@@ -1,0 +1,16 @@
+# Compiled binaries & build artifacts (anchored so cmd/mcplex/ is tracked)
+/mcplex
+/mcplex.exe
+/dist/
+/build/
+coverage.out
+
+# Local Go workspaces & IDE files
+go.work
+go.work.sum
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db

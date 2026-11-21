@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Run tests
+        run: go test -race -count=1 ./...
+
+      - name: Build release archives
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          mkdir -p dist build
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            ext=""
+            if [ "$os" = "windows" ]; then ext=".exe"; fi
+
+            name="mcplex_${ver}_${os}_${arch}"
+            stage="build/${name}"
+            mkdir -p "$stage"
+            GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "${stage}/mcplex${ext}" ./cmd/mcplex
+            cp README.md README_ZH.md LICENSE "${stage}/"
+            if [ "$os" = "windows" ]; then
+              (cd "$stage" && zip -qr "../../dist/${name}.zip" .)
+            else
+              tar -czf "dist/${name}.tar.gz" -C "$stage" .
+            fi
+          done
+          "./build/mcplex_${ver}_linux_amd64/mcplex" version | grep -q "v${ver} " || { echo "binary version mismatch"; exit 1; }
+          (cd dist && sha256sum * > checksums.txt)
+          ls -lh dist/
+
+      - name: Write release notes
+        run: |
+          git fetch --force --tags
+          ver="${GITHUB_REF_NAME#v}"
+          notes=""
+          if [ "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag" ]; then
+            notes=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME" | sed '/-----BEGIN PGP SIGNATURE-----/,$d')
+          fi
+          prev=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          {
+            if [ -n "$(echo "$notes" | tr -d '[:space:]')" ]; then
+              echo "$notes"
+            else
+              echo "## Changes"
+              if [ -n "$prev" ]; then git log --format='- %s' "${prev}..${GITHUB_REF_NAME}"; else git log --format='- %s' "$GITHUB_REF_NAME"; fi
+            fi
+            echo
+            echo "---"
+            echo
+            echo "### Quick Start"
+            echo '```bash'
+            echo "# Stdio MCP proxy"
+            echo "./mcplex serve --cwd /path/to/workspace --strict-root"
+            echo
+            echo "# Streamable HTTP MCP proxy"
+            echo "./mcplex serve --http 127.0.0.1:8787 --token <secret> --cwd /path/to/workspace"
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
