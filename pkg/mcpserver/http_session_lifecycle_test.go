@@ -64,6 +64,15 @@ func TestEndedSessionsAnswer404AndReinitializeWorks(t *testing.T) {
 	if resp, _ := postMCP(t, ts.URL, sid, "["+ping+"]"); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("batch on deleted session = %d, want 404", resp.StatusCode)
 	}
+	// A batch with non-initialize work BEFORE initialize must still 404 (never resurrecting the ended sid).
+	initMsg := `{"jsonrpc":"2.0","id":10,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`
+	if resp, _ := postMCP(t, ts.URL, sid, "["+ping+","+initMsg+"]"); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("mixed [ping, initialize] batch on deleted session = %d, want 404", resp.StatusCode)
+	}
+	// A batch starting WITH initialize mints a fresh session id for the batch and succeeds.
+	if resp, _ := postMCP(t, ts.URL, sid, "["+initMsg+","+ping+"]"); resp.StatusCode != http.StatusOK || resp.Header.Get("Mcp-Session-Id") == "" || resp.Header.Get("Mcp-Session-Id") == sid {
+		t.Fatalf("[initialize, ping] batch on deleted session failed: status=%d newSid=%q", resp.StatusCode, resp.Header.Get("Mcp-Session-Id"))
+	}
 	if fresh := initSession(t, ts.URL); fresh == sid {
 		t.Fatal("re-initialize must mint a new session id")
 	}

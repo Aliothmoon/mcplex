@@ -122,6 +122,7 @@ func (r *httpSessionRegistry) register(sid string, now time.Time) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	delete(r.ended, sid)
 	if len(r.sessions) >= maxTrackedSessions && r.sessions[sid] == nil {
 		var oldestID string
 		var oldestAt time.Time
@@ -144,6 +145,9 @@ func (r *httpSessionRegistry) begin(sid string, now time.Time) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, ended := r.ended[sid]; ended {
+		return
+	}
 	st, ok := r.sessions[sid]
 	if !ok {
 		if len(r.sessions) >= maxTrackedSessions {
@@ -199,15 +203,6 @@ func (r *httpSessionRegistry) collectExpired(now time.Time, ttl time.Duration, f
 		}
 	}
 	return expired
-}
-
-func batchHasInitialize(batch []jsonRPCRequest) bool {
-	for _, req := range batch {
-		if req.Method == "initialize" {
-			return true
-		}
-	}
-	return false
 }
 
 // writeSessionEnded answers a request for a terminated session with HTTP 404, which MCP Streamable HTTP
@@ -537,7 +532,7 @@ func (s *Server) httpHandlerWithRegistry(opts HTTPOptions, reg *httpSessionRegis
 			}
 			var replies []jsonRPCResponse
 			sid := strings.TrimSpace(r.Header.Get("Mcp-Session-Id"))
-			if reg.isEnded(sid) && !batchHasInitialize(batch) {
+			if reg.isEnded(sid) && batch[0].Method != "initialize" {
 				writeSessionEnded(w)
 				return
 			}

@@ -37,4 +37,15 @@ func TestStdioOversizedContentLengthBodyIsSkipped(t *testing.T) {
 	if strings.Contains(got, `"id":99`) || strings.Contains(got, "Parse error") {
 		t.Fatalf("oversized body was re-parsed as messages: %.300s", got)
 	}
+
+	// Integer-overflow Content-Length (> MaxInt64) must also hit the oversize guard and never execute its body as NDJSON.
+	overflowIn := "Content-Length: 99999999999999999999999999\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":88,\"method\":\"ping\"}\n"
+	out.Reset()
+	if err := srv.Serve(context.Background(), strings.NewReader(overflowIn), &out); err != nil {
+		t.Fatalf("Serve overflow: %v", err)
+	}
+	gotOverflow := out.String()
+	if !strings.Contains(gotOverflow, "exceeds 16MB limit") || strings.Contains(gotOverflow, `"id":88`) {
+		t.Fatalf("expected overflow Content-Length to be rejected without dispatching body, got: %s", gotOverflow)
+	}
 }

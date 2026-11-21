@@ -105,6 +105,17 @@ try { return inf(0); } catch (e) { return "caught"; }`})
 	if !strings.Contains(ee.Message, "Maximum call stack size exceeded") || !strings.Contains(ee.Message, "inf") {
 		t.Fatalf("stack overflow message lacks explanation/location: %q", ee.Message)
 	}
+
+	// Stack overflow inside console.log or host-call argument getters must remain uncatchable and report Maximum call stack size exceeded.
+	for _, snippet := range []string{
+		`function inf(): any { return inf(); } try { console.log({ get x() { return inf(); } }); } catch (e) { return "caught"; }`,
+		`function inf(): any { return inf(); } try { await sleep({ get x() { return inf(); } } as any); } catch (e) { return "caught"; }`,
+	} {
+		_, err = Execute(context.Background(), ExecRequest{Cwd: t.TempDir(), Code: snippet})
+		if !errors.As(err, &ee) || ee.Phase != "runtime" || !strings.Contains(ee.Message, "Maximum call stack size exceeded") {
+			t.Fatalf("expected uncatchable stack overflow for %q, got %v", snippet, err)
+		}
+	}
 }
 
 func TestWindowsProcessEnvProxyInvariants(t *testing.T) {

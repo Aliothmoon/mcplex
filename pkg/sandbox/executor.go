@@ -260,10 +260,7 @@ func (env *ExecutionEnv) wrapSync(capability string, fn SyncHostFunc) func(goja.
 		}
 		exported, argErr := safeExportArgs(env.VM, call.Arguments)
 		if argErr != nil {
-			var interrupted *goja.InterruptedError
-			if errors.As(argErr, &interrupted) {
-				panic(interrupted)
-			}
+			rethrowIfInterrupted(argErr)
 			panic(env.newJSHostError(KindBadArgs, capability, safeErrString(argErr), line, nil))
 		}
 		target := summarizeTarget(exported)
@@ -306,10 +303,7 @@ func (env *ExecutionEnv) wrapAsync(capability string, fn AsyncHostFunc) func(goj
 		}
 		exported, argErr := safeExportArgs(env.VM, call.Arguments)
 		if argErr != nil {
-			var interrupted *goja.InterruptedError
-			if errors.As(argErr, &interrupted) {
-				panic(interrupted)
-			}
+			rethrowIfInterrupted(argErr)
 			promise, _, reject := env.VM.NewPromise()
 			errVal := env.newJSHostError(KindBadArgs, capability, safeErrString(argErr), line, nil)
 			if rErr := reject(errVal); rErr != nil {

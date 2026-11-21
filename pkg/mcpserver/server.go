@@ -6,8 +6,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"runtime"
 	"strconv"
@@ -192,13 +194,16 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 
 	// skipBody counts bytes of an oversized Content-Length body still to be discarded, so the body of a rejected
 	// message is never re-parsed as line-delimited JSON (which would desync framing for later messages).
-	skipBody := 0
+	var skipBody int64
 	drain := func() {
 		for len(buf) > 0 {
 			if skipBody > 0 {
-				n := min(skipBody, len(buf))
+				n := int(min(skipBody, int64(len(buf))))
 				buf = buf[n:]
-				skipBody -= n
+				if len(buf) == 0 {
+					buf = nil
+				}
+				skipBody -= int64(n)
 				if skipBody > 0 {
 					break
 				}
@@ -247,11 +252,12 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 					continue
 				}
 				bodyStart := sepIdx + sepLen
-				if len(buf) < bodyStart+cLen {
+				if int64(len(buf)-bodyStart) < cLen {
 					break
 				}
-				body := buf[bodyStart : bodyStart+cLen]
-				buf = buf[bodyStart+cLen:]
+				endIdx := bodyStart + int(cLen)
+				body := buf[bodyStart:endIdx]
+				buf = buf[endIdx:]
 				dispatch(body, true)
 				continue
 			}
@@ -330,10 +336,12 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 				drain()
 			}
 			if chunk.err != nil {
-				if rem := bytes.TrimSpace(buf); len(rem) > 0 {
-					low := strings.ToLower(string(rem[:min(len(rem), 16)]))
-					if !strings.HasPrefix(low, "content-length:") && !strings.HasPrefix(low, "content-type:") {
-						dispatch(rem, false)
+				if skipBody == 0 {
+					if rem := bytes.TrimSpace(buf); len(rem) > 0 {
+						low := strings.ToLower(string(rem[:min(len(rem), 16)]))
+						if !strings.HasPrefix(low, "content-length:") && !strings.HasPrefix(low, "content-type:") {
+							dispatch(rem, false)
+						}
 					}
 				}
 				inFlight.Wait()
@@ -1056,13 +1064,17 @@ func fileURIToPath(raw string) string {
 	return p
 }
 
-func parseContentLength(hdr string) int {
+func parseContentLength(hdr string) int64 {
 	for _, line := range strings.Split(hdr, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
 			val := strings.TrimSpace(line[len("content-length:"):])
-			if n, err := strconv.Atoi(val); err == nil && n >= 0 {
+			n, err := strconv.ParseInt(val, 10, 64)
+			if err == nil && n >= 0 {
 				return n
+			}
+			if errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(val, "-") {
+				return math.MaxInt64
 			}
 		}
 	}

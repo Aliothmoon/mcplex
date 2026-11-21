@@ -304,6 +304,10 @@ func rethrowIfInterrupted(err error) {
 	if errors.As(err, &interrupted) {
 		panic(interrupted)
 	}
+	var stackOverflow *goja.StackOverflowError
+	if errors.As(err, &stackOverflow) {
+		panic(stackOverflow)
+	}
 }
 
 func (st *exportState) exportVal(val goja.Value, depth int) (any, error) {
