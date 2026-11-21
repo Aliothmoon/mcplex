@@ -154,7 +154,8 @@ drain:
 			if ev.Kind == KindTask && ev.RunID == "t1" && ev.Status == "completed" {
 				gotTaskDone = true
 			}
-		default:
+		case <-time.After(300 * time.Millisecond):
+			// Overflowed events are forwarded asynchronously by the subscriber pump, so wait briefly.
 			break drain
 		}
 	}

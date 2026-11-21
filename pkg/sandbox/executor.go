@@ -342,7 +342,7 @@ func (env *ExecutionEnv) wrapAsync(capability string, fn AsyncHostFunc) func(goj
 			res, err := func() (val any, fnErr error) {
 				defer func() {
 					if r := recover(); r != nil {
-						fnErr = fmt.Errorf("host capability panic in %s: %v", capability, safeErrString(recoveredToError(r)))
+						fnErr = fmt.Errorf("host capability panic in %s: %v", capability, safeErrString(recoveredToError(nil, r)))
 					}
 				}()
 				return fn(env.Ctx, exported)
@@ -366,7 +366,7 @@ func (env *ExecutionEnv) wrapAsync(capability string, fn AsyncHostFunc) func(goj
 					defer env.pendingOps.Add(-1)
 					defer func() {
 						if r := recover(); r != nil {
-							env.setAsyncErr(recoveredToError(r))
+							env.setAsyncErr(recoveredToError(env.VM, r))
 						}
 					}()
 					// Decrement vmActiveAsync BEFORE settling the Promise so a sequential `await`
@@ -547,7 +547,7 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 			result = nil
 			retErr = &ExecutionError{
 				Phase:      "runtime",
-				Message:    safeErrString(recoveredToError(r)),
+				Message:    safeErrString(recoveredToError(nil, r)),
 				DurationMs: time.Since(start).Milliseconds(),
 			}
 		}
@@ -578,7 +578,7 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 
 	vm := goja.New()
-	vm.SetMaxCallStackSize(1024)
+	vm.SetMaxCallStackSize(MaxCallStackDepth)
 	vm.SetFieldNameMapper(goja.TagFieldNameMapper("json", true))
 
 	env := &ExecutionEnv{
@@ -602,7 +602,7 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 	defer func() {
 		if r := recover(); r != nil {
 			result = nil
-			retErr = env.wrapRuntimeErr(recoveredToError(r), cr, start)
+			retErr = env.wrapRuntimeErr(recoveredToError(env.VM, r), cr, start)
 		}
 		cancel()
 		env.cleanupTimers()
@@ -611,7 +611,7 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 			func(fn func()) {
 				defer func() {
 					if r := recover(); r != nil {
-						env.AddWarning("cleanup panic: " + safeErrString(recoveredToError(r)))
+						env.AddWarning("cleanup panic: " + safeErrString(recoveredToError(env.VM, r)))
 					}
 				}()
 				fn()
@@ -886,9 +886,40 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 	}, nil
 }
 
+// MaxCallStackDepth bounds JS call depth (roughly Node's default ~10k frames) so runaway recursion fails in
+// milliseconds with bounded memory instead of running until the exec timeout. Async functions consume about
+// two frames per level, so ~4k levels of async recursion still work.
+const MaxCallStackDepth = 8192
+
+// stackOverflowMessage replaces Goja's message-less StackOverflowError with an actionable RangeError text.
+// Goja treats stack overflow as uncatchable, so the hint says so explicitly.
+func stackOverflowMessage(err error) string {
+	loc := strings.TrimSpace(safeErrString(err))
+	msg := fmt.Sprintf("RangeError: Maximum call stack size exceeded (more than %d nested calls). This is not catchable by try/catch inside the sandbox; convert deep recursion to an explicit loop/stack", MaxCallStackDepth)
+	if loc != "" {
+		if !strings.HasPrefix(loc, "at ") {
+			loc = "at " + loc
+		}
+		msg += " " + loc
+	}
+	return msg
+}
+
 func (env *ExecutionEnv) wrapRuntimeErr(err error, cr *compiler.CompileResult, start time.Time) error {
 	phase := "runtime"
 	var interrupted *goja.InterruptedError
+	var stackOverflow *goja.StackOverflowError
+	if errors.As(err, &stackOverflow) {
+		formattedMsg := compiler.CleanStack(compiler.FormatRuntimeError(stackOverflowMessage(stackOverflow), cr), cr)
+		return &ExecutionError{
+			Phase:       phase,
+			Message:     formattedMsg,
+			TimedOutOps: env.snapshotInFlight(),
+			Logs:        env.getLogs(),
+			Traces:      env.getTraces(),
+			DurationMs:  time.Since(start).Milliseconds(),
+		}
+	}
 	if errors.As(err, &interrupted) {
 		if strings.Contains(strings.ToLower(interrupted.String()), "canceled") {
 			phase = "canceled"
@@ -1113,7 +1144,7 @@ func enrichUnknownMethodError(vm *goja.Runtime, formattedMsg string, cr *compile
 		return formattedMsg
 	}
 	var exported any
-	_ = tryJS(func() {
+	_ = tryJS(vm, func() {
 		val := vm.Get("__ptcLastMissingMethod")
 		if val != nil && !goja.IsUndefined(val) && !goja.IsNull(val) {
 			exported, _ = safeExportValue(vm, val)
@@ -1176,27 +1207,27 @@ func enrichUnknownMethodError(vm *goja.Runtime, formattedMsg string, cr *compile
 func formatRejectedValue(vm *goja.Runtime, rej goja.Value) (out string) {
 	defer func() {
 		if r := recover(); r != nil {
-			out = "Uncaught rejection (" + safeErrString(recoveredToError(r)) + ")"
+			out = "Uncaught rejection (" + safeErrString(recoveredToError(vm, r)) + ")"
 		}
 	}()
 	if rej == nil || goja.IsUndefined(rej) || goja.IsNull(rej) {
 		return "Promise rejected with undefined"
 	}
 	var obj *goja.Object
-	_ = tryJS(func() {
+	_ = tryJS(vm, func() {
 		obj = rej.ToObject(vm)
 	})
 	if obj != nil {
 		var msgStr, stackStr string
 		var getterErr error
-		if err := tryJS(func() {
+		if err := tryJS(vm, func() {
 			if m := obj.Get("message"); m != nil && !goja.IsUndefined(m) && !goja.IsNull(m) {
 				msgStr = strings.TrimSpace(m.String())
 			}
 		}); err != nil {
 			getterErr = err
 		}
-		if err := tryJS(func() {
+		if err := tryJS(vm, func() {
 			if s := obj.Get("stack"); s != nil && !goja.IsUndefined(s) && !goja.IsNull(s) {
 				stackStr = strings.TrimSpace(s.String())
 			}
@@ -1224,7 +1255,7 @@ func formatRejectedValue(vm *goja.Runtime, rej goja.Value) (out string) {
 		}
 	}
 	var s string
-	if err := tryJS(func() { s = rej.String() }); err != nil {
+	if err := tryJS(vm, func() { s = rej.String() }); err != nil {
 		return "Thrown value toString failed: " + safeErrString(err)
 	}
 	if s == "[object Object]" {

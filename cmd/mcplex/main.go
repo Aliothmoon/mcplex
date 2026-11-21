@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/aliothmoon/mcplex/pkg/audit"
 	"github.com/aliothmoon/mcplex/pkg/mcpserver"
@@ -109,7 +110,7 @@ Core serve flags:
   --policy-file <file>       Custom JSON policy rules file (repeatable)
 
 Advanced flags (run 'mcplex serve -h' for full list):
-  --allow-root, --data-dir, --max-output, --cors-origin, --insecure-no-token, --compact-schema, --trust-workspace-mcp`)
+  --allow-root, --data-dir, --max-output, --cors-origin, --insecure-no-token, --session-idle-ttl, --compact-schema, --trust-workspace-mcp`)
 }
 
 func parseToolSet(spec string) (mcpserver.ToolSet, error) {
@@ -198,6 +199,7 @@ func runServe(args []string) int {
 	token := fs.String("token", os.Getenv("MCPLEX_TOKEN"), "Bearer token required in HTTP mode")
 	corsOrigin := fs.String("cors-origin", "", "Optional Access-Control-Allow-Origin header in HTTP mode")
 	insecureNoToken := fs.Bool("insecure-no-token", false, "Allow non-loopback HTTP bind or wildcard CORS without --token")
+	sessionIdleTTL := fs.Duration("session-idle-ttl", 30*time.Minute, "HTTP mode: close sessions idle this long (kills their background tasks incl. daemons; 0 disables)")
 	uiMode := fs.Bool("ui", false, "Launch interactive TUI console (defaults --http to 127.0.0.1:8787)")
 
 	var extraRoots, mcpConfigs, policyFiles stringListFlag
@@ -246,6 +248,7 @@ func runServe(args []string) int {
 			Token:                *token,
 			AllowOrigin:          *corsOrigin,
 			AllowInsecureNoToken: *insecureNoToken,
+			SessionIdleTTL:       httpSessionTTL(*sessionIdleTTL),
 		}
 		if vErr := mcpserver.ValidateHTTPOptions(preOpts); vErr != nil {
 			fmt.Fprintf(os.Stderr, "mcplex http security error: %v\n", vErr)
@@ -303,6 +306,7 @@ func runServe(args []string) int {
 			Token:                *token,
 			AllowOrigin:          *corsOrigin,
 			AllowInsecureNoToken: *insecureNoToken,
+			SessionIdleTTL:       httpSessionTTL(*sessionIdleTTL),
 		}
 		if *token == "" && !mcpserver.IsLoopbackBindAddr(*httpAddr) {
 			fmt.Fprintf(os.Stderr, "[WARN] mcplex HTTP is binding non-loopback address %q WITHOUT --token (--insecure-no-token enabled)!\n", *httpAddr)
@@ -521,4 +525,13 @@ func runStats(args []string) int {
 	}
 	fmt.Print(audit.FormatStats(entries))
 	return 0
+}
+
+// httpSessionTTL maps the --session-idle-ttl flag to HTTPOptions.SessionIdleTTL, where 0 means "use the default"
+// and a negative value disables reaping; on the CLI, 0 (or any non-positive value) disables reaping.
+func httpSessionTTL(flagVal time.Duration) time.Duration {
+	if flagVal <= 0 {
+		return -1
+	}
+	return flagVal
 }

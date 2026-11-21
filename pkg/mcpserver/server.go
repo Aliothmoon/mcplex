@@ -190,8 +190,20 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 		}(append([]byte(nil), trimmed...))
 	}
 
+	// skipBody counts bytes of an oversized Content-Length body still to be discarded, so the body of a rejected
+	// message is never re-parsed as line-delimited JSON (which would desync framing for later messages).
+	skipBody := 0
 	drain := func() {
 		for len(buf) > 0 {
+			if skipBody > 0 {
+				n := min(skipBody, len(buf))
+				buf = buf[n:]
+				skipBody -= n
+				if skipBody > 0 {
+					break
+				}
+				continue
+			}
 			// Skip leading CR/LF
 			trimIdx := 0
 			for trimIdx < len(buf) && (buf[trimIdx] == '\n' || buf[trimIdx] == '\r') {
@@ -225,6 +237,7 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 				if cLen < 0 || cLen > maxStdioMessageBytes {
 					buf = buf[sepIdx+sepLen:]
 					if cLen > maxStdioMessageBytes {
+						skipBody = cLen
 						writeResp(jsonRPCResponse{
 							JSONRPC: "2.0",
 							ID:      json.RawMessage("null"),

@@ -213,7 +213,7 @@ func (env *ExecutionEnv) runTimerCoordinator() {
 				run: func() {
 					defer func() {
 						if r := recover(); r != nil {
-							env.setAsyncErr(recoveredToError(r))
+							env.setAsyncErr(recoveredToError(env.VM, r))
 						}
 					}()
 					if env.settleTimerEntry(picked) {

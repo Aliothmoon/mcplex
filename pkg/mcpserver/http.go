@@ -68,16 +68,52 @@ type trackedHTTPSession struct {
 	inFlight int
 }
 
+// maxEndedSessionTombstones bounds how many terminated session IDs are remembered for 404 responses.
+const maxEndedSessionTombstones = 4096
+
 type httpSessionRegistry struct {
 	mu        sync.Mutex
 	sessions  map[string]*trackedHTTPSession
 	lastSweep time.Time
+	// ended remembers sessions terminated by idle reaping or DELETE so later requests carrying that
+	// Mcp-Session-Id get HTTP 404 (MCP Streamable HTTP spec) and the client re-initializes, instead of
+	// silently continuing in a fresh session that has lost its workspace, spills and background tasks.
+	ended      map[string]struct{}
+	endedOrder []string
 }
 
 func newHTTPSessionRegistry() *httpSessionRegistry {
 	return &httpSessionRegistry{
 		sessions: map[string]*trackedHTTPSession{},
+		ended:    map[string]struct{}{},
 	}
+}
+
+func (r *httpSessionRegistry) markEndedLocked(sid string) {
+	if sid == "" {
+		return
+	}
+	if _, ok := r.ended[sid]; ok {
+		return
+	}
+	if len(r.endedOrder) >= maxEndedSessionTombstones {
+		oldest := r.endedOrder[0]
+		r.endedOrder = r.endedOrder[1:]
+		delete(r.ended, oldest)
+	}
+	r.ended[sid] = struct{}{}
+	r.endedOrder = append(r.endedOrder, sid)
+}
+
+// isEnded reports whether sid was terminated by this server (idle reaping or DELETE).
+func (r *httpSessionRegistry) isEnded(sid string) bool {
+	if sid == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.ended[sid]
+	return ok
 }
 
 func (r *httpSessionRegistry) register(sid string, now time.Time) {
@@ -140,6 +176,7 @@ func (r *httpSessionRegistry) remove(sid string) {
 	}
 	r.mu.Lock()
 	delete(r.sessions, sid)
+	r.markEndedLocked(sid)
 	r.mu.Unlock()
 }
 
@@ -158,9 +195,31 @@ func (r *httpSessionRegistry) collectExpired(now time.Time, ttl time.Duration, f
 		if st.inFlight == 0 && now.Sub(st.lastSeen) > ttl {
 			expired = append(expired, sid)
 			delete(r.sessions, sid)
+			r.markEndedLocked(sid)
 		}
 	}
 	return expired
+}
+
+func batchHasInitialize(batch []jsonRPCRequest) bool {
+	for _, req := range batch {
+		if req.Method == "initialize" {
+			return true
+		}
+	}
+	return false
+}
+
+// writeSessionEnded answers a request for a terminated session with HTTP 404, which MCP Streamable HTTP
+// clients treat as "start a new session with initialize".
+func writeSessionEnded(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	_ = json.NewEncoder(w).Encode(jsonRPCResponse{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage("null"),
+		Error:   &rpcError{Code: -32001, Message: "Session not found: it was closed or expired after being idle; send initialize to start a new session"},
+	})
 }
 
 func writeJSONHTTPError(w http.ResponseWriter, status int, errMsg string) {
@@ -223,7 +282,11 @@ func (s *Server) httpHandlerWithRegistry(opts HTTPOptions, reg *httpSessionRegis
 		}
 	}
 
-	enforceHostGuard := strings.TrimSpace(opts.Token) == "" || IsLoopbackBindAddr(opts.Addr) || strings.TrimSpace(opts.Addr) == ""
+	// The Host allowlist defends loopback binds against DNS rebinding. A non-loopback bind is either protected by
+	// the bearer token or was explicitly exposed with --insecure-no-token; in both cases LAN/container clients
+	// legitimately send non-loopback Host headers, so the allowlist would only lock them out.
+	loopbackBind := strings.TrimSpace(opts.Addr) == "" || IsLoopbackBindAddr(opts.Addr)
+	enforceHostGuard := loopbackBind || (strings.TrimSpace(opts.Token) == "" && !opts.AllowInsecureNoToken)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -474,6 +537,10 @@ func (s *Server) httpHandlerWithRegistry(opts HTTPOptions, reg *httpSessionRegis
 			}
 			var replies []jsonRPCResponse
 			sid := strings.TrimSpace(r.Header.Get("Mcp-Session-Id"))
+			if reg.isEnded(sid) && !batchHasInitialize(batch) {
+				writeSessionEnded(w)
+				return
+			}
 			for _, req := range batch {
 				if req.Method == "initialize" {
 					sid = newSessionID()
@@ -513,6 +580,10 @@ func (s *Server) httpHandlerWithRegistry(opts HTTPOptions, reg *httpSessionRegis
 			return
 		}
 		sid := strings.TrimSpace(r.Header.Get("Mcp-Session-Id"))
+		if req.Method != "initialize" && reg.isEnded(sid) {
+			writeSessionEnded(w)
+			return
+		}
 		if req.Method == "initialize" {
 			sid = newSessionID()
 			reg.register(sid, time.Now())
@@ -520,7 +591,9 @@ func (s *Server) httpHandlerWithRegistry(opts HTTPOptions, reg *httpSessionRegis
 		}
 		if sid != "" {
 			reg.begin(sid, time.Now())
-			defer reg.end(sid, time.Now())
+			// Evaluate time.Now() when the request FINISHES: `defer reg.end(sid, time.Now())` would record the
+			// start time, so a long call (task wait, slow exec) could be reaped right after completing.
+			defer func() { reg.end(sid, time.Now()) }()
 		}
 		resp := s.handleSingle(ptcruntime.WithSessionID(r.Context(), sid), req)
 		if resp == nil {

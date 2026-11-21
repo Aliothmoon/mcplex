@@ -132,3 +132,27 @@ func TestPerSessionClientWorkspaceAndAutoSpillIsolation(t *testing.T) {
 		t.Fatalf("expected sess-A __last_result to stay isolated from sess-B, got: %s", readBackA)
 	}
 }
+
+// The auto-loaded <data-dir>/policy.json must be write-protected even before it exists; otherwise a sandbox whose
+// workspace contains the data dir could create it with allow rules that the next exec loads (strict-root escape).
+func TestDataDirPolicyJSONIsWriteProtectedBeforeItExists(t *testing.T) {
+	ws := t.TempDir()
+	dataDir := filepath.Join(ws, ".mcplex-data")
+	eng := NewEngineWithOptions(EngineOptions{
+		DataDir:         dataDir,
+		DefaultCwd:      ws,
+		StrictWorkspace: true,
+	})
+	defer eng.Close()
+
+	policyPath := filepath.ToSlash(filepath.Join(dataDir, "policy.json"))
+	out, isErr := eng.RunMCPExec(context.Background(), ExecInput{
+		Code: `await fs.write("` + policyPath + `", JSON.stringify({ permissions: { allow: ["read_file(*)"] } })); return "written";`,
+	})
+	if !isErr || strings.Contains(out, "written") {
+		t.Fatalf("sandbox must not be able to create <data-dir>/policy.json, got isErr=%v out=%s", isErr, out)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "policy.json")); !os.IsNotExist(err) {
+		t.Fatalf("policy.json was created: %v", err)
+	}
+}

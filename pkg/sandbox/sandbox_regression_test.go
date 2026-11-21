@@ -105,7 +105,8 @@ func TestSafeExportCyclesDAGMaxDepthNaNAndHugeSparseArray(t *testing.T) {
 		t.Fatalf("unexpected log output: %v", res.Logs)
 	}
 
-	// 2. Max depth 64 cap
+	// 2. Depth cap: values below maxExportDepth round-trip intact (no silent data truncation), deeper values
+	// fail loudly for results, and console.log keeps a "[MaxDepth]" marker.
 	resDepth, err := Execute(context.Background(), ExecRequest{
 		Cwd: t.TempDir(),
 		Code: `
@@ -120,8 +121,25 @@ func TestSafeExportCyclesDAGMaxDepthNaNAndHugeSparseArray(t *testing.T) {
 		t.Fatalf("unexpected depth error: %v", err)
 	}
 	depthJSON := output.MarshalResultForBudget(resDepth.Value, 9600)
-	if !strings.Contains(depthJSON, "[MaxDepth]") {
-		t.Fatalf("expected [MaxDepth] marker in deep object export, got: %s", depthJSON)
+	if strings.Contains(depthJSON, "[MaxDepth]") || !strings.Contains(depthJSON, `"leaf":true`) {
+		t.Fatalf("80-level object must export intact, got: %.300s", depthJSON)
+	}
+	resLogDepth, err := Execute(context.Background(), ExecRequest{
+		Cwd: t.TempDir(),
+		Code: `
+			let cur: any = { leaf: true };
+			for (let i = 0; i < 1100; i++) {
+				cur = { child: cur };
+			}
+			console.log(cur);
+			return 1;
+		`,
+	})
+	if err != nil {
+		t.Fatalf("console.log of a too-deep object must not fail the exec: %v", err)
+	}
+	if len(resLogDepth.Logs) != 1 || !strings.Contains(resLogDepth.Logs[0], "[MaxDepth]") {
+		t.Fatalf("expected [MaxDepth] marker in logged deep object, got %d logs", len(resLogDepth.Logs))
 	}
 
 	// 3. Sparse / huge Array OOM guard (new Array(1e9) must fail fast without allocating 16GB!)
@@ -162,7 +180,7 @@ func TestSafeExportThrowingGettersHostileRejectionsAndCallStackLimit(t *testing.
 		t.Fatalf("expected controlled runtime error for hostile rejection, got: %+v", errRej)
 	}
 
-	// 3. Infinite JS recursion hits SetMaxCallStackSize(1024) cleanly
+	// 3. Infinite JS recursion hits SetMaxCallStackSize(MaxCallStackDepth) cleanly
 	_, errStack := Execute(context.Background(), ExecRequest{
 		Cwd:  t.TempDir(),
 		Code: `function inf(): any { return inf(); } return inf();`,

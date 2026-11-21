@@ -74,6 +74,7 @@ type Engine struct {
 	stores                map[string]*capabilities.StateStore
 	bridges               map[string]*capabilities.MCPBridge
 	storeOrder            []string
+	wsRefs                map[string]int // in-flight execs per workspace cache key; referenced entries are never evicted
 	fileLocks             *capabilities.FileLockTable
 	events                *events.Hub
 	runSeq                atomic.Int64
@@ -127,6 +128,7 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 		auditor:               audit.NewLogger(dataDir),
 		stores:                map[string]*capabilities.StateStore{},
 		bridges:               map[string]*capabilities.MCPBridge{},
+		wsRefs:                map[string]int{},
 		fileLocks:             capabilities.NewFileLockTable(),
 		events:                hub,
 	}
@@ -215,8 +217,12 @@ func (e *Engine) isStrictMode() bool {
 
 func (e *Engine) newPolicyForCwd(cwd string) *policy.Engine {
 	pFiles := append([]string(nil), e.policyFiles...)
+	protected := append([]string(nil), e.mcpConfigPaths...)
 	if e.dataDir != "" {
 		dp := filepath.Join(e.dataDir, "policy.json")
+		// Protect the auto-loaded policy path even before it exists: otherwise the sandbox could CREATE it
+		// (e.g. when --data-dir lies inside the workspace) with allow rules that the next exec would load.
+		protected = append(protected, dp)
 		if fi, err := os.Stat(dp); err == nil && !fi.IsDir() {
 			already := false
 			for _, existing := range pFiles {
@@ -235,7 +241,7 @@ func (e *Engine) newPolicyForCwd(cwd string) *policy.Engine {
 		StrictWorkspace:       e.strictWorkspace,
 		TrustWorkspaceMCP:     e.trustWorkspaceMCP,
 		PolicyFiles:           pFiles,
-		ProtectedFiles:        e.mcpConfigPaths,
+		ProtectedFiles:        protected,
 		LoadAntigravityConfig: e.antigravityMode,
 		NativeEscalationHint:  e.antigravityMode,
 	})
@@ -402,7 +408,8 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 		return msg, true
 	}
 
-	store, bridge := e.workspaceResources(cwd, pol)
+	store, bridge, releaseWorkspace := e.workspaceResources(cwd, pol)
+	defer releaseWorkspace()
 	defer store.Flush() // state writes (state.set, auto-spills) hit disk once per exec
 
 	title := strings.TrimSpace(in.Title)
@@ -837,22 +844,50 @@ func (e *Engine) touchWorkspaceOrderLocked(key string) {
 	e.storeOrder = append(e.storeOrder, key)
 }
 
-func (e *Engine) workspaceResources(cwd string, pol *policy.Engine) (*capabilities.StateStore, *capabilities.MCPBridge) {
+type evictedWorkspace struct {
+	store  *capabilities.StateStore
+	bridge *capabilities.MCPBridge
+}
+
+// evictIdleWorkspacesLocked drops least-recently-used cache entries above maxCachedWorkspaces, skipping entries
+// still referenced by an in-flight exec: closing a bridge mid-call would fail that exec's mcp.* calls, and a
+// second StateStore for the same workspace would overwrite the first one's writes. The cap may be exceeded
+// temporarily while every entry is busy; release() re-runs eviction.
+func (e *Engine) evictIdleWorkspacesLocked() []evictedWorkspace {
+	var out []evictedWorkspace
+	for i := 0; len(e.storeOrder) > maxCachedWorkspaces && i < len(e.storeOrder); {
+		key := e.storeOrder[i]
+		if e.wsRefs[key] > 0 {
+			i++
+			continue
+		}
+		e.storeOrder = append(e.storeOrder[:i], e.storeOrder[i+1:]...)
+		out = append(out, evictedWorkspace{store: e.stores[key], bridge: e.bridges[key]})
+		delete(e.stores, key)
+		delete(e.bridges, key)
+	}
+	return out
+}
+
+func closeEvictedWorkspaces(list []evictedWorkspace) {
+	for _, ev := range list {
+		if ev.store != nil {
+			ev.store.Flush()
+		}
+		if ev.bridge != nil {
+			ev.bridge.Close()
+		}
+	}
+}
+
+// workspaceResources returns the cached state store and MCP bridge for cwd plus a release func that must be
+// called when the exec using them finishes.
+func (e *Engine) workspaceResources(cwd string, pol *policy.Engine) (*capabilities.StateStore, *capabilities.MCPBridge, func()) {
 	key := workspaceCacheKey(cwd)
-	var evictedStore *capabilities.StateStore
-	var evictedBridge *capabilities.MCPBridge
 
 	e.mu.Lock()
 	st, ok := e.stores[key]
 	if !ok {
-		if len(e.storeOrder) >= maxCachedWorkspaces {
-			evictKey := e.storeOrder[0]
-			e.storeOrder = e.storeOrder[1:]
-			evictedStore = e.stores[evictKey]
-			evictedBridge = e.bridges[evictKey]
-			delete(e.stores, evictKey)
-			delete(e.bridges, evictKey)
-		}
 		st = capabilities.NewStateStore(e.dataDir, cwd)
 		e.stores[key] = st
 	}
@@ -872,15 +907,26 @@ func (e *Engine) workspaceResources(cwd string, pol *policy.Engine) (*capabiliti
 		br.SetPolicy(pol)
 	}
 	e.touchWorkspaceOrderLocked(key)
+	e.wsRefs[key]++
+	evicted := e.evictIdleWorkspacesLocked()
 	e.mu.Unlock()
+	closeEvictedWorkspaces(evicted)
 
-	if evictedStore != nil {
-		evictedStore.Flush()
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			e.mu.Lock()
+			if e.wsRefs[key] > 1 {
+				e.wsRefs[key]--
+			} else {
+				delete(e.wsRefs, key)
+			}
+			later := e.evictIdleWorkspacesLocked()
+			e.mu.Unlock()
+			closeEvictedWorkspaces(later)
+		})
 	}
-	if evictedBridge != nil {
-		evictedBridge.Close()
-	}
-	return st, br
+	return st, br, release
 }
 
 const liveStatusMinInterval = 120 * time.Millisecond

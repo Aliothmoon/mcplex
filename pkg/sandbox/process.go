@@ -46,9 +46,18 @@ func installProcessOS(env *ExecutionEnv) error {
 		delete globalThis.__ptcHostInfo;
 		let envObj = Object.freeze(Object.assign({}, h.env));
 		if (h.platform === "win32") {
+			// The Proxy target must stay EXTENSIBLE: reporting case-variant keys ("path" for "Path") from
+			// getOwnPropertyDescriptor on a frozen target violates Proxy invariants and makes Object.hasOwn /
+			// hasOwnProperty throw. Immutability is enforced by the mutation traps below instead of freeze().
+			const base = Object.assign({}, h.env);
 			const upper = {};
-			for (const k of Object.keys(envObj)) upper[k.toUpperCase()] = envObj[k];
-			envObj = new Proxy(envObj, {
+			for (const k of Object.keys(base)) upper[k.toUpperCase()] = base[k];
+			const readOnly = () => false;
+			envObj = new Proxy(base, {
+				set: readOnly,
+				defineProperty: readOnly,
+				deleteProperty: readOnly,
+				preventExtensions: readOnly,
 				get(t, p) {
 					if (typeof p !== "string" || p in t || p === "toJSON" || p === "then" || p in Object.prototype) {
 						return t[p];

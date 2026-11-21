@@ -285,8 +285,15 @@ func computeHugeDiff(before, after []byte, existedBefore, existsAfter bool, cont
 		if !okB || !okA || !bytes.Equal(lb, la) {
 			break
 		}
-		if len(tailSlices) < ctxCap {
-			tailSlices = append(tailSlices, lb)
+		// Lines are visited from EOF towards the change, so keep a sliding window of the most recently
+		// visited ctxCap lines: those are the ones directly after the changed region (not the file's last lines).
+		if ctxCap > 0 {
+			if len(tailSlices) == ctxCap {
+				copy(tailSlices, tailSlices[1:])
+				tailSlices[ctxCap-1] = lb
+			} else {
+				tailSlices = append(tailSlices, lb)
+			}
 		}
 		bTailEnd = prevB
 		aTailEnd = prevA
@@ -840,46 +847,51 @@ func computeIntralineSpans(a, b string) ([]Span, []Span) {
 	if a == "" || b == "" || a == b {
 		return nil, nil
 	}
-	ar := []rune(a)
-	br := []rune(b)
-
-	pref := 0
-	for pref < len(ar) && pref < len(br) && ar[pref] == br[pref] {
-		pref++
+	// Walk the RAW bytes rune-by-rune (utf8.Decode* yields size 1 for invalid bytes) so every span offset
+	// indexes the original text exactly. Converting to []rune would turn each invalid byte into U+FFFD
+	// (3 bytes) and shift all later offsets past the end of the line.
+	pref := 0 // byte length of the common prefix (identical in a and b)
+	prefRunes := 0
+	for pref < len(a) && pref < len(b) {
+		_, sa := utf8.DecodeRuneInString(a[pref:])
+		_, sb := utf8.DecodeRuneInString(b[pref:])
+		if sa != sb || a[pref:pref+sa] != b[pref:pref+sb] {
+			break
+		}
+		pref += sa
+		prefRunes++
 	}
-	suff := 0
-	for suff < len(ar)-pref && suff < len(br)-pref && ar[len(ar)-1-suff] == br[len(br)-1-suff] {
-		suff++
+	endA, endB := len(a), len(b) // start offsets of the common suffix
+	suffRunes := 0
+	for endA > pref && endB > pref {
+		_, sa := utf8.DecodeLastRuneInString(a[pref:endA])
+		_, sb := utf8.DecodeLastRuneInString(b[pref:endB])
+		if sa != sb || a[endA-sa:endA] != b[endB-sb:endB] {
+			break
+		}
+		endA -= sa
+		endB -= sb
+		suffRunes++
 	}
-	if pref+suff == 0 || (pref+suff)*5 < min(len(ar), len(br)) {
+	shared := prefRunes + suffRunes
+	if shared == 0 || shared*5 < min(utf8.RuneCountInString(a), utf8.RuneCountInString(b)) {
 		return nil, nil
 	}
 
-	buildSpans := func(runes []rune, p, s int) []Span {
+	buildSpans := func(total, midEnd int) []Span {
 		var spans []Span
-		prefBytes := runePrefixBytes(runes, p)
-		midEndBytes := runePrefixBytes(runes, len(runes)-s)
-		totalBytes := runePrefixBytes(runes, len(runes))
-		if prefBytes > 0 {
-			spans = append(spans, Span{Start: 0, End: prefBytes, Changed: false})
+		if pref > 0 {
+			spans = append(spans, Span{Start: 0, End: pref, Changed: false})
 		}
-		if midEndBytes > prefBytes {
-			spans = append(spans, Span{Start: prefBytes, End: midEndBytes, Changed: true})
+		if midEnd > pref {
+			spans = append(spans, Span{Start: pref, End: midEnd, Changed: true})
 		}
-		if totalBytes > midEndBytes {
-			spans = append(spans, Span{Start: midEndBytes, End: totalBytes, Changed: false})
+		if total > midEnd {
+			spans = append(spans, Span{Start: midEnd, End: total, Changed: false})
 		}
 		return spans
 	}
-	return buildSpans(ar, pref, suff), buildSpans(br, pref, suff)
-}
-
-func runePrefixBytes(runes []rune, count int) int {
-	n := 0
-	for i := 0; i < count && i < len(runes); i++ {
-		n += utf8.RuneLen(runes[i])
-	}
-	return n
+	return buildSpans(len(a), endA), buildSpans(len(b), endB)
 }
 
 func splitNormalizedLines(raw []byte) []string {

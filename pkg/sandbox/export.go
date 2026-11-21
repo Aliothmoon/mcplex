@@ -16,10 +16,15 @@ import (
 )
 
 const (
-	maxExportDepth      = 64
-	maxExportArrayLen   = 100_000
-	maxExportTotalNodes = 250_000
+	maxExportDepth      = 1000
+	maxExportArrayLen   = 1_000_000
+	maxExportTotalNodes = 2_000_000
 	maxExportByteSlice  = 16 * 1024 * 1024
+)
+
+var (
+	gojaMapExportType = reflect.TypeOf([][2]any{})
+	gojaSetExportType = reflect.TypeOf([]any{})
 )
 
 type exportState struct {
@@ -29,31 +34,96 @@ type exportState struct {
 	forLog  bool
 }
 
-// tryJS executes fn while catching any Goja runtime panic (such as throwing JS property getters or Proxy traps)
-// and converting it into a regular Go error.
-func tryJS(fn func()) (err error) {
+// tryJS executes fn — which may re-enter JS through property getters, Proxy traps or toString/valueOf —
+// under vm.Try so Goja unwinds its value stack, call stack and try frames back to the entry state before the
+// exception is turned into a Go error. A bare Go recover() here would leave the stack pointer of the JS frames
+// pushed by the throwing callee in place, so a later `catch (e)` in the SAME program would bind the wrong value.
+//
+// Uncatchable exceptions (InterruptedError, StackOverflowError) are re-panicked by vm.Try only AFTER the stacks
+// have been restored; the outer recover converts them so callers can decide to rethrow (see rethrowIfInterrupted).
+func tryJS(vm *goja.Runtime, fn func()) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = recoveredToError(r)
+			err = recoveredToError(vm, r)
 		}
 	}()
-	fn()
+	if vm == nil {
+		fn()
+		return nil
+	}
+	if ex := vm.Try(fn); ex != nil {
+		return stableJSError(vm, ex)
+	}
 	return nil
 }
 
-func recoveredToError(r any) error {
+// jsThrowError is a JS exception whose message was rendered once under vm.Try, so calling Error() later never
+// re-enters JS (goja's (*Exception).Error() invokes the thrown value's toString, which may itself throw).
+type jsThrowError struct {
+	msg string
+	ex  *goja.Exception
+}
+
+func (e *jsThrowError) Error() string { return e.msg }
+
+// Value returns the original thrown JS value.
+func (e *jsThrowError) Value() goja.Value {
+	if e.ex == nil {
+		return nil
+	}
+	return e.ex.Value()
+}
+
+func stableJSError(vm *goja.Runtime, ex *goja.Exception) error {
+	if ex == nil {
+		return nil
+	}
+	var msg string
+	if vm != nil {
+		if inner := vm.Try(func() { msg = ex.Error() }); inner != nil {
+			msg = describeThrownWithoutJS(ex.Value()) + " (toString threw)"
+		}
+	} else {
+		msg = describeThrownWithoutJS(ex.Value())
+	}
+	if strings.TrimSpace(msg) == "" {
+		msg = "uncaught JS exception"
+	}
+	return &jsThrowError{msg: msg, ex: ex}
+}
+
+// describeThrownWithoutJS renders a thrown value without invoking any user-defined JS code.
+func describeThrownWithoutJS(v goja.Value) string {
+	if v == nil || goja.IsUndefined(v) {
+		return "undefined"
+	}
+	if goja.IsNull(v) {
+		return "null"
+	}
+	if obj, ok := v.(*goja.Object); ok {
+		return "[object " + obj.ClassName() + "]"
+	}
+	return v.String()
+}
+
+func recoveredToError(vm *goja.Runtime, r any) error {
 	if r == nil {
 		return nil
+	}
+	if ex, ok := r.(*goja.Exception); ok {
+		return stableJSError(vm, ex)
 	}
 	if err, ok := r.(error); ok {
 		return err
 	}
 	if gv, ok := r.(goja.Value); ok {
 		var s string
-		if err := tryJS(func() { s = gv.String() }); err == nil && s != "" {
-			return errors.New(s)
+		if vm != nil {
+			if ex := vm.Try(func() { s = gv.String() }); ex == nil && s != "" {
+				return errors.New(s)
+			}
 		}
-		return errors.New("uncaught JS value")
+		return errors.New(describeThrownWithoutJS(gv))
 	}
 	return fmt.Errorf("%v", r)
 }
@@ -72,8 +142,8 @@ func safeErrString(err error) (s string) {
 
 // safeExportValue converts a guest Goja value into a cycle-free, depth-bounded, JSON-safe Go value:
 //   - Ancestor-path cycle tracking (`[Circular]`) so shared DAG references export normally without false positives
-//   - Max depth 64 (`[MaxDepth]`)
-//   - Sparse/huge Array OOM guard (`length > 100_000` returns a `RangeError` before allocating)
+//   - Max depth 1000 (`[MaxDepth]` in logs; a RangeError for results and host-call arguments, never silent truncation)
+//   - Sparse/huge Array OOM guard (`length > 1_000_000` or > 2M total nodes returns a `RangeError` before allocating)
 //   - `NaN` / `±Infinity` converted to `nil` (`null` in JSON, matching `JSON.stringify`)
 //   - `Proxy` (`process.env`, `P`/`payloads`) and `DynamicObject` exported via own keys + property gets
 //   - `ArrayBuffer` / `Uint8Array` / `Buffer` cloned with `bytes.Clone`
@@ -181,7 +251,7 @@ func safeFormatLogArg(vm *goja.Runtime, val goja.Value) string {
 			return strconv.FormatFloat(x, 'g', -1, 64)
 		default:
 			var s string
-			if err := tryJS(func() { s = val.String() }); err != nil {
+			if err := tryJS(vm, func() { s = val.String() }); err != nil {
 				rethrowIfInterrupted(err)
 				return "[Thrown: " + output.SliceUTF8Bytes(safeErrString(err), 120) + "]"
 			}
@@ -190,7 +260,7 @@ func safeFormatLogArg(vm *goja.Runtime, val goja.Value) string {
 	}
 
 	var className string
-	if err := tryJS(func() { className = obj.ClassName() }); err != nil {
+	if err := tryJS(vm, func() { className = obj.ClassName() }); err != nil {
 		rethrowIfInterrupted(err)
 		return "[Thrown: " + output.SliceUTF8Bytes(safeErrString(err), 120) + "]"
 	}
@@ -199,7 +269,7 @@ func safeFormatLogArg(vm *goja.Runtime, val goja.Value) string {
 	}
 	if className == "Error" || className == "RegExp" {
 		var s string
-		if err := tryJS(func() { s = obj.String() }); err != nil {
+		if err := tryJS(vm, func() { s = obj.String() }); err != nil {
 			rethrowIfInterrupted(err)
 			return "[" + className + ": " + output.SliceUTF8Bytes(safeErrString(err), 120) + "]"
 		}
@@ -259,7 +329,7 @@ func (st *exportState) exportVal(val goja.Value, depth int) (any, error) {
 	obj, isObj := val.(*goja.Object)
 	if !isObj {
 		var exp any
-		if err := tryJS(func() { exp = val.Export() }); err != nil {
+		if err := tryJS(st.vm, func() { exp = val.Export() }); err != nil {
 			return nil, err
 		}
 		switch x := exp.(type) {
@@ -310,35 +380,76 @@ func (st *exportState) exportVal(val goja.Value, depth int) (any, error) {
 		return "[Circular]", nil
 	}
 	if depth >= maxExportDepth {
-		return "[MaxDepth]", nil
+		if st.forLog {
+			return "[MaxDepth]", nil
+		}
+		// Never silently truncate data handed to host calls (state.set, fs.write JSON) or returned as the result.
+		return nil, fmt.Errorf("RangeError: value is nested deeper than %d levels; flatten it (e.g. store a linked list as an array) before passing or returning it", maxExportDepth)
 	}
 	st.nodes++
 	if st.nodes > maxExportTotalNodes {
 		if st.forLog {
 			return "[MaxItems]", nil
 		}
-		return nil, fmt.Errorf("RangeError: exported value exceeds max %d elements", maxExportTotalNodes)
+		return nil, fmt.Errorf("RangeError: exported value exceeds max %d elements; return a summary or write the data to a file with fs.write", maxExportTotalNodes)
 	}
 
 	st.visited[obj] = true
 	defer delete(st.visited, obj)
 
 	var className string
-	if err := tryJS(func() { className = obj.ClassName() }); err != nil {
+	if err := tryJS(st.vm, func() {
+		className = obj.ClassName()
+		if className == "Object" {
+			// Goja reports class "Object" for Map/Set; identify them by their native export type instead.
+			switch obj.ExportType() {
+			case gojaMapExportType:
+				className = "Map"
+			case gojaSetExportType:
+				className = "Set"
+			}
+		}
+	}); err != nil {
 		return nil, err
 	}
 
 	switch className {
+	case "Map", "Set":
+		// Map -> [[key, value], ...], Set -> [value, ...] (insertion order), matching goja's historical Export()
+		// shape. Iterate through Array.from under vm.Try so user-defined iterators/getters cannot corrupt the VM.
+		var listVal goja.Value
+		if err := tryJS(st.vm, func() {
+			arrayCtor := st.vm.Get("Array")
+			if arrayCtor == nil {
+				return
+			}
+			from, ok := goja.AssertFunction(arrayCtor.ToObject(st.vm).Get("from"))
+			if !ok {
+				return
+			}
+			v, callErr := from(arrayCtor, obj)
+			if callErr != nil {
+				panic(callErr)
+			}
+			listVal = v
+		}); err != nil {
+			return nil, err
+		}
+		if listVal == nil {
+			return []any{}, nil
+		}
+		return st.exportVal(listVal, depth)
+
 	case "Boolean":
 		var b bool
-		if err := tryJS(func() { b = obj.ToBoolean() }); err != nil {
+		if err := tryJS(st.vm, func() { b = obj.ToBoolean() }); err != nil {
 			return nil, err
 		}
 		return b, nil
 
 	case "Number":
 		var f float64
-		if err := tryJS(func() { f = obj.ToFloat() }); err != nil {
+		if err := tryJS(st.vm, func() { f = obj.ToFloat() }); err != nil {
 			return nil, err
 		}
 		if math.IsNaN(f) {
@@ -360,14 +471,14 @@ func (st *exportState) exportVal(val goja.Value, depth int) (any, error) {
 
 	case "String":
 		var s string
-		if err := tryJS(func() { s = obj.String() }); err != nil {
+		if err := tryJS(st.vm, func() { s = obj.String() }); err != nil {
 			return nil, err
 		}
 		return s, nil
 
 	case "Date":
 		var iso any
-		if err := tryJS(func() {
+		if err := tryJS(st.vm, func() {
 			if toJSONVal := obj.Get("toJSON"); toJSONVal != nil {
 				if fn, ok := goja.AssertFunction(toJSONVal); ok {
 					res, fnErr := fn(obj)
@@ -391,7 +502,7 @@ func (st *exportState) exportVal(val goja.Value, depth int) (any, error) {
 	case "RegExp":
 		if st.forLog {
 			var s string
-			if err := tryJS(func() { s = obj.String() }); err != nil {
+			if err := tryJS(st.vm, func() { s = obj.String() }); err != nil {
 				return nil, err
 			}
 			return s, nil
@@ -400,7 +511,7 @@ func (st *exportState) exportVal(val goja.Value, depth int) (any, error) {
 
 	case "Array":
 		var arrLen int64
-		if err := tryJS(func() {
+		if err := tryJS(st.vm, func() {
 			lenVal := obj.Get("length")
 			if lenVal != nil && !goja.IsUndefined(lenVal) && !goja.IsNull(lenVal) {
 				arrLen = lenVal.ToInteger()
@@ -423,7 +534,7 @@ func (st *exportState) exportVal(val goja.Value, depth int) (any, error) {
 		out := make([]any, arrLen)
 		for i := int64(0); i < arrLen; i++ {
 			var elem goja.Value
-			if err := tryJS(func() { elem = obj.Get(strconv.FormatInt(i, 10)) }); err != nil {
+			if err := tryJS(st.vm, func() { elem = obj.Get(strconv.FormatInt(i, 10)) }); err != nil {
 				if st.forLog {
 					rethrowIfInterrupted(err)
 					out[i] = "[GetterError: " + output.SliceUTF8Bytes(safeErrString(err), 120) + "]"
@@ -453,9 +564,9 @@ func (st *exportState) exportVal(val goja.Value, depth int) (any, error) {
 	}
 
 	// Non-byte TypedArrays (Int32Array, Float64Array, etc.)
-	if isTypedArrayView(obj) {
+	if isTypedArrayView(st.vm, obj) {
 		var tLen int64
-		if err := tryJS(func() {
+		if err := tryJS(st.vm, func() {
 			if lv := obj.Get("length"); lv != nil && !goja.IsUndefined(lv) {
 				tLen = lv.ToInteger()
 			}
@@ -471,7 +582,7 @@ func (st *exportState) exportVal(val goja.Value, depth int) (any, error) {
 		out := make([]any, tLen)
 		for i := int64(0); i < tLen; i++ {
 			var elem goja.Value
-			if err := tryJS(func() { elem = obj.Get(strconv.FormatInt(i, 10)) }); err != nil {
+			if err := tryJS(st.vm, func() { elem = obj.Get(strconv.FormatInt(i, 10)) }); err != nil {
 				return nil, err
 			}
 			v, err := st.exportVal(elem, depth+1)
@@ -485,7 +596,7 @@ func (st *exportState) exportVal(val goja.Value, depth int) (any, error) {
 
 	// Plain Objects, Error objects, ECMAScript Proxies (`process.env`, `P`/`payloads`), DynamicObjects, and Go maps.
 	var keys []string
-	if err := tryJS(func() {
+	if err := tryJS(st.vm, func() {
 		keys = obj.Keys()
 		if len(keys) == 0 {
 			// Fallback for Proxy wrappers if Goja's Proxy.Keys() did not enumerate target keys.
@@ -508,7 +619,7 @@ func (st *exportState) exportVal(val goja.Value, depth int) (any, error) {
 			return nil, fmt.Errorf("RangeError: exported object exceeds max %d total properties", maxExportTotalNodes)
 		}
 		var propVal goja.Value
-		if err := tryJS(func() { propVal = obj.Get(k) }); err != nil {
+		if err := tryJS(st.vm, func() { propVal = obj.Get(k) }); err != nil {
 			if st.forLog {
 				rethrowIfInterrupted(err)
 				out[k] = "[GetterError: " + output.SliceUTF8Bytes(safeErrString(err), 120) + "]"
@@ -543,7 +654,7 @@ func (st *exportState) exportVal(val goja.Value, depth int) (any, error) {
 
 	// Standard JS `new Error("msg")` has non-enumerable `name` & `message`; surface them when no enumerable keys exist.
 	if className == "Error" && len(out) == 0 {
-		_ = tryJS(func() {
+		_ = tryJS(st.vm, func() {
 			if n := obj.Get("name"); n != nil && !goja.IsUndefined(n) && !goja.IsNull(n) {
 				out["name"] = n.String()
 			}
@@ -559,7 +670,7 @@ func (st *exportState) exportVal(val goja.Value, depth int) (any, error) {
 func (st *exportState) tryExtractClonedBytes(obj *goja.Object) ([]byte, bool, error) {
 	var rawExp any
 	var hasDirectExp bool
-	if err := tryJS(func() {
+	if err := tryJS(st.vm, func() {
 		et := obj.ExportType()
 		if et == reflect.TypeOf(goja.ArrayBuffer{}) || et == reflect.TypeOf([]byte(nil)) {
 			rawExp = obj.Export()
@@ -588,7 +699,7 @@ func (st *exportState) tryExtractClonedBytes(obj *goja.Object) ([]byte, bool, er
 	var viewBytes []byte
 	var matched bool
 	var rangeErr error
-	if err := tryJS(func() {
+	if err := tryJS(st.vm, func() {
 		if obj.ExportType() == reflect.TypeOf(goja.Proxy{}) {
 			return
 		}
@@ -652,9 +763,9 @@ func (st *exportState) tryExtractClonedBytes(obj *goja.Object) ([]byte, bool, er
 	return viewBytes, matched, nil
 }
 
-func isTypedArrayView(obj *goja.Object) bool {
+func isTypedArrayView(vm *goja.Runtime, obj *goja.Object) bool {
 	var ok bool
-	_ = tryJS(func() {
+	_ = tryJS(vm, func() {
 		switch obj.ClassName() {
 		case "Int8Array", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array":
 			ok = true

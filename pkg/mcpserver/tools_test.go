@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -15,6 +16,7 @@ import (
 	"testing"
 
 	ptcruntime "github.com/aliothmoon/mcplex/pkg/runtime"
+	"github.com/aliothmoon/mcplex/pkg/tasks"
 )
 
 func TestToolsListRespectsToolSetProfile(t *testing.T) {
@@ -261,18 +263,25 @@ func TestSpawnTaskAndSandboxTasksNamespaceOverHTTP(t *testing.T) {
 	}
 	delResp.Body.Close()
 
-	// Verify task is now killed.
-	_, statusOut := post(sid, map[string]any{
-		"jsonrpc": "2.0",
-		"id":      4,
-		"method":  "tools/call",
-		"params": map[string]any{
-			"name":      "task",
-			"arguments": map[string]any{"action": "status", "taskId": "bg-srv-1"},
-		},
-	})
-	statusJSON, _ := json.Marshal(statusOut)
-	if !strings.Contains(string(statusJSON), "killed") {
-		t.Fatalf("expected daemon to be killed after DELETE /mcp, got: %s", string(statusJSON))
+	// The terminated session answers HTTP 404 (client must re-initialize) ...
+	staleReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":4,"method":"ping"}`))
+	staleReq.Header.Set("Content-Type", "application/json")
+	staleReq.Header.Set("Mcp-Session-Id", sid)
+	staleResp, err := http.DefaultClient.Do(staleReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleResp.Body.Close()
+	if staleResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for deleted session, got %d", staleResp.StatusCode)
+	}
+
+	// ... and its daemon has been killed (checked through the engine, scoped to the old session).
+	_, statusText, err := eng.RunTaskManage(ptcruntime.WithSessionID(context.Background(), sid), tasks.ManageRequest{Action: "status", TaskID: "bg-srv-1"})
+	if err != nil {
+		t.Fatalf("task status after DELETE: %v", err)
+	}
+	if !strings.Contains(statusText, "killed") {
+		t.Fatalf("expected daemon to be killed after DELETE /mcp, got: %s", statusText)
 	}
 }

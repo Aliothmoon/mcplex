@@ -85,12 +85,35 @@ type Event struct {
 	Diff         *diff.Result `json:"diff,omitempty"`
 }
 
+// subscriberOverflowCap bounds events queued behind a full subscriber channel. Beyond it the oldest
+// non-terminal queued event is dropped (terminal lifecycle events are kept up to subscriberOverflowHardCap).
+const (
+	subscriberOverflowCap     = 256
+	subscriberOverflowHardCap = 4096
+)
+
+// subscriber delivers events in Seq order: Emit sends directly into ch while nothing is queued; once ch is full,
+// events go to a bounded FIFO overflow that a single pump goroutine forwards. Emit never blocks, never re-orders
+// already-buffered events, and never spawns more than one goroutine per subscriber.
 type subscriber struct {
 	id            int64
 	sessionFilter string
 	ch            chan Event
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
+
+	mu       sync.Mutex
+	overflow []Event
+	inFlight bool // pump holds the oldest queued event and is blocked sending it
+	pumping  bool
+	stopped  bool
+}
+
+// ringSlot is one physical ring entry; dead slots were superseded (stream coalescing / terminal replacement)
+// and are skipped until the next compaction.
+type ringSlot struct {
+	ev   Event
+	dead bool
 }
 
 // Hub maintains a bounded ring buffer of recent events and fans out live events non-blockingly.
@@ -102,7 +125,10 @@ type Hub struct {
 	seq            atomic.Int64
 	nextSubID      atomic.Int64
 	mu             sync.RWMutex
-	ring           []Event
+	ring           []ringSlot     // live entries are the non-dead slots in ring[ringStart:], oldest first
+	ringStart      int            // physical index of the oldest retained slot
+	ringLive       int            // number of live slots
+	streamIdx      map[string]int // StreamID -> physical index of its live (non-chunk) entry
 	subs           map[int64]*subscriber
 	sessionLabels  map[string]string
 	droppedDeliver atomic.Int64
@@ -123,7 +149,8 @@ func NewHub(capacity int) *Hub {
 	return &Hub{
 		capacity:      capacity,
 		instanceID:    inst,
-		ring:          make([]Event, 0, min(capacity, 64)),
+		ring:          make([]ringSlot, 0, min(capacity, 64)),
+		streamIdx:     map[string]int{},
 		subs:          map[int64]*subscriber{},
 		sessionLabels: map[string]string{},
 	}
@@ -218,7 +245,7 @@ func (h *Hub) Emit(ev Event) Event {
 		if sub.sessionFilter != "" && ev.SessionID != sub.sessionFilter {
 			continue
 		}
-		if deliverToSubscriberLocked(sub, ev) {
+		if sub.deliver(ev) {
 			h.droppedDeliver.Add(1)
 		}
 	}
@@ -226,83 +253,80 @@ func (h *Hub) Emit(ev Event) Event {
 	return ev
 }
 
-func deliverToSubscriberLocked(sub *subscriber, ev Event) (dropped bool) {
-	select {
-	case sub.ch <- ev:
+// deliver enqueues ev for sub without blocking and without re-ordering anything already buffered.
+// Returns true when some event had to be dropped. Called with h.mu held (Emit order == Seq order).
+func (sub *subscriber) deliver(ev Event) (dropped bool) {
+	sub.mu.Lock()
+	defer sub.mu.Unlock()
+	if sub.stopped {
 		return false
-	default:
 	}
-
-	select {
-	case head := <-sub.ch:
-		if !isTerminalLifecycleEvent(head) {
-			select {
-			case sub.ch <- ev:
-			default:
-			}
-			return true
-		}
-		var scratch [subscriberChanCap]Event
-		scratch[0] = head
-		n := 1
-		for n < len(scratch) {
-			select {
-			case item := <-sub.ch:
-				scratch[n] = item
-				n++
-			default:
-				goto drained
-			}
-		}
-	drained:
-		dropIdx := -1
-		for i := 0; i < n; i++ {
-			if !isTerminalLifecycleEvent(scratch[i]) {
-				dropIdx = i
-				break
-			}
-		}
-		if dropIdx >= 0 {
-			for i := 0; i < n; i++ {
-				if i == dropIdx {
-					continue
-				}
-				select {
-				case sub.ch <- scratch[i]:
-				default:
-				}
-			}
-			select {
-			case sub.ch <- ev:
-			default:
-			}
-			return true
-		}
-		for i := 0; i < n; i++ {
-			select {
-			case sub.ch <- scratch[i]:
-			default:
-			}
-		}
-		if !isTerminalLifecycleEvent(ev) {
-			return true
-		}
-		sub.wg.Add(1)
-		go func(e Event) {
-			defer sub.wg.Done()
-			select {
-			case sub.ch <- e:
-			case <-sub.stopCh:
-			}
-		}(ev)
-		return false
-	default:
+	if len(sub.overflow) == 0 && !sub.inFlight {
 		select {
 		case sub.ch <- ev:
 			return false
 		default:
-			return true
 		}
+	}
+	sub.overflow = append(sub.overflow, ev)
+	if len(sub.overflow) > subscriberOverflowCap {
+		dropIdx := -1
+		for i := range sub.overflow {
+			if !isTerminalLifecycleEvent(sub.overflow[i]) {
+				dropIdx = i
+				break
+			}
+		}
+		if dropIdx < 0 && len(sub.overflow) > subscriberOverflowHardCap {
+			dropIdx = 0 // consumer is stuck: bound memory even for lifecycle events
+		}
+		if dropIdx >= 0 {
+			copy(sub.overflow[dropIdx:], sub.overflow[dropIdx+1:])
+			sub.overflow[len(sub.overflow)-1] = Event{}
+			sub.overflow = sub.overflow[:len(sub.overflow)-1]
+			dropped = true
+		}
+	}
+	if !sub.pumping {
+		sub.pumping = true
+		sub.wg.Add(1)
+		go sub.pump()
+	}
+	return dropped
+}
+
+// pump forwards queued overflow events into ch in FIFO order until the queue is empty or the subscriber stops.
+func (sub *subscriber) pump() {
+	defer sub.wg.Done()
+	for {
+		sub.mu.Lock()
+		if sub.stopped || len(sub.overflow) == 0 {
+			sub.pumping = false
+			sub.inFlight = false
+			sub.mu.Unlock()
+			return
+		}
+		next := sub.overflow[0]
+		sub.overflow[0] = Event{}
+		sub.overflow = sub.overflow[1:]
+		if len(sub.overflow) == 0 {
+			sub.overflow = nil
+		}
+		sub.inFlight = true
+		sub.mu.Unlock()
+
+		select {
+		case sub.ch <- next:
+		case <-sub.stopCh:
+			sub.mu.Lock()
+			sub.pumping = false
+			sub.inFlight = false
+			sub.mu.Unlock()
+			return
+		}
+		sub.mu.Lock()
+		sub.inFlight = false
+		sub.mu.Unlock()
 	}
 }
 
@@ -336,13 +360,18 @@ func (h *Hub) Subscribe(sessionFilter string, replay int, afterSeq int64) (<-cha
 			if ok {
 				delete(h.subs, id)
 				h.subCount.Add(-1)
-				close(sub.stopCh)
 			}
 			h.mu.Unlock()
-			if ok {
-				sub.wg.Wait()
-				close(sub.ch)
+			if !ok {
+				return
 			}
+			sub.mu.Lock()
+			sub.stopped = true
+			sub.overflow = nil
+			sub.mu.Unlock()
+			close(sub.stopCh)
+			sub.wg.Wait()
+			close(sub.ch)
 		})
 	}
 	return sub.ch, history, cancel
@@ -360,14 +389,15 @@ func (h *Hub) Recent(sessionFilter string, limit int, afterSeq int64) []Event {
 
 func (h *Hub) matchingLocked(sessionFilter string, limit int, afterSeq int64) []Event {
 	var out []Event
-	for _, ev := range h.ring {
-		if ev.Seq <= afterSeq {
+	for i := h.ringStart; i < len(h.ring); i++ {
+		slot := &h.ring[i]
+		if slot.dead || slot.ev.Seq <= afterSeq {
 			continue
 		}
-		if sessionFilter != "" && ev.SessionID != sessionFilter {
+		if sessionFilter != "" && slot.ev.SessionID != sessionFilter {
 			continue
 		}
-		out = append(out, ev)
+		out = append(out, slot.ev)
 	}
 	if limit > 0 && len(out) > limit {
 		out = out[len(out)-limit:]
@@ -377,56 +407,101 @@ func (h *Hub) matchingLocked(sessionFilter string, limit int, afterSeq int64) []
 	return cp
 }
 
+// ringAppendLocked appends ev as the newest live entry, evicting the oldest live entries above capacity.
+// Amortized O(1): superseded entries are tombstoned and the backing slice is compacted only after it has
+// grown by at least `capacity` slots since the last compaction.
+func (h *Hub) ringAppendLocked(ev Event) {
+	h.ring = append(h.ring, ringSlot{ev: ev})
+	h.ringLive++
+	if ev.StreamID != "" && ev.Kind != KindStreamChunk {
+		h.streamIdx[ev.StreamID] = len(h.ring) - 1
+	}
+	for h.ringLive > h.capacity && h.ringStart < len(h.ring) {
+		slot := &h.ring[h.ringStart]
+		if !slot.dead {
+			if idx, ok := h.streamIdx[slot.ev.StreamID]; ok && idx == h.ringStart {
+				delete(h.streamIdx, slot.ev.StreamID)
+			}
+			h.ringLive--
+		}
+		*slot = ringSlot{} // release strings/diffs of the evicted event
+		h.ringStart++
+	}
+	if len(h.ring) >= 2*h.capacity+64 {
+		h.compactRingLocked()
+	}
+}
+
+// ringKillLocked tombstones the live slot at physical index i.
+func (h *Hub) ringKillLocked(i int) {
+	slot := &h.ring[i]
+	if slot.dead {
+		return
+	}
+	if idx, ok := h.streamIdx[slot.ev.StreamID]; ok && idx == i {
+		delete(h.streamIdx, slot.ev.StreamID)
+	}
+	slot.ev = Event{}
+	slot.dead = true
+	h.ringLive--
+}
+
+func (h *Hub) compactRingLocked() {
+	compacted := make([]ringSlot, 0, max(h.ringLive, min(h.capacity, 64)))
+	clear(h.streamIdx)
+	for i := h.ringStart; i < len(h.ring); i++ {
+		slot := h.ring[i]
+		if slot.dead {
+			continue
+		}
+		compacted = append(compacted, slot)
+		if slot.ev.StreamID != "" && slot.ev.Kind != KindStreamChunk {
+			h.streamIdx[slot.ev.StreamID] = len(compacted) - 1
+		}
+	}
+	h.ring = compacted
+	h.ringStart = 0
+}
+
 func (h *Hub) recordRingLocked(ev *Event) {
 	if ev.Kind == KindStreamChunk && ev.StreamID != "" {
-		// Coalesce live stream chunks into the existing ring entry so long-running logs
-		// never evict earlier CRUD/diff events, while updating Seq & Timestamp and keeping
-		// ring entries monotonic so Last-Event-ID (afterSeq) reconnects replay missed output!
-		for i := len(h.ring) - 1; i >= 0; i-- {
-			if h.ring[i].StreamID == ev.StreamID && h.ring[i].Kind != KindStreamChunk {
-				updated := h.ring[i]
-				combined := updated.Detail + ev.Detail
-				trimmed, capped := CapTailPreview(combined, DefaultShellPreview)
-				updated.Detail = trimmed
-				if capped {
-					updated.Truncated = true
-				}
-				if ev.Summary != "" {
-					updated.Summary = ev.Summary
-				}
-				updated.Seq = ev.Seq
-				if ev.Timestamp != "" {
-					updated.Timestamp = ev.Timestamp
-				}
-				if i < len(h.ring)-1 {
-					copy(h.ring[i:], h.ring[i+1:])
-				}
-				h.ring[len(h.ring)-1] = updated
-				return
-			}
+		// Coalesce live stream chunks into the stream's ring entry so long-running logs never evict earlier
+		// CRUD/diff events, while moving it to the newest position with the chunk's Seq & Timestamp so ring
+		// entries stay monotonic and Last-Event-ID (afterSeq) reconnects replay missed output.
+		idx, ok := h.streamIdx[ev.StreamID]
+		if !ok {
+			return
 		}
+		updated := h.ring[idx].ev
+		trimmed, capped := CapTailPreview(updated.Detail+ev.Detail, DefaultShellPreview)
+		updated.Detail = trimmed
+		if capped {
+			updated.Truncated = true
+		}
+		if ev.Summary != "" {
+			updated.Summary = ev.Summary
+		}
+		updated.Seq = ev.Seq
+		if ev.Timestamp != "" {
+			updated.Timestamp = ev.Timestamp
+		}
+		h.ringKillLocked(idx)
+		h.ringAppendLocked(updated)
 		return
 	}
 	// When a terminal shell/task event arrives for an active stream, replace its earlier
 	// "running" ring slot so replay returns one final card while afterSeq reconnects see the new Seq.
 	if ev.StreamID != "" && ev.Status != "running" {
-		for i := len(h.ring) - 1; i >= 0; i-- {
-			if h.ring[i].StreamID == ev.StreamID {
-				if ev.Detail == "" && h.ring[i].Detail != "" {
-					ev.Detail = h.ring[i].Detail
-					ev.Truncated = ev.Truncated || h.ring[i].Truncated
-				}
-				h.ring = append(h.ring[:i], h.ring[i+1:]...)
-				break
+		if idx, ok := h.streamIdx[ev.StreamID]; ok {
+			prev := h.ring[idx].ev
+			if ev.Detail == "" && prev.Detail != "" {
+				ev.Detail = prev.Detail
+				ev.Truncated = ev.Truncated || prev.Truncated
 			}
+			h.ringKillLocked(idx)
 		}
 	}
-	if len(h.ring) >= h.capacity {
-		copy(h.ring, h.ring[1:])
-		h.ring[len(h.ring)-1] = *ev
-	} else {
-		h.ring = append(h.ring, *ev)
-	}
+	h.ringAppendLocked(*ev)
 }
 
 // CapPreview trims s safely on a UTF-8 boundary to maxBytes (keeping the head).
