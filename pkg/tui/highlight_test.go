@@ -3,8 +3,11 @@ package tui
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 )
 
 func TestDetectLangAndMultiLanguageHighlightIntegrity(t *testing.T) {
@@ -35,7 +38,6 @@ func TestDetectLangAndMultiLanguageHighlightIntegrity(t *testing.T) {
 		}
 	}
 
-	// Highlighting MUST never corrupt or drop visible characters across any language!
 	snippets := map[string][]string{
 		"go":       {`package main`, `func serve(ctx context.Context) error { // hi`, `return nil`},
 		"json":     {`{`, `  "name": "mcplex",`, `  "port": 8787,`, `  "live": true`, `}`},
@@ -62,9 +64,42 @@ func TestDetectLangAndMultiLanguageHighlightIntegrity(t *testing.T) {
 		}
 	}
 
-	// Verify Markdown **bold** renders cleanly without breaking search text
 	mdBold := highlightMarkdownLine("Use **atomic** transactions")
 	if !strings.Contains(ansi.Strip(mdBold), "atomic") {
 		t.Fatalf("markdown bold stripped content: %q", mdBold)
+	}
+}
+
+func TestChineseURLHighlightingNeverSplitsUTF8Runes(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(prev)
+
+	// '全' (E5 85 A8) contains 0x85 (NEL) and '加' (E5 8A A0) contains 0xA0 (NBSP),
+	// which previously tripped byte-wise unicode.IsSpace(rune(line[end]))!
+	url := "https://example.com/全部加载"
+	mdLine := "查看链接 " + url + " 以及 [文档](" + url + ") 完成"
+	mdOut := highlightMarkdownLine(mdLine)
+	if !utf8.ValidString(mdOut) {
+		t.Fatalf("highlightMarkdownLine split UTF-8 rune into invalid sequence: %q", mdOut)
+	}
+	if ansi.Strip(mdOut) != mdLine {
+		t.Fatalf("highlightMarkdownLine altered plain text:\n got: %q\nwant: %q", ansi.Strip(mdOut), mdLine)
+	}
+	wantStyledURL := styleSynURL.Render(url)
+	if strings.Count(mdOut, wantStyledURL) != 2 {
+		t.Fatalf("expected full Chinese URL styled intact twice in markdown, got:\n%q", mdOut)
+	}
+
+	shLine := "curl -fsSL " + url + " && echo $配置全加 PASS"
+	shOut := highlightShellLine(shLine)
+	if !utf8.ValidString(shOut) {
+		t.Fatalf("highlightShellLine split UTF-8 rune into invalid sequence: %q", shOut)
+	}
+	if ansi.Strip(shOut) != shLine {
+		t.Fatalf("highlightShellLine altered plain text:\n got: %q\nwant: %q", ansi.Strip(shOut), shLine)
+	}
+	if !strings.Contains(shOut, wantStyledURL) {
+		t.Fatalf("expected full Chinese URL styled intact in shell line, got:\n%q", shOut)
 	}
 }

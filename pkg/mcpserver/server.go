@@ -76,13 +76,19 @@ type ServerOptions struct {
 	SkillResourceText  string
 }
 
+type inFlightEntry struct {
+	token  uint64
+	cancel context.CancelFunc
+}
+
 // Server speaks MCP JSON-RPC 2.0 over stdio (NDJSON & Content-Length) and Streamable HTTP.
 type Server struct {
-	Engine     *ptcruntime.Engine
-	opts       ServerOptions
-	wMu        sync.Mutex
-	inFlightMu sync.Mutex
-	inFlight   map[string]context.CancelFunc
+	Engine      *ptcruntime.Engine
+	opts        ServerOptions
+	wMu         sync.Mutex
+	inFlightMu  sync.Mutex
+	inFlightSeq uint64
+	inFlight    map[string]inFlightEntry
 }
 
 // NewServer wraps an Engine in an MCP server with default options.
@@ -98,7 +104,7 @@ func NewServerWithOptions(engine *ptcruntime.Engine, opts ServerOptions) *Server
 	return &Server{
 		Engine:   engine,
 		opts:     opts,
-		inFlight: map[string]context.CancelFunc{},
+		inFlight: map[string]inFlightEntry{},
 	}
 }
 
@@ -198,6 +204,7 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 				}
 			}
 
+			const maxStdioMessageBytes = 16 * 1024 * 1024 // 16 MB
 			probeLen := min(len(buf), 16)
 			probe := strings.ToLower(string(buf[:probeLen]))
 			if strings.HasPrefix(probe, "content-length:") || strings.HasPrefix(probe, "content-type:") {
@@ -208,12 +215,22 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 					sepLen = 2
 				}
 				if sepIdx < 0 {
+					if len(buf) > 16*1024 {
+						buf = nil
+					}
 					break
 				}
 				hdr := string(buf[:sepIdx])
 				cLen := parseContentLength(hdr)
-				if cLen < 0 {
+				if cLen < 0 || cLen > maxStdioMessageBytes {
 					buf = buf[sepIdx+sepLen:]
+					if cLen > maxStdioMessageBytes {
+						writeResp(jsonRPCResponse{
+							JSONRPC: "2.0",
+							ID:      json.RawMessage("null"),
+							Error:   &rpcError{Code: -32600, Message: "Invalid Request: Content-Length exceeds 16MB limit"},
+						}, true)
+					}
 					continue
 				}
 				bodyStart := sepIdx + sepLen
@@ -228,10 +245,26 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 
 			nl := bytes.IndexByte(buf, '\n')
 			if nl < 0 {
+				if len(buf) > maxStdioMessageBytes {
+					buf = nil
+					writeResp(jsonRPCResponse{
+						JSONRPC: "2.0",
+						ID:      json.RawMessage("null"),
+						Error:   &rpcError{Code: -32600, Message: "Invalid Request: message exceeds 16MB limit"},
+					}, false)
+				}
 				break
 			}
 			line := buf[:nl]
 			buf = buf[nl+1:]
+			if len(line) > maxStdioMessageBytes {
+				writeResp(jsonRPCResponse{
+					JSONRPC: "2.0",
+					ID:      json.RawMessage("null"),
+					Error:   &rpcError{Code: -32600, Message: "Invalid Request: message exceeds 16MB limit"},
+				}, false)
+				continue
+			}
 			dispatch(line, false)
 		}
 	}
@@ -308,26 +341,30 @@ func scopedInFlightKey(sessionID string, id json.RawMessage) string {
 	return sessionID + "\x00" + idKey
 }
 
-func (s *Server) registerInFlight(sessionID string, id json.RawMessage, cancel context.CancelFunc) string {
+func (s *Server) registerInFlight(sessionID string, id json.RawMessage, cancel context.CancelFunc) (string, uint64) {
 	key := scopedInFlightKey(sessionID, id)
 	if key == "" {
-		return ""
+		return "", 0
 	}
 	s.inFlightMu.Lock()
 	if s.inFlight == nil {
-		s.inFlight = map[string]context.CancelFunc{}
+		s.inFlight = map[string]inFlightEntry{}
 	}
-	s.inFlight[key] = cancel
+	s.inFlightSeq++
+	tok := s.inFlightSeq
+	s.inFlight[key] = inFlightEntry{token: tok, cancel: cancel}
 	s.inFlightMu.Unlock()
-	return key
+	return key, tok
 }
 
-func (s *Server) unregisterInFlight(key string) {
+func (s *Server) unregisterInFlight(key string, tok uint64) {
 	if key == "" {
 		return
 	}
 	s.inFlightMu.Lock()
-	delete(s.inFlight, key)
+	if cur, ok := s.inFlight[key]; ok && cur.token == tok {
+		delete(s.inFlight, key)
+	}
 	s.inFlightMu.Unlock()
 }
 
@@ -337,10 +374,10 @@ func (s *Server) cancelInFlight(sessionID string, id json.RawMessage) bool {
 		return false
 	}
 	s.inFlightMu.Lock()
-	cancel, ok := s.inFlight[key]
+	entry, ok := s.inFlight[key]
 	s.inFlightMu.Unlock()
-	if ok && cancel != nil {
-		cancel()
+	if ok && entry.cancel != nil {
+		entry.cancel()
 		return true
 	}
 	return false
@@ -353,9 +390,9 @@ func (s *Server) cancelSessionInFlight(sessionID string) {
 	prefix := sessionID + "\x00"
 	s.inFlightMu.Lock()
 	var cancels []context.CancelFunc
-	for k, c := range s.inFlight {
-		if strings.HasPrefix(k, prefix) && c != nil {
-			cancels = append(cancels, c)
+	for k, entry := range s.inFlight {
+		if strings.HasPrefix(k, prefix) && entry.cancel != nil {
+			cancels = append(cancels, entry.cancel)
 		}
 	}
 	s.inFlightMu.Unlock()
@@ -367,8 +404,10 @@ func (s *Server) cancelSessionInFlight(sessionID string) {
 func (s *Server) cancelAllInFlight() {
 	s.inFlightMu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(s.inFlight))
-	for _, c := range s.inFlight {
-		cancels = append(cancels, c)
+	for _, entry := range s.inFlight {
+		if entry.cancel != nil {
+			cancels = append(cancels, entry.cancel)
+		}
 	}
 	s.inFlightMu.Unlock()
 	for _, c := range cancels {
@@ -395,7 +434,6 @@ func canonicalIDKey(raw json.RawMessage) string {
 }
 
 func (s *Server) handleSingle(ctx context.Context, req jsonRPCRequest) *jsonRPCResponse {
-	// Notifications (missing ID) must not emit a response, but notifications/cancelled aborts in-flight calls scoped to session.
 	sid := ptcruntime.SessionIDFromContext(ctx)
 	if len(req.ID) == 0 {
 		if req.Method == "notifications/cancelled" {
@@ -409,9 +447,9 @@ func (s *Server) handleSingle(ctx context.Context, req jsonRPCRequest) *jsonRPCR
 		return nil
 	}
 	reqCtx, reqCancel := context.WithCancel(ctx)
-	key := s.registerInFlight(sid, req.ID, reqCancel)
+	key, tok := s.registerInFlight(sid, req.ID, reqCancel)
 	defer func() {
-		s.unregisterInFlight(key)
+		s.unregisterInFlight(key, tok)
 		reqCancel()
 	}()
 	ctx = reqCtx
@@ -440,7 +478,7 @@ func (s *Server) handleSingle(ctx context.Context, req jsonRPCRequest) *jsonRPCR
 		}
 		_ = json.Unmarshal(req.Params, &params)
 		if ws := extractInitWorkspace(params.RootPath, params.RootURI, params.WorkspaceFolders); ws != "" && s.Engine != nil {
-			s.Engine.SetClientWorkspace(ws)
+			s.Engine.SetSessionClientWorkspace(sid, ws)
 		}
 		if sid != "" && s.Engine != nil && s.Engine.EventHub() != nil {
 			if name := strings.TrimSpace(params.ClientInfo.Name); name != "" {
@@ -994,8 +1032,13 @@ func fileURIToPath(raw string) string {
 		return ""
 	}
 	p := u.Path
-	if runtime.GOOS == "windows" && len(p) >= 3 && p[0] == '/' && p[2] == ':' {
-		p = p[1:]
+	if runtime.GOOS == "windows" {
+		if u.Host != "" && !strings.EqualFold(u.Host, "localhost") {
+			return `\\` + u.Host + strings.ReplaceAll(p, "/", `\`)
+		}
+		if len(p) >= 3 && p[0] == '/' && p[2] == ':' {
+			p = p[1:]
+		}
 	}
 	return p
 }

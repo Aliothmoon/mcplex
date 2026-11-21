@@ -144,6 +144,9 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 					return nil, vErr
 				}
 				res["verify"] = vRes
+				if vOk, _ := vRes["ok"].(bool); !vOk {
+					res["ok"] = false
+				}
 			}
 			return res, nil
 		},
@@ -340,8 +343,9 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 				return nil, err
 			}
 			rel := relDisplayPath(env.Cwd, abs)
-			if _, seen := tx.snapshots[abs]; !seen {
-				tx.snapshots[abs] = fileSnapshot{absPath: abs, relPath: rel, existed: true, mode: info.Mode().Perm(), origBytes: orig}
+			snapKey := snapshotKeyForPath(abs)
+			if _, seen := tx.snapshots[snapKey]; !seen {
+				tx.snapshots[snapKey] = fileSnapshot{absPath: abs, relPath: rel, existed: true, mode: info.Mode().Perm(), origBytes: orig}
 				tx.touched = append(tx.touched, rel)
 			}
 			if rmErr := os.Remove(abs); rmErr != nil {
@@ -402,8 +406,9 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 					return fileSnapshot{absPath: absTo, relPath: relDisplayPath(env.Cwd, absTo), existed: rErr == nil, mode: toMode, origBytes: orig}
 				}(),
 			} {
-				if _, seen := tx.snapshots[snap.absPath]; !seen {
-					tx.snapshots[snap.absPath] = snap
+				snapKey := snapshotKeyForPath(snap.absPath)
+				if _, seen := tx.snapshots[snapKey]; !seen {
+					tx.snapshots[snapKey] = snap
 					tx.touched = append(tx.touched, snap.relPath)
 				}
 			}
@@ -665,10 +670,17 @@ func (b *EditTxBinder) applyFileSpecsWithOwner(ctx context.Context, cwd, execOwn
 
 	if !dryRun {
 		var written []plannedFileWrite
+		var newSnapKeys []string
+		prevTouchedLen := 0
+		if tx != nil {
+			prevTouchedLen = len(tx.touched)
+		}
 		for _, pw := range planned {
+			var addedKey string
 			if tx != nil {
-				if _, seen := tx.snapshots[pw.absPath]; !seen {
-					tx.snapshots[pw.absPath] = fileSnapshot{
+				snapKey := snapshotKeyForPath(pw.absPath)
+				if _, seen := tx.snapshots[snapKey]; !seen {
+					tx.snapshots[snapKey] = fileSnapshot{
 						absPath:   pw.absPath,
 						relPath:   pw.relPath,
 						existed:   pw.existed,
@@ -676,22 +688,48 @@ func (b *EditTxBinder) applyFileSpecsWithOwner(ctx context.Context, cwd, execOwn
 						origBytes: pw.origBytes,
 					}
 					tx.touched = append(tx.touched, pw.relPath)
+					addedKey = snapKey
+					newSnapKeys = append(newSnapKeys, snapKey)
 				}
 			}
 			if err := writeFileWithMode(pw.absPath, pw.newBytes, pw.mode); err != nil {
-				if tx == nil && len(written) > 0 {
-					// Outside a tx, keep multi-file edit.apply all-or-nothing: undo files already written in this call.
+				if addedKey != "" {
+					// This file was never written on disk, so drop its fresh snapshot entry if added in this call.
+					delete(tx.snapshots, addedKey)
+					newSnapKeys = newSnapKeys[:len(newSnapKeys)-1]
+				}
+				if len(written) > 0 {
+					// Keep multi-file edit.apply AND t.edit([...]) atomic per call: undo files 0..K-1 back to pre-call bytes.
 					var undoFailed []map[string]any
+					failedKeys := map[string]bool{}
 					for i := len(written) - 1; i >= 0; i-- {
 						w := written[i]
 						if uErr := restoreSnapshot(fileSnapshot{absPath: w.absPath, relPath: w.relPath, existed: w.existed, mode: w.mode, origBytes: w.origBytes}); uErr != nil {
 							undoFailed = append(undoFailed, map[string]any{"path": w.relPath, "error": uErr.Error()})
+							failedKeys[snapshotKeyForPath(w.absPath)] = true
+						}
+					}
+					if tx != nil {
+						for _, sk := range newSnapKeys {
+							if !failedKeys[sk] {
+								delete(tx.snapshots, sk)
+							}
+						}
+						if len(undoFailed) == 0 {
+							tx.touched = tx.touched[:prevTouchedLen]
 						}
 					}
 					if len(undoFailed) > 0 {
 						return nil, fmt.Errorf("failed writing '%s': %w; ALSO failed to undo earlier writes: %s", pw.relPath, err, formatRollbackFailures(undoFailed))
 					}
-					return nil, fmt.Errorf("failed writing '%s': %w (earlier files in this edit.apply call were restored)", pw.relPath, err)
+					callLabel := "edit.apply"
+					if tx != nil {
+						callLabel = "t.edit"
+					}
+					return nil, fmt.Errorf("failed writing '%s': %w (earlier files in this %s call were restored)", pw.relPath, err, callLabel)
+				}
+				if tx != nil {
+					tx.touched = tx.touched[:prevTouchedLen]
 				}
 				return nil, fmt.Errorf("failed writing '%s': %w", pw.relPath, err)
 			}
@@ -1023,6 +1061,14 @@ func isIndentSensitivePath(relPath string) bool {
 	return false
 }
 
+func isBacktickEscapeLang(relPath string) bool {
+	switch strings.ToLower(filepath.Ext(relPath)) {
+	case ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts":
+		return true
+	}
+	return false
+}
+
 func splitLeadingHSpace(s string) (lead, rest string) {
 	i := 0
 	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
@@ -1034,30 +1080,51 @@ func splitLeadingHSpace(s string) (lead, rest string) {
 // canonicalizeCodeLine collapses runs of horizontal whitespace (' ' / '\t') OUTSIDE string literals
 // while preserving exact characters inside "...", '...', and `...`.
 func canonicalizeCodeLine(s string, keepIndent bool) string {
-	lead, rest := splitLeadingHSpace(s)
+	canon, _ := canonicalizeCodeLineStateful(s, keepIndent, false, false)
+	return canon
+}
+
+// canonicalizeCodeLineStateful tracks multiline backtick literals (`...`) across lines so interior
+// raw/template string lines keep their exact whitespace without collapsing spaces or stripping leading indent.
+func canonicalizeCodeLineStateful(s string, keepIndent, inBacktick, btEscape bool) (string, bool) {
 	var b strings.Builder
-	b.Grow(len(s) + 4)
-	if keepIndent {
-		for i := 0; i < len(lead); i++ {
-			if lead[i] == '\t' {
-				b.WriteString("    ")
-			} else {
-				b.WriteByte(' ')
-			}
-		}
-		b.WriteString("::")
-	}
+	b.Grow(len(s) + 8)
+
 	inQuote := rune(0)
 	escaped := false
 	inSpace := false
+	rest := s
+
+	if inBacktick {
+		inQuote = '`'
+		b.WriteString("\x00BT:")
+	} else {
+		i := 0
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+			i++
+		}
+		lead := s[:i]
+		rest = s[i:]
+		if keepIndent {
+			for j := 0; j < len(lead); j++ {
+				if lead[j] == '\t' {
+					b.WriteString("    ")
+				} else {
+					b.WriteByte(' ')
+				}
+			}
+			b.WriteString("::")
+		}
+	}
+
 	for _, r := range rest {
 		if inQuote != 0 {
 			b.WriteRune(r)
-			if inQuote != '`' && escaped {
+			if (inQuote != '`' || btEscape) && escaped {
 				escaped = false
 				continue
 			}
-			if inQuote != '`' && r == '\\' {
+			if (inQuote != '`' || btEscape) && r == '\\' {
 				escaped = true
 				continue
 			}
@@ -1085,7 +1152,43 @@ func canonicalizeCodeLine(s string, keepIndent bool) string {
 		}
 		b.WriteRune(r)
 	}
-	return b.String()
+	return b.String(), inQuote == '`'
+}
+
+// trackMultilineBackticks returns a per-line boolean slice indicating whether line i begins inside an
+// already-open multiline backtick string (`...`).
+func trackMultilineBackticks(lines []string, btEscape bool) []bool {
+	startsInBT := make([]bool, len(lines))
+	inBT := false
+	for i, line := range lines {
+		startsInBT[i] = inBT
+		inQuote := rune(0)
+		if inBT {
+			inQuote = '`'
+		}
+		escaped := false
+		for _, r := range line {
+			if inQuote != 0 {
+				if (inQuote != '`' || btEscape) && escaped {
+					escaped = false
+					continue
+				}
+				if (inQuote != '`' || btEscape) && r == '\\' {
+					escaped = true
+					continue
+				}
+				if r == inQuote {
+					inQuote = 0
+				}
+				continue
+			}
+			if r == '"' || r == '\'' || r == '`' {
+				inQuote = r
+			}
+		}
+		inBT = inQuote == '`'
+	}
+	return startsInBT
 }
 
 // matchWhitespaceNormalized attempts a quote-aware horizontal whitespace / indent normalized line-block
@@ -1108,6 +1211,7 @@ func matchWhitespaceNormalized(windowText, normTarget, normRepl, relPath string,
 	}
 
 	keepIndent := isIndentSensitivePath(relPath)
+	btEscape := isBacktickEscapeLang(relPath)
 	tLines := strings.Split(trimmedTarget, "\n")
 	k := len(tLines)
 	wLines := splitWindowLines(windowText)
@@ -1116,15 +1220,22 @@ func matchWhitespaceNormalized(windowText, normTarget, normRepl, relPath string,
 	}
 
 	tCanon := make([]string, k)
+	tInBT := false
 	for i, tl := range tLines {
-		tCanon[i] = canonicalizeCodeLine(tl, keepIndent)
+		tCanon[i], tInBT = canonicalizeCodeLineStateful(tl, keepIndent, tInBT, btEscape)
+	}
+
+	wCanon := make([]string, len(wLines))
+	wInBT := false
+	for i, wl := range wLines {
+		wCanon[i], wInBT = canonicalizeCodeLineStateful(wl.raw, keepIndent, wInBT, btEscape)
 	}
 
 	var hitIndices []int
 	for i := 0; i <= len(wLines)-k; i++ {
 		ok := true
 		for j := 0; j < k; j++ {
-			if canonicalizeCodeLine(wLines[i+j].raw, keepIndent) != tCanon[j] {
+			if wCanon[i+j] != tCanon[j] {
 				ok = false
 				break
 			}
@@ -1145,13 +1256,14 @@ func matchWhitespaceNormalized(windowText, normTarget, normRepl, relPath string,
 		end++
 	}
 
-	adjustedRepl = realignReplacementIndent(wLines[idx:idx+k], tLines, normRepl, keepIndent)
+	adjustedRepl = realignReplacementIndent(wLines[idx:idx+k], tLines, normRepl, keepIndent, btEscape)
 	return start, end, adjustedRepl, matchedLineNums
 }
 
 // realignReplacementIndent adjusts uniform leading-indent drift between targetLines and matched fileLines
-// so over- or under-indented hunks land with the file's actual indentation.
-func realignReplacementIndent(matched []winLineSpan, tLines []string, normRepl string, keepIndent bool) string {
+// so over- or under-indented hunks land with the file's actual indentation while leaving multiline backtick
+// raw/template string interiors untouched.
+func realignReplacementIndent(matched []winLineSpan, tLines []string, normRepl string, keepIndent, btEscape bool) string {
 	if keepIndent || len(matched) == 0 || len(matched) != len(tLines) {
 		return normRepl
 	}
@@ -1159,13 +1271,16 @@ func realignReplacementIndent(matched []winLineSpan, tLines []string, normRepl s
 	replBody := strings.TrimSuffix(normRepl, "\n")
 	rLines := strings.Split(replBody, "\n")
 
-	// Check if every non-empty target line is uniformly over-indented by extraPrefix relative to matched file lines,
-	// or uniformly under-indented by missingPrefix.
+	tStartsInBT := trackMultilineBackticks(tLines, btEscape)
+	rStartsInBT := trackMultilineBackticks(rLines, btEscape)
+
+	// Check if every non-empty code target line (outside multiline backticks) is uniformly over-indented by
+	// extraPrefix relative to matched file lines, or uniformly under-indented by missingPrefix.
 	extraPrefix := ""
 	missingPrefix := ""
 	mode := 0 // 0=init, 1=target has extraPrefix, 2=target lacks missingPrefix, -1=mixed
 	for i := range tLines {
-		if strings.TrimSpace(tLines[i]) == "" {
+		if tStartsInBT[i] || strings.TrimSpace(tLines[i]) == "" || strings.TrimSpace(matched[i].raw) == "" {
 			continue
 		}
 		fLead, _ := splitLeadingHSpace(matched[i].raw)
@@ -1200,34 +1315,40 @@ func realignReplacementIndent(matched []winLineSpan, tLines []string, normRepl s
 
 	switch mode {
 	case 1:
-		// Strip extraPrefix if every non-empty replacement line also carries it.
+		// Strip extraPrefix if every non-empty code replacement line (outside backticks) also carries it.
 		allHave := true
-		for _, rl := range rLines {
-			if strings.TrimSpace(rl) != "" && !strings.HasPrefix(rl, extraPrefix) {
+		for i, rl := range rLines {
+			if !rStartsInBT[i] && strings.TrimSpace(rl) != "" && !strings.HasPrefix(rl, extraPrefix) {
 				allHave = false
 				break
 			}
 		}
 		if allHave {
 			for i, rl := range rLines {
-				if strings.TrimSpace(rl) != "" {
+				if !rStartsInBT[i] && strings.TrimSpace(rl) != "" {
 					rLines[i] = rl[len(extraPrefix):]
 				}
 			}
 		}
 	case 2:
 		for i, rl := range rLines {
-			if strings.TrimSpace(rl) != "" {
+			if !rStartsInBT[i] && strings.TrimSpace(rl) != "" {
 				rLines[i] = missingPrefix + rl
 			}
 		}
 	default:
 		// Special case: caller omitted leading indent ONLY on line 0 of both target and replacement.
-		fLead0, _ := splitLeadingHSpace(matched[0].raw)
-		tLead0, _ := splitLeadingHSpace(tLines[0])
-		rLead0, _ := splitLeadingHSpace(rLines[0])
-		if fLead0 != "" && tLead0 == "" && rLead0 == "" && strings.TrimSpace(rLines[0]) != "" {
-			rLines[0] = fLead0 + rLines[0]
+		// Guard against whitespace-only matched[0].raw so trailing spaces on a blank line are never copied as code indent.
+		if !tStartsInBT[0] && !rStartsInBT[0] &&
+			strings.TrimSpace(matched[0].raw) != "" &&
+			strings.TrimSpace(tLines[0]) != "" &&
+			strings.TrimSpace(rLines[0]) != "" {
+			fLead0, _ := splitLeadingHSpace(matched[0].raw)
+			tLead0, _ := splitLeadingHSpace(tLines[0])
+			rLead0, _ := splitLeadingHSpace(rLines[0])
+			if fLead0 != "" && tLead0 == "" && rLead0 == "" {
+				rLines[0] = fLead0 + rLines[0]
+			}
 		}
 	}
 

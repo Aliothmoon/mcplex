@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aliothmoon/mcplex/internal/shellcmd"
 	"github.com/aliothmoon/mcplex/pkg/events"
 	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
@@ -166,7 +167,10 @@ func (b *ShellGitBinder) RunArgv(parentCtx context.Context, env *sandbox.Executi
 	runErr := runManagedCmd(cmd)
 	durMs := time.Since(start).Milliseconds()
 
-	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(runErr, exec.ErrWaitDelay)
+	if errors.Is(runErr, exec.ErrWaitDelay) && ctx.Err() == nil && parentCtx.Err() == nil && cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 0 {
+		runErr = nil
+	}
+	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(parentCtx.Err(), context.DeadlineExceeded)
 	exitCode := 0
 	spawnErr := ""
 	if runErr != nil {
@@ -176,6 +180,8 @@ func (b *ShellGitBinder) RunArgv(parentCtx context.Context, env *sandbox.Executi
 			exitCode = -1
 		case errors.As(runErr, &exitErr):
 			exitCode = exitErr.ExitCode()
+		case errors.Is(runErr, exec.ErrWaitDelay) && ctx.Err() == nil && cmd.ProcessState != nil:
+			exitCode = cmd.ProcessState.ExitCode()
 		default:
 			exitCode = -1
 			spawnErr = runErr.Error()
@@ -297,66 +303,22 @@ func mergeEnv(extra map[string]any) []string {
 
 // defaultShellName is the dialect sh.exec uses when no `shell` option is given.
 func defaultShellName() string {
-	if runtime.GOOS != "windows" {
-		return "sh"
-	}
-	if _, err := exec.LookPath("pwsh"); err == nil {
-		return "pwsh"
-	}
-	return "cmd"
+	return shellcmd.DefaultShellName()
 }
 
 // resolveShell maps a shell name to its executable and the args preceding the command line.
 func resolveShell(name string) (string, []string, error) {
-	if name == "" {
-		name = defaultShellName()
-	}
-	switch strings.ToLower(name) {
-	case "pwsh":
-		p, err := exec.LookPath("pwsh")
-		if err != nil {
-			return "", nil, sandbox.NewHostError(sandbox.KindNotFound, nil, "pwsh: command not found")
-		}
-		return p, []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command"}, nil
-	case "powershell":
-		p, err := exec.LookPath("powershell")
-		if err != nil {
-			return "", nil, sandbox.NewHostError(sandbox.KindNotFound, nil, "powershell: command not found")
-		}
-		return p, []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command"}, nil
-	case "cmd":
-		if runtime.GOOS != "windows" {
-			return "", nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "cmd is only available on Windows")
-		}
-		return "cmd.exe", []string{"/d", "/s", "/c"}, nil
-	case "bash", "sh":
-		p, err := findPosixShell(strings.ToLower(name))
-		if err != nil {
-			return "", nil, err
-		}
-		return p, []string{"-c"}, nil
-	}
-	return "", nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "unknown shell %q (use pwsh, powershell, cmd, bash or sh)", name)
+	exe, args, _, err := resolveShellFull(name)
+	return exe, args, err
 }
 
-// findPosixShell prefers Git for Windows' bash/sh over the WSL launcher in System32 (which runs inside Linux).
-func findPosixShell(name string) (string, error) {
-	if runtime.GOOS != "windows" {
-		if p, err := exec.LookPath(name); err == nil {
-			return p, nil
+func resolveShellFull(name string) (string, []string, string, error) {
+	exe, args, dialect, err := shellcmd.Resolve(name)
+	if err != nil {
+		if shellcmd.IsNotFound(err) {
+			return "", nil, "", sandbox.NewHostError(sandbox.KindNotFound, nil, "%s", err.Error())
 		}
-		return "", sandbox.NewHostError(sandbox.KindNotFound, nil, "%s: command not found", name)
+		return "", nil, "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s", err.Error())
 	}
-	if gitPath, err := exec.LookPath("git"); err == nil {
-		root := filepath.Dir(filepath.Dir(gitPath)) // <Git>/cmd/git.exe or <Git>/bin/git.exe
-		for _, c := range []string{filepath.Join(root, "bin", name+".exe"), filepath.Join(root, "usr", "bin", name+".exe")} {
-			if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
-				return c, nil
-			}
-		}
-	}
-	if p, err := exec.LookPath(name); err == nil && !strings.Contains(strings.ToLower(p), `\system32\`) {
-		return p, nil
-	}
-	return "", sandbox.NewHostError(sandbox.KindNotFound, nil, "%s: not found (install Git for Windows)", name)
+	return exe, args, dialect, nil
 }

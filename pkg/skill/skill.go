@@ -352,8 +352,13 @@ func FullGuide() string {
 
 // FullGuideForTools dynamically assembles the complete Markdown manual from the single-source topic registry.
 func FullGuideForTools(hasRead, hasTasks bool) string {
+	return FullGuideForToolset(hasRead, hasTasks, true)
+}
+
+// FullGuideForToolset dynamically assembles the complete Markdown manual for the exact active toolset.
+func FullGuideForToolset(hasRead, hasTasks, hasDocs bool) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "<!-- Active MCPlex tools: %s -->\n", strings.Join(activeToolNames(hasRead, hasTasks, true), ", "))
+	fmt.Fprintf(&b, "<!-- Active MCPlex tools: %s -->\n", strings.Join(activeToolNames(hasRead, hasTasks, hasDocs), ", "))
 	b.WriteString("# MCPlex — Code Mode Local Tool & MCP Proxy Guide\n\n")
 	for i, t := range activeTopics(hasTasks) {
 		if i > 0 {
@@ -367,12 +372,17 @@ func FullGuideForTools(hasRead, hasTasks bool) string {
 
 // Instructions returns the slim progressive-disclosure instructions returned in MCP initialize.result.instructions.
 func Instructions() string {
-	return InstructionsForTools(true, true)
+	return InstructionsForToolset(true, true, true)
 }
 
-// InstructionsForTools returns a compact (~600B) routing guide tailored to the active toolset,
-// relying on the on-demand `docs` tool (and `mcplex://skill`) instead of flooding upfront context.
+// InstructionsForTools returns a compact (~600B) routing guide tailored to hasRead and hasTasks (assuming docs is enabled).
 func InstructionsForTools(hasRead, hasTasks bool) string {
+	return InstructionsForToolset(hasRead, hasTasks, true)
+}
+
+// InstructionsForToolset returns a compact (~600B) routing guide tailored to the exact active toolset,
+// omitting references to `docs` when `hasDocs` is false (e.g. `--tools exec`).
+func InstructionsForToolset(hasRead, hasTasks, hasDocs bool) string {
 	var routes []string
 	if hasRead {
 		routes = append(routes, "- `read`: read whole files, line ranges, tail logs, or images (`.png`/`.jpg`/`.webp`/`.gif`).")
@@ -381,27 +391,39 @@ func InstructionsForTools(hasRead, hasTasks bool) string {
 	if hasTasks {
 		routes = append(routes, "- `spawn` + `task`: run >15s builds/tests, interactive commands, or `daemon: true` services (use `task({ action: \"wait\", taskId, expect })`).")
 	}
-	routes = append(routes, "- `docs`: instant on-demand reference (`docs()` index, `docs({ topic })`, or `docs({ query })`).")
+	if hasDocs {
+		routes = append(routes, "- `docs`: instant on-demand reference (`docs()` index, `docs({ topic })`, or `docs({ query })`).")
+	}
 
 	ns := "fs, search, ast, edit, tx, git, sh, state, tools/mcp"
 	if hasTasks {
 		ns = "fs, search, ast, edit, tx, git, sh, tasks, state, tools/mcp"
 	}
+	docHint := "Read resource `mcplex://skill` if you need full API signatures or examples."
+	if hasDocs {
+		docHint = "Call `docs({ topic })` (e.g. `tx`, `edit`, `sh`, `search`, `ast`, `errors`, `patterns`) or `docs({ query })` whenever you need exact signatures or examples."
+	}
 	return fmt.Sprintf(
 		"MCPlex Code Mode Proxy:\n%s\n\nInside `exec`, globals include: %s (plus Buffer, crypto, path, URL, sleep, P/payloads). "+
-			"Always `await t.commit()` for `tx.begin()` edits. Call `docs({ topic })` (e.g. `tx`, `edit`, `sh`, `search`, `ast`, `errors`, `patterns`) or `docs({ query })` whenever you need exact signatures or examples.",
+			"Always `await t.commit()` for `tx.begin()` edits. %s",
 		strings.Join(routes, "\n"),
 		ns,
+		docHint,
 	)
 }
 
 // CompactExecDescription returns a concise self-describing tool description for `exec`.
 func CompactExecDescription(defaultMaxOutBytes int) string {
-	return CompactExecDescriptionForTools(defaultMaxOutBytes, true, true)
+	return CompactExecDescriptionForToolset(defaultMaxOutBytes, true, true, true)
 }
 
-// CompactExecDescriptionForTools returns a slim (~520B) `exec` tool description pointing to `docs` for full signatures.
+// CompactExecDescriptionForTools returns a slim (~520B) `exec` tool description (assuming `docs` is enabled).
 func CompactExecDescriptionForTools(defaultMaxOutBytes int, hasRead, hasTasks bool) string {
+	return CompactExecDescriptionForToolset(defaultMaxOutBytes, hasRead, hasTasks, true)
+}
+
+// CompactExecDescriptionForToolset returns a slim (~520B) `exec` tool description tailored to the exact active toolset.
+func CompactExecDescriptionForToolset(defaultMaxOutBytes int, hasRead, hasTasks, hasDocs bool) string {
 	if defaultMaxOutBytes <= 0 {
 		defaultMaxOutBytes = 24576
 	}
@@ -417,13 +439,18 @@ func CompactExecDescriptionForTools(defaultMaxOutBytes int, hasRead, hasTasks bo
 	} else if hasTasks {
 		siblingHint = " Use `spawn`+`task` for >15s builds or daemons."
 	}
+	docTail := "Read `mcplex://skill` for full API signatures and examples."
+	if hasDocs {
+		docTail = "Call `docs({ topic })` or `docs({ query })` for exact API signatures, options, and examples."
+	}
 	return fmt.Sprintf(
 		"Execute a top-level async TypeScript body (`await`, `Promise.all`, `print()`, `return`; do not wrap in `async function`) in a fast local Code Mode sandbox. "+
 			"Namespaces: %s, plus `P`/`payloads`, Buffer, crypto, path, URL, sleep. "+
 			"Inline output cap: %dB (oversized output spills to memory `state.page('__result_N', 2)`).%s "+
-			"Call `docs({ topic })` or `docs({ query })` for exact API signatures, options, and examples.",
+			"%s",
 		ns,
 		defaultMaxOutBytes,
 		siblingHint,
+		docTail,
 	)
 }

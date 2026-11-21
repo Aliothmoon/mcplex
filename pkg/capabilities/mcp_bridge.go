@@ -58,6 +58,11 @@ type MCPBridgeOptions struct {
 	SelfName                string
 }
 
+type stdioSlot struct {
+	mu     sync.Mutex
+	client atomic.Pointer[stdioClient]
+}
+
 // MCPBridge multiplexes discovery (cached schemas + live tools/list) and lazy execution of external MCP servers.
 type MCPBridge struct {
 	Policy                  *policy.Engine
@@ -68,8 +73,9 @@ type MCPBridge struct {
 	IncludeAntigravityPaths bool
 
 	mu           sync.Mutex
+	closed       bool
 	policyPtr    atomic.Pointer[policy.Engine]
-	stdioPool    map[string]*stdioClient
+	stdioPool    map[string]*stdioSlot
 	liveSchemas  map[string][]ToolDescriptor // cached live tools/list per server name
 	httpSessions map[string]string           // endpoint -> Mcp-Session-Id ("" when stateless)
 	httpInited   map[string]bool             // endpoint -> initialize attempted
@@ -98,14 +104,39 @@ func NewMCPBridgeWithOptions(pol *policy.Engine, workspaceDir string, opts MCPBr
 		ConfigPaths:             append([]string(nil), opts.ConfigPaths...),
 		CacheDirs:               append([]string(nil), opts.CacheDirs...),
 		IncludeAntigravityPaths: opts.IncludeAntigravityPaths,
-		stdioPool:               map[string]*stdioClient{},
+		stdioPool:               map[string]*stdioSlot{},
 		liveSchemas:             map[string][]ToolDescriptor{},
 		httpSessions:            map[string]string{},
 		httpInited:              map[string]bool{},
-		httpClient:              &http.Client{Timeout: 60 * time.Second},
+		httpClient:              newMCPHTTPClient(),
 	}
 	b.policyPtr.Store(pol)
 	return b
+}
+
+func newMCPHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 305 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			orig := via[0].URL
+			crossHost := !strings.EqualFold(orig.Host, req.URL.Host) ||
+				(strings.EqualFold(orig.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https"))
+			if crossHost {
+				for k := range req.Header {
+					switch http.CanonicalHeaderKey(k) {
+					case "Accept", "Accept-Encoding", "Content-Length", "Content-Type", "User-Agent":
+						continue
+					default:
+						req.Header.Del(k)
+					}
+				}
+			}
+			return nil
+		},
+	}
 }
 
 // SetPolicy atomically updates the policy engine used by concurrent callers.
@@ -123,11 +154,19 @@ func (m *MCPBridge) currentPolicy() *policy.Engine {
 // Close shuts down any pooled child stdio MCP processes.
 func (m *MCPBridge) Close() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, c := range m.stdioPool {
-		c.close()
+	m.closed = true
+	slots := make([]*stdioSlot, 0, len(m.stdioPool))
+	for _, sl := range m.stdioPool {
+		slots = append(slots, sl)
 	}
-	m.stdioPool = map[string]*stdioClient{}
+	m.stdioPool = map[string]*stdioSlot{}
+	m.mu.Unlock()
+
+	for _, sl := range slots {
+		if c := sl.client.Swap(nil); c != nil {
+			c.close()
+		}
+	}
 }
 
 func (m *MCPBridge) Bind(env *sandbox.ExecutionEnv) error {
@@ -256,15 +295,22 @@ func (m *MCPBridge) CallExternalTool(ctx context.Context, cwd, rawRef string, ca
 		return nil, fmt.Errorf("MCP server '%s' not found in mcp_config.json (configured servers: %s)%s", serverHint, strings.Join(sortedKeys(cfgs), ", "), hint)
 	}
 
+	// Check MCP permission against toolHint FIRST so a denied server is never spawned or probed via live tools/list.
+	pol := m.currentPolicy()
+	if pol != nil {
+		if err := pol.CheckMCP(serverName, toolHint); err != nil {
+			return nil, err
+		}
+	}
 	// Resolve exact tool name against cached disk or live schemas if JS used underscore sanitization (e.g. resolve_library_id -> resolve-library-id).
 	exactTool := m.resolveCachedToolName(ctx, serverName, cfg, toolHint)
-	if pol := m.currentPolicy(); pol != nil {
+	if pol != nil && exactTool != toolHint {
 		if err := pol.CheckMCP(serverName, exactTool); err != nil {
 			return nil, err
 		}
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, resolveMCPServerTimeout(cfg.TimeoutSec))
 	defer cancel()
 
 	endpoint := strings.TrimSpace(cfg.ServerURL)
@@ -422,6 +468,20 @@ func (m *MCPBridge) discoverServerTools(ctx context.Context, serverName string, 
 	m.liveSchemas[serverName] = tools
 	m.mu.Unlock()
 	return append([]ToolDescriptor(nil), tools...)
+}
+
+func resolveMCPServerTimeout(timeoutSec int) time.Duration {
+	if timeoutSec <= 0 {
+		return 25 * time.Second
+	}
+	d := time.Duration(timeoutSec) * time.Second
+	if d < 1*time.Second {
+		return 1 * time.Second
+	}
+	if d > 300*time.Second {
+		return 300 * time.Second
+	}
+	return d
 }
 
 func decodeMCPToolsList(serverName string, raw []byte) []ToolDescriptor {
@@ -663,8 +723,10 @@ func (m *MCPBridge) httpRPCRaw(ctx context.Context, serverName, endpoint string,
 		"jsonrpc": "2.0",
 		"method":  method,
 	}
+	var reqID int64
 	if !isNotification {
-		payload["id"] = m.reqSeq.Add(1)
+		reqID = m.reqSeq.Add(1)
+		payload["id"] = reqID
 	}
 	if params != nil {
 		payload["params"] = params
@@ -697,6 +759,9 @@ func (m *MCPBridge) httpRPCRaw(ctx context.Context, serverName, endpoint string,
 	gotSID := strings.TrimSpace(resp.Header.Get("Mcp-Session-Id"))
 	if resp.StatusCode >= 400 {
 		return nil, gotSID, resp.StatusCode, fmt.Errorf("MCP HTTP %s %s returned status %d", serverName, method, resp.StatusCode)
+	}
+	if !isNotification && len(respBytes) > 0 {
+		respBytes = extractSSEDataPayloadForID(respBytes, reqID)
 	}
 	return respBytes, gotSID, resp.StatusCode, nil
 }
@@ -734,17 +799,42 @@ func (m *MCPBridge) callStreamableHTTP(ctx context.Context, serverName, endpoint
 
 func (m *MCPBridge) getOrStartStdio(serverName string, cfg externalServerCfg) (*stdioClient, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	client, ok := m.stdioPool[serverName]
-	if !ok || client.closed.Load() {
-		spawned, err := startStdioClient(cfg)
-		if err != nil {
-			return nil, fmt.Errorf("failed starting MCP server '%s': %w", serverName, err)
-		}
-		client = spawned
-		m.stdioPool[serverName] = client
+	if m.closed {
+		m.mu.Unlock()
+		return nil, errors.New("MCP bridge is closed")
 	}
-	return client, nil
+	slot, ok := m.stdioPool[serverName]
+	if !ok {
+		slot = &stdioSlot{}
+		m.stdioPool[serverName] = slot
+	}
+	m.mu.Unlock()
+
+	if c := slot.client.Load(); c != nil && !c.closed.Load() {
+		return c, nil
+	}
+
+	// Acquire ONLY this server's startup mutex so a slow 10s initialize on server A never blocks server B.
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+
+	if c := slot.client.Load(); c != nil && !c.closed.Load() {
+		return c, nil
+	}
+	spawned, err := startStdioClient(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed starting MCP server '%s': %w", serverName, err)
+	}
+
+	m.mu.Lock()
+	closed := m.closed
+	m.mu.Unlock()
+	if closed {
+		spawned.close()
+		return nil, errors.New("MCP bridge is closed")
+	}
+	slot.client.Store(spawned)
+	return spawned, nil
 }
 
 func (m *MCPBridge) callStdioServer(ctx context.Context, serverName string, cfg externalServerCfg, toolName string, callArgs map[string]any) (any, error) {
@@ -758,12 +848,14 @@ func (m *MCPBridge) callStdioServer(ctx context.Context, serverName string, cfg 
 type stdioClient struct {
 	cmd       *exec.Cmd
 	stdin     io.WriteCloser
+	stdout    io.ReadCloser
 	stderrBuf *limitedSyncBuffer
 	mu        sync.Mutex
 	pending   map[int64]chan []byte
 	pendingMu sync.Mutex
 	seq       atomic.Int64
 	closed    atomic.Bool
+	closeOnce sync.Once
 }
 
 func startStdioClient(cfg externalServerCfg) (*stdioClient, error) {
@@ -787,14 +879,18 @@ func startStdioClient(cfg externalServerCfg) (*stdioClient, error) {
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		_ = stdin.Close()
 		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
 		return nil, err
 	}
 	c := &stdioClient{
 		cmd:       cmd,
 		stdin:     stdin,
+		stdout:    stdout,
 		stderrBuf: stderrBuf,
 		pending:   map[int64]chan []byte{},
 	}
@@ -859,6 +955,9 @@ func (c *stdioClient) readLoop(r io.Reader) {
 		if c.stdin != nil {
 			_ = c.stdin.Close()
 		}
+		if c.stdout != nil {
+			_ = c.stdout.Close()
+		}
 		killCmdProcessTree(c.cmd)
 	}
 
@@ -869,11 +968,20 @@ func (c *stdioClient) readLoop(r io.Reader) {
 }
 
 func (c *stdioClient) writeLineWithTimeout(ctx context.Context, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	line := append(append([]byte(nil), data...), '\n')
+	// 0 = waiting for c.mu, 1 = acquired c.mu (writing to c.stdin), 2 = canceled before acquiring c.mu
+	var state atomic.Int32
 	done := make(chan error, 1)
 	go func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		if !state.CompareAndSwap(0, 1) {
+			// Caller's ctx.Done() fired while we were waiting on c.mu; do NOT write anything to c.stdin.
+			return
+		}
 		if c.closed.Load() {
 			done <- errors.New("MCP server connection closed")
 			return
@@ -887,9 +995,23 @@ func (c *stdioClient) writeLineWithTimeout(ctx context.Context, data []byte) err
 	case err := <-done:
 		return err
 	case <-ctx.Done():
-		c.close()
-		return ctx.Err()
+		if state.CompareAndSwap(0, 2) {
+			// Canceled BEFORE acquiring c.mu / BEFORE sending any bytes on c.stdin:
+			// return ctx.Err() WITHOUT closing the shared stdio server!
+			return ctx.Err()
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				return err
+			}
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+			c.close()
+			return ctx.Err()
+		}
 	case <-timer.C:
+		state.CompareAndSwap(0, 2)
 		c.close()
 		return errors.New("MCP server stdin write timed out (server unresponsive)")
 	}
@@ -958,25 +1080,130 @@ func (c *stdioClient) callTool(ctx context.Context, serverName, toolName string,
 }
 
 func (c *stdioClient) close() {
-	c.closed.Store(true)
-	_ = c.stdin.Close()
-	killCmdProcessTree(c.cmd)
+	if c == nil {
+		return
+	}
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		if c.stdin != nil {
+			_ = c.stdin.Close()
+		}
+		if c.stdout != nil {
+			_ = c.stdout.Close()
+		}
+		c.pendingMu.Lock()
+		for _, ch := range c.pending {
+			close(ch)
+		}
+		c.pending = map[int64]chan []byte{}
+		c.pendingMu.Unlock()
+		killCmdProcessTree(c.cmd)
+	})
 }
 
 func extractSSEDataPayload(raw []byte) []byte {
+	return extractSSEDataPayloadForID(raw, 0)
+}
+
+// extractSSEDataPayloadForID parses SSE frames (skipping `: ...` comments and `event:`/`id:`/`retry:` metadata),
+// skips server notifications/requests (`method != ""`), and prefers the JSON-RPC response frame matching wantID.
+func extractSSEDataPayloadForID(raw []byte, wantID int64) []byte {
 	trimmed := bytes.TrimSpace(raw)
-	if bytes.HasPrefix(trimmed, []byte("event:")) || bytes.HasPrefix(trimmed, []byte("data:")) {
-		for _, line := range bytes.Split(trimmed, []byte("\n")) {
-			line = bytes.TrimSpace(line)
-			if bytes.HasPrefix(line, []byte("data:")) {
-				candidate := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-				if len(candidate) > 0 && candidate[0] == '{' {
-					trimmed = candidate
-				}
-			}
+	if len(trimmed) == 0 || trimmed[0] == '{' || trimmed[0] == '[' {
+		return trimmed
+	}
+
+	var candidates [][]byte
+	var eventData [][]byte
+	flushEvent := func() {
+		if len(eventData) == 0 {
+			return
+		}
+		joined := bytes.TrimSpace(bytes.Join(eventData, []byte("\n")))
+		eventData = nil
+		if len(joined) > 0 && joined[0] == '{' {
+			candidates = append(candidates, joined)
 		}
 	}
-	return trimmed
+
+	norm := bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
+	sawSSEDirective := false
+	for _, rawLine := range bytes.Split(norm, []byte("\n")) {
+		lineLeft := bytes.TrimLeft(rawLine, " \t")
+		if len(lineLeft) == 0 {
+			flushEvent()
+			continue
+		}
+		if lineLeft[0] == ':' {
+			// SSE comment / keepalive line (`: ping`)
+			sawSSEDirective = true
+			continue
+		}
+		if bytes.HasPrefix(lineLeft, []byte("event:")) || bytes.HasPrefix(lineLeft, []byte("id:")) || bytes.HasPrefix(lineLeft, []byte("retry:")) {
+			sawSSEDirective = true
+			continue
+		}
+		if bytes.HasPrefix(lineLeft, []byte("data:")) {
+			sawSSEDirective = true
+			d := bytes.TrimPrefix(lineLeft, []byte("data:"))
+			if len(d) > 0 && d[0] == ' ' {
+				d = d[1:]
+			}
+			dTrim := bytes.TrimSpace(d)
+			// If previous data line was already a complete standalone JSON object and server omitted blank line separator, flush it first.
+			if len(eventData) > 0 && len(dTrim) > 0 && dTrim[0] == '{' && json.Valid(bytes.Join(eventData, []byte("\n"))) {
+				flushEvent()
+			}
+			eventData = append(eventData, d)
+		}
+	}
+	flushEvent()
+	if !sawSSEDirective || len(candidates) == 0 {
+		return trimmed
+	}
+
+	var fallbackResponse []byte
+	for _, cand := range candidates {
+		var frame struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+			Result json.RawMessage `json:"result"`
+			Error  json.RawMessage `json:"error"`
+		}
+		if json.Unmarshal(cand, &frame) != nil {
+			continue
+		}
+		// Skip server notifications and server-to-client requests.
+		if frame.Method != "" {
+			continue
+		}
+		idRaw := bytes.TrimSpace(frame.ID)
+		if len(idRaw) == 0 || (bytes.Equal(idRaw, []byte("null")) && len(frame.Error) == 0) {
+			continue
+		}
+		if wantID > 0 && matchesJSONRPCID(idRaw, wantID) {
+			return cand
+		}
+		if fallbackResponse == nil && (len(frame.Result) > 0 || len(frame.Error) > 0) {
+			fallbackResponse = cand
+		}
+	}
+	if fallbackResponse != nil {
+		return fallbackResponse
+	}
+	return candidates[len(candidates)-1]
+}
+
+func matchesJSONRPCID(idRaw []byte, wantID int64) bool {
+	var num int64
+	if json.Unmarshal(idRaw, &num) == nil && num == wantID {
+		return true
+	}
+	var str string
+	if json.Unmarshal(idRaw, &str) == nil && str == fmt.Sprintf("%d", wantID) {
+		return true
+	}
+	return false
 }
 
 func decodeMCPCallResponse(serverName, toolName string, raw []byte) (any, error) {

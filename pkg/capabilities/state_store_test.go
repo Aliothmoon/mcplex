@@ -172,25 +172,24 @@ func TestAutoSpillsDoNotPersistOrLeakAcrossProcessesAndStripLegacySpills(t *test
 	}
 }
 
-func TestManualLastResultOverrideDeleteAndKeys(t *testing.T) {
+func TestReservedSpillKeysRejectedAndDeleteKeysWork(t *testing.T) {
 	store := NewStateStore("", "")
 	k1 := store.SaveAutoSpill("spilled-1")
 	if !slices.Contains(store.Keys(), "__last_result") || !slices.Contains(store.Keys(), k1) {
 		t.Fatalf("expected __last_result and %s in Keys(), got %v", k1, store.Keys())
 	}
 
-	// Manual override takes over __last_result.
-	if err := store.Set("__last_result", "manual"); err != nil {
-		t.Fatal(err)
-	}
-	if val, res, ok := store.GetResolved("__last_result"); !ok || res != "__last_result" || val != "manual" {
-		t.Fatalf("manual override failed: ok=%v res=%s val=%v", ok, res, val)
+	// Reserved spill keys must be rejected by Set.
+	for _, reserved := range []string{"__last_result", "__result_1", "__result_99"} {
+		if err := store.Set(reserved, "manual"); err == nil {
+			t.Fatalf("expected Set(%q) to fail as reserved key", reserved)
+		}
 	}
 
-	// Subsequent auto-spill supersedes manual override.
+	// Subsequent auto-spill updates __last_result cleanly.
 	k2 := store.SaveAutoSpill("spilled-2")
 	if val, res, ok := store.GetResolved("__last_result"); !ok || res != k2 || val != "spilled-2" {
-		t.Fatalf("spill after manual override failed: ok=%v res=%s val=%v", ok, res, val)
+		t.Fatalf("spill failed: ok=%v res=%s val=%v", ok, res, val)
 	}
 
 	// Deleting __last_result clears the alias without deleting __result_2.

@@ -1,10 +1,24 @@
 package sandbox
 
 import (
+	"fmt"
+	"sort"
 	"time"
 
 	"github.com/dop251/goja"
 )
+
+const maxActiveTimers = 1024
+
+type timerEntry struct {
+	id         int64
+	due        time.Time
+	fn         goja.Callable
+	extra      []goja.Value
+	dispatched bool
+	canceled   bool
+	settled    bool
+}
 
 // OrderedMap is returned by host functions that must preserve key order in the guest object
 // (Go maps iterate randomly). Keys and Vals are parallel slices.
@@ -14,14 +28,14 @@ type OrderedMap struct {
 }
 
 // installTimers adds the standard `setTimeout` / `clearTimeout` and `structuredClone` globals models reach for by
-// habit (`await new Promise(r => setTimeout(r, 500))`). Pending timers keep the program alive like Node; an exception
-// thrown inside a timer callback fails the run (Node would crash on it too).
+// habit (`await new Promise(r => setTimeout(r, 500))`).
+// Active timers are capped at 1024, dispatched via a single deterministic coordinator so same-delay timers
+// strictly preserve FIFO registration order, and cleaned up immediately when `Execute` exits.
 func installTimers(env *ExecutionEnv) error {
 	vm := env.VM
-	timers := map[int64]*time.Timer{} // VM-thread only
-	var nextID int64
-
 	maxDelay := EffectiveMaxTimeout()
+	rangeErrCtor, _ := goja.AssertConstructor(vm.Get("RangeError"))
+
 	setTimeout := func(call goja.FunctionCall) goja.Value {
 		fn, ok := goja.AssertFunction(call.Argument(0))
 		if !ok {
@@ -38,38 +52,55 @@ func installTimers(env *ExecutionEnv) error {
 		if len(call.Arguments) > 2 {
 			extra = append(extra, call.Arguments[2:]...)
 		}
-		nextID++
-		id := nextID
-		env.pendingOps.Add(1)
-		timers[id] = time.AfterFunc(delay, func() {
-			select {
-			case env.loopCh <- loopAction{run: func() {
-				defer env.pendingOps.Add(-1)
-				if _, live := timers[id]; !live {
-					return // cleared after firing
+
+		env.startTimerCoordinator()
+
+		env.timersMu.Lock()
+		if env.timersClosed {
+			env.timersMu.Unlock()
+			return vm.ToValue(int64(0))
+		}
+		if len(env.timers) >= maxActiveTimers {
+			env.timersMu.Unlock()
+			msg := fmt.Sprintf("setTimeout: active timer limit (%d) exceeded", maxActiveTimers)
+			if rangeErrCtor != nil {
+				if errObj, err := rangeErrCtor(nil, vm.ToValue(msg)); err == nil {
+					panic(errObj)
 				}
-				delete(timers, id)
-				if _, err := fn(goja.Undefined(), extra...); err != nil {
-					env.setAsyncErr(err)
-				}
-				_, _ = env.deliverFn(goja.Undefined())
-			}}:
-			case <-env.Ctx.Done():
-				env.pendingOps.Add(-1)
 			}
-		})
+			panic(vm.NewGoError(fmt.Errorf("RangeError: %s", msg)))
+		}
+		env.nextTimerID++
+		id := env.nextTimerID
+		entry := &timerEntry{
+			id:    id,
+			due:   time.Now().Add(delay),
+			fn:    fn,
+			extra: extra,
+		}
+		env.timers[id] = entry
+		env.pendingOps.Add(1)
+		env.timersMu.Unlock()
+
+		env.signalTimerWake()
 		return vm.ToValue(id)
 	}
+
 	clearTimeout := func(call goja.FunctionCall) goja.Value {
 		id := call.Argument(0).ToInteger()
-		if t, ok := timers[id]; ok {
-			if t.Stop() {
-				env.pendingOps.Add(-1) // callback will never be queued
+		env.timersMu.Lock()
+		if entry, ok := env.timers[id]; ok {
+			entry.canceled = true
+			if !entry.settled {
+				entry.settled = true
+				env.pendingOps.Add(-1)
 			}
-			delete(timers, id)
+			delete(env.timers, id)
 		}
+		env.timersMu.Unlock()
 		return goja.Undefined()
 	}
+
 	if err := vm.Set("setTimeout", setTimeout); err != nil {
 		return err
 	}
@@ -94,6 +125,166 @@ func installTimers(env *ExecutionEnv) error {
 		globalThis.structuredClone = function structuredClone(v) { return clone(v, new Map()); };
 	})()`)
 	return err
+}
+
+func (env *ExecutionEnv) startTimerCoordinator() {
+	env.timerOnce.Do(func() {
+		env.timersMu.Lock()
+		if env.timers == nil {
+			env.timers = make(map[int64]*timerEntry)
+		}
+		env.timerWake = make(chan struct{}, 1)
+		env.timerDone = make(chan struct{})
+		env.timersMu.Unlock()
+
+		go env.runTimerCoordinator()
+	})
+}
+
+func (env *ExecutionEnv) signalTimerWake() {
+	if env.timerWake == nil {
+		return
+	}
+	select {
+	case env.timerWake <- struct{}{}:
+	default:
+	}
+}
+
+func (env *ExecutionEnv) settleTimerEntry(e *timerEntry) bool {
+	env.timersMu.Lock()
+	defer env.timersMu.Unlock()
+	canceled := e.canceled
+	if !e.settled {
+		e.settled = true
+		env.pendingOps.Add(-1)
+	}
+	delete(env.timers, e.id)
+	return canceled
+}
+
+func (env *ExecutionEnv) runTimerCoordinator() {
+	var timer *time.Timer
+	stopTimer := func() {
+		if timer != nil {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+	}
+	defer stopTimer()
+
+	for {
+		now := time.Now()
+		var ready []*timerEntry
+		var nextDue time.Time
+
+		env.timersMu.Lock()
+		if env.timersClosed {
+			env.timersMu.Unlock()
+			return
+		}
+		for _, e := range env.timers {
+			if e.canceled || e.dispatched {
+				continue
+			}
+			if !now.Before(e.due) {
+				ready = append(ready, e)
+			} else if nextDue.IsZero() || e.due.Before(nextDue) {
+				nextDue = e.due
+			}
+		}
+		if len(ready) > 0 {
+			sort.Slice(ready, func(i, j int) bool {
+				if !ready[i].due.Equal(ready[j].due) {
+					return ready[i].due.Before(ready[j].due)
+				}
+				return ready[i].id < ready[j].id
+			})
+			// Dispatch the earliest expired timer first, then re-evaluate under lock so newly added/cleared timers stay ordered.
+			picked := ready[0]
+			picked.dispatched = true
+			env.timersMu.Unlock()
+
+			act := loopAction{
+				run: func() {
+					defer func() {
+						if r := recover(); r != nil {
+							env.setAsyncErr(recoveredToError(r))
+						}
+					}()
+					if env.settleTimerEntry(picked) {
+						return
+					}
+					if _, err := picked.fn(goja.Undefined(), picked.extra...); err != nil {
+						env.setAsyncErr(err)
+						return
+					}
+					if _, dErr := env.deliverFn(goja.Undefined()); dErr != nil {
+						env.setAsyncErr(dErr)
+					}
+				},
+			}
+
+			select {
+			case env.loopCh <- act:
+			case <-env.timerDone:
+				env.settleTimerEntry(picked)
+				return
+			case <-env.Ctx.Done():
+				env.settleTimerEntry(picked)
+				return
+			}
+			continue
+		}
+		env.timersMu.Unlock()
+
+		var timerCh <-chan time.Time
+		if !nextDue.IsZero() {
+			wait := time.Until(nextDue)
+			if wait < 0 {
+				wait = 0
+			}
+			if timer == nil {
+				timer = time.NewTimer(wait)
+			} else {
+				stopTimer()
+				timer.Reset(wait)
+			}
+			timerCh = timer.C
+		} else {
+			stopTimer()
+		}
+
+		select {
+		case <-env.timerDone:
+			return
+		case <-env.Ctx.Done():
+			return
+		case <-env.timerWake:
+		case <-timerCh:
+		}
+	}
+}
+
+func (env *ExecutionEnv) cleanupTimers() {
+	env.timersMu.Lock()
+	env.timersClosed = true
+	if env.timerDone != nil {
+		env.timerStopOnce.Do(func() { close(env.timerDone) })
+	}
+	for id, e := range env.timers {
+		e.canceled = true
+		if !e.settled {
+			e.settled = true
+			env.pendingOps.Add(-1)
+		}
+		delete(env.timers, id)
+	}
+	env.timersMu.Unlock()
 }
 
 // setAsyncErr records the first error raised outside the main promise chain (e.g. inside a timer callback).

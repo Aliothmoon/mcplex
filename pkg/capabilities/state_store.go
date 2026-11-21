@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -22,24 +23,30 @@ const (
 	MaxStateEntryBytes = 512 * 1024      // 512 KB per persisted user key
 	MaxStateTotalBytes = 4 * 1024 * 1024 // 4 MB per workspace session (persisted user entries)
 	MaxSpillEntryBytes = 4 * 1024 * 1024 // 4 MB per in-memory auto-spill entry
-	MaxSpillTotalBytes = 4 * 1024 * 1024 // 4 MB in-memory cap for process-local auto-spills
+	MaxSpillTotalBytes = 4 * 1024 * 1024 // 4 MB in-memory cap per session for auto-spills
+	maxGlobalSpillPool = 32 * 1024 * 1024
 	lastResultKey      = "__last_result"
 	spillKeyPrefix     = "__result_"
 )
 
+type sessionSpillBucket struct {
+	spills       map[string]stateEntry
+	seq          int64
+	lastSpillKey string
+}
+
 // StateStore provides fast in-memory + disk-persisted key-value storage across PTC turns.
 // User-set entries persist per workspace; auto-spills (`__result_N` / `__last_result` alias)
-// live in a dedicated process-local ring so concurrent sessions never cross-contaminate.
+// live in session-scoped in-memory buckets so concurrent HTTP sessions never cross-contaminate.
 type StateStore struct {
-	mu           sync.RWMutex
-	dataDir      string
-	filePath     string
-	entries      map[string]stateEntry // persisted user KV
-	spills       map[string]stateEntry // process-local auto-spills (__result_N)
-	seq          int64
-	saveSeq      int64
-	lastSpillKey string // alias target for "__last_result" unless manually overridden via Set
-	dirty        bool   // pending user KV changes; persisted by Flush (once per exec)
+	mu            sync.RWMutex
+	dataDir       string
+	filePath      string
+	entries       map[string]stateEntry          // persisted user KV
+	sessionSpills map[string]*sessionSpillBucket // sessionID ("" = default) -> auto-spills
+	globalSeq     int64
+	saveSeq       int64
+	dirty         bool // pending user KV changes; persisted by Flush (once per exec)
 }
 
 // Flush persists pending user KV changes to disk.
@@ -59,15 +66,23 @@ type stateEntry struct {
 	Seq       int64  `json:"seq,omitempty"`
 }
 
+func normalizeWorkspaceHashKeyForOS(workspaceDir, goos string) string {
+	cleaned := filepath.ToSlash(filepath.Clean(workspaceDir))
+	if goos == "windows" || goos == "darwin" {
+		return strings.ToLower(cleaned)
+	}
+	return cleaned
+}
+
 // NewStateStore creates or loads a workspace-scoped state store under dataDir.
 func NewStateStore(dataDir, workspaceDir string) *StateStore {
 	s := &StateStore{
-		dataDir: dataDir,
-		entries: map[string]stateEntry{},
-		spills:  map[string]stateEntry{},
+		dataDir:       dataDir,
+		entries:       map[string]stateEntry{},
+		sessionSpills: map[string]*sessionSpillBucket{},
 	}
 	if dataDir != "" {
-		h := sha256.Sum256([]byte(strings.ToLower(filepath.ToSlash(filepath.Clean(workspaceDir)))))
+		h := sha256.Sum256([]byte(normalizeWorkspaceHashKeyForOS(workspaceDir, runtime.GOOS)))
 		id := hex.EncodeToString(h[:8])
 		sessDir := filepath.Join(dataDir, "sessions")
 		_ = os.MkdirAll(sessDir, 0o755)
@@ -93,6 +108,10 @@ func isAutoSpillKey(key string) bool {
 	return true
 }
 
+func isReservedSpillKey(key string) bool {
+	return key == lastResultKey || isAutoSpillKey(key)
+}
+
 func (s *StateStore) loadFromDisk() {
 	if s.filePath == "" {
 		return
@@ -105,7 +124,7 @@ func (s *StateStore) loadFromDisk() {
 	if err := json.Unmarshal(raw, &loaded); err == nil && loaded != nil {
 		// Drop legacy persisted auto-spills so a fresh session never inherits stale output from prior runs.
 		for k := range loaded {
-			if k == lastResultKey || isAutoSpillKey(k) {
+			if isReservedSpillKey(k) {
 				delete(loaded, k)
 			}
 		}
@@ -159,11 +178,14 @@ func cloneValue(val any) any {
 	return cp
 }
 
-// Set stores a JSON-serializable value under key.
+// Set stores a JSON-serializable value under key. Reserved spill keys (`__last_result`, `__result_N`) are rejected.
 func (s *StateStore) Set(key string, val any) error {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return errors.New("state key cannot be empty")
+	}
+	if isReservedSpillKey(key) {
+		return fmt.Errorf("state key %q is reserved for automatic output spills (choose a custom key name)", key)
 	}
 	if val == nil {
 		s.Delete(key)
@@ -197,98 +219,134 @@ func (s *StateStore) Set(key string, val any) error {
 		Bytes:     len(raw),
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	// Keep user KV and spill map disjoint so manual overrides behave predictably.
-	delete(s.spills, key)
-	if key == lastResultKey || key == s.lastSpillKey {
-		s.lastSpillKey = ""
-	}
 	s.dirty = true
 	return nil
 }
 
-// SaveAutoSpill atomically saves an oversized return value into the in-memory spill pool
-// under a unique `__result_N` key and updates the `__last_result` alias in the same lock.
+func (s *StateStore) getOrCreateBucketLocked(sessionID string) *sessionSpillBucket {
+	sid := strings.TrimSpace(sessionID)
+	b, ok := s.sessionSpills[sid]
+	if !ok {
+		b = &sessionSpillBucket{spills: map[string]stateEntry{}}
+		s.sessionSpills[sid] = b
+	}
+	return b
+}
+
+// SaveAutoSpill atomically saves an oversized return value into the default session spill pool.
 func (s *StateStore) SaveAutoSpill(val any) string {
+	return s.SaveAutoSpillForSession("", val)
+}
+
+// SaveAutoSpillForSession atomically saves an oversized return value into sessionID's in-memory spill pool
+// under a unique `__result_N` key and updates that session's `__last_result` alias under the same lock.
+func (s *StateStore) SaveAutoSpillForSession(sessionID string, val any) string {
 	raw, err := json.Marshal(val)
 	if err != nil || len(raw) > MaxSpillEntryBytes {
 		return ""
 	}
 	detached := detachValue(val, raw)
+	sid := strings.TrimSpace(sessionID)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	total := len(raw)
-	for _, e := range s.spills {
-		total += e.Bytes
+	bucket := s.getOrCreateBucketLocked(sid)
+	bucketTotal := len(raw)
+	for _, e := range bucket.spills {
+		bucketTotal += e.Bytes
 	}
-	if total > MaxSpillTotalBytes {
-		s.evictSpillsLocked(total - MaxSpillTotalBytes)
+	if bucketTotal > MaxSpillTotalBytes {
+		evictBucketSpillsLocked(bucket, bucketTotal-MaxSpillTotalBytes)
 	}
 
-	s.seq++
-	id := fmt.Sprintf("%s%d", spillKeyPrefix, s.seq)
-	s.spills[id] = stateEntry{
+	globalTotal := len(raw)
+	for _, b := range s.sessionSpills {
+		for _, e := range b.spills {
+			globalTotal += e.Bytes
+		}
+	}
+	if globalTotal > maxGlobalSpillPool {
+		s.evictGlobalSpillsLocked(globalTotal - maxGlobalSpillPool)
+		bucket = s.getOrCreateBucketLocked(sid)
+	}
+
+	s.globalSeq++
+	bucket.seq++
+	id := fmt.Sprintf("%s%d", spillKeyPrefix, bucket.seq)
+	bucket.spills[id] = stateEntry{
 		Value:     detached,
 		Bytes:     len(raw),
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
-		Seq:       s.seq,
+		Seq:       s.globalSeq,
 	}
-	s.lastSpillKey = id
-	// If the user previously set an explicit manual "__last_result", let the new spill supersede it.
-	if _, existed := s.entries[lastResultKey]; existed {
-		delete(s.entries, lastResultKey)
-		s.dirty = true
-	}
+	bucket.lastSpillKey = id
 	return id
 }
 
-// GetResolved retrieves a detached copy of key's value along with the concrete key it resolved to
-// (for example, "__last_result" resolves to "__result_N" when backed by an auto-spill).
+// GetResolved retrieves a detached copy of key's value in the default session along with its resolved key.
 func (s *StateStore) GetResolved(key string) (val any, resolvedKey string, found bool) {
+	return s.GetResolvedForSession("", key)
+}
+
+// GetResolvedForSession retrieves a detached copy of key's value scoped to sessionID for spill keys
+// (`__last_result`, `__result_N`) while sharing workspace user KV entries.
+func (s *StateStore) GetResolvedForSession(sessionID, key string) (val any, resolvedKey string, found bool) {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return nil, "", false
 	}
+	sid := strings.TrimSpace(sessionID)
+
 	s.mu.RLock()
 	var e stateEntry
 	if entry, ok := s.entries[key]; ok {
 		e = entry
 		resolvedKey = key
 		found = true
-	} else if entry, ok := s.spills[key]; ok {
-		e = entry
-		resolvedKey = key
-		found = true
-	} else if key == lastResultKey && s.lastSpillKey != "" {
-		if entry, ok := s.spills[s.lastSpillKey]; ok {
+	} else if b := s.sessionSpills[sid]; b != nil {
+		if entry, ok := b.spills[key]; ok {
 			e = entry
-			resolvedKey = s.lastSpillKey
+			resolvedKey = key
 			found = true
+		} else if key == lastResultKey && b.lastSpillKey != "" {
+			if entry, ok := b.spills[b.lastSpillKey]; ok {
+				e = entry
+				resolvedKey = b.lastSpillKey
+				found = true
+			}
 		}
 	}
 	s.mu.RUnlock()
+
 	if !found {
 		return nil, "", false
 	}
 	return cloneValue(e.Value), resolvedKey, true
 }
 
-// Get retrieves a detached copy of key's value (or nil if absent).
+// Get retrieves a detached copy of key's value in the default session (or nil if absent).
 func (s *StateStore) Get(key string) any {
-	val, _, ok := s.GetResolved(key)
+	val, _, ok := s.GetResolvedForSession("", key)
 	if !ok {
 		return nil
 	}
 	return val
 }
 
-// Delete removes a key from the store.
+// Delete removes a key from the store in the default session.
 func (s *StateStore) Delete(key string) bool {
+	return s.DeleteForSession("", key)
+}
+
+// DeleteForSession removes a user key or a session-scoped spill key (`__result_N` / `__last_result`).
+func (s *StateStore) DeleteForSession(sessionID, key string) bool {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return false
 	}
+	sid := strings.TrimSpace(sessionID)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	existed := false
@@ -297,35 +355,51 @@ func (s *StateStore) Delete(key string) bool {
 		s.dirty = true
 		existed = true
 	}
-	if _, ok := s.spills[key]; ok {
-		delete(s.spills, key)
-		existed = true
-		if s.lastSpillKey == key {
-			s.lastSpillKey = ""
+	if b := s.sessionSpills[sid]; b != nil {
+		if _, ok := b.spills[key]; ok {
+			delete(b.spills, key)
+			existed = true
+			if b.lastSpillKey == key {
+				b.lastSpillKey = ""
+			}
 		}
-	}
-	if key == lastResultKey && s.lastSpillKey != "" {
-		s.lastSpillKey = ""
-		existed = true
+		if key == lastResultKey && b.lastSpillKey != "" {
+			b.lastSpillKey = ""
+			existed = true
+		}
 	}
 	return existed
 }
 
-// Keys lists all keys currently readable in the store.
+// Keys lists all keys currently readable in the default session.
 func (s *StateStore) Keys() []string {
+	return s.KeysForSession("")
+}
+
+// KeysForSession lists all user keys plus sessionID's active spill keys (`__result_N` and `__last_result`).
+func (s *StateStore) KeysForSession(sessionID string) []string {
+	sid := strings.TrimSpace(sessionID)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]string, 0, len(s.entries)+len(s.spills)+1)
+
+	b := s.sessionSpills[sid]
+	spillCap := 0
+	if b != nil {
+		spillCap = len(b.spills) + 1
+	}
+	out := make([]string, 0, len(s.entries)+spillCap)
 	for k := range s.entries {
 		out = append(out, k)
 	}
-	for k := range s.spills {
-		out = append(out, k)
-	}
-	if s.lastSpillKey != "" {
-		if _, ok := s.spills[s.lastSpillKey]; ok {
-			if _, manual := s.entries[lastResultKey]; !manual {
-				out = append(out, lastResultKey)
+	if b != nil {
+		for k := range b.spills {
+			out = append(out, k)
+		}
+		if b.lastSpillKey != "" {
+			if _, ok := b.spills[b.lastSpillKey]; ok {
+				if _, manual := s.entries[lastResultKey]; !manual {
+					out = append(out, lastResultKey)
+				}
 			}
 		}
 	}
@@ -333,7 +407,27 @@ func (s *StateStore) Keys() []string {
 	return out
 }
 
-// Clear wipes all persisted entries and in-memory auto-spills in the store.
+// ClearSessionSpills removes all in-memory auto-spills belonging to sessionID without touching user KV or other sessions.
+func (s *StateStore) ClearSessionSpills(sessionID string) {
+	sid := strings.TrimSpace(sessionID)
+	s.mu.Lock()
+	delete(s.sessionSpills, sid)
+	s.mu.Unlock()
+}
+
+// ClearForSession clears persisted user KV entries and sessionID's auto-spills without dropping other sessions' active spills.
+func (s *StateStore) ClearForSession(sessionID string) {
+	sid := strings.TrimSpace(sessionID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.entries) > 0 {
+		s.dirty = true
+	}
+	s.entries = map[string]stateEntry{}
+	delete(s.sessionSpills, sid)
+}
+
+// Clear wipes all persisted entries and all in-memory auto-spills in the store.
 func (s *StateStore) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -341,18 +435,17 @@ func (s *StateStore) Clear() {
 		s.dirty = true
 	}
 	s.entries = map[string]stateEntry{}
-	s.spills = map[string]stateEntry{}
-	s.lastSpillKey = ""
+	s.sessionSpills = map[string]*sessionSpillBucket{}
 }
 
-func (s *StateStore) evictSpillsLocked(bytesNeeded int) {
+func evictBucketSpillsLocked(b *sessionSpillBucket, bytesNeeded int) {
 	type cand struct {
 		key   string
 		seq   int64
 		bytes int
 	}
-	cands := make([]cand, 0, len(s.spills))
-	for k, e := range s.spills {
+	cands := make([]cand, 0, len(b.spills))
+	for k, e := range b.spills {
 		cands = append(cands, cand{key: k, seq: e.Seq, bytes: e.Bytes})
 	}
 	sort.Slice(cands, func(i, j int) bool {
@@ -363,9 +456,46 @@ func (s *StateStore) evictSpillsLocked(bytesNeeded int) {
 	})
 	freed := 0
 	for _, c := range cands {
-		delete(s.spills, c.key)
-		if s.lastSpillKey == c.key {
-			s.lastSpillKey = ""
+		delete(b.spills, c.key)
+		if b.lastSpillKey == c.key {
+			b.lastSpillKey = ""
+		}
+		freed += c.bytes
+		if freed >= bytesNeeded {
+			break
+		}
+	}
+}
+
+func (s *StateStore) evictGlobalSpillsLocked(bytesNeeded int) {
+	type cand struct {
+		sid   string
+		key   string
+		seq   int64
+		bytes int
+	}
+	var cands []cand
+	for sid, b := range s.sessionSpills {
+		for k, e := range b.spills {
+			cands = append(cands, cand{sid: sid, key: k, seq: e.Seq, bytes: e.Bytes})
+		}
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].seq != cands[j].seq {
+			return cands[i].seq < cands[j].seq
+		}
+		return cands[i].key < cands[j].key
+	})
+	freed := 0
+	for _, c := range cands {
+		if b := s.sessionSpills[c.sid]; b != nil {
+			delete(b.spills, c.key)
+			if b.lastSpillKey == c.key {
+				b.lastSpillKey = ""
+			}
+			if len(b.spills) == 0 && b.seq == 0 {
+				delete(s.sessionSpills, c.sid)
+			}
 		}
 		freed += c.bytes
 		if freed >= bytesNeeded {
@@ -472,7 +602,8 @@ func parsePageArgs(args []any) (key string, explicitKey bool, pageNum int, pageS
 
 // StateBinder binds the `state` namespace (`get`, `set`, `delete`, `keys`, `clear`, `page`) into the sandbox.
 type StateBinder struct {
-	Store *StateStore
+	Store     *StateStore
+	SessionID string
 }
 
 func (b *StateBinder) Bind(env *sandbox.ExecutionEnv) error {
@@ -482,7 +613,11 @@ func (b *StateBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
-			return b.Store.Get(key), nil
+			val, _, ok := b.Store.GetResolvedForSession(b.SessionID, key)
+			if !ok {
+				return nil, nil
+			}
+			return val, nil
 		},
 		"set": func(_ context.Context, args []any) (any, error) {
 			key, err := requireStringArg(args, 0, "key")
@@ -503,13 +638,13 @@ func (b *StateBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{"deleted": b.Store.Delete(key)}, nil
+			return map[string]any{"deleted": b.Store.DeleteForSession(b.SessionID, key)}, nil
 		},
 		"keys": func(_ context.Context, _ []any) (any, error) {
-			return b.Store.Keys(), nil
+			return b.Store.KeysForSession(b.SessionID), nil
 		},
 		"clear": func(_ context.Context, _ []any) (any, error) {
-			b.Store.Clear()
+			b.Store.ClearForSession(b.SessionID)
 			return map[string]any{"ok": true}, nil
 		},
 		// state.page(key, n?, size?) or state.page(n, size?) returns page n (negative = from the end)
@@ -519,10 +654,10 @@ func (b *StateBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
-			val, resolvedKey, ok := b.Store.GetResolved(key)
+			val, resolvedKey, ok := b.Store.GetResolvedForSession(b.SessionID, key)
 			if !ok {
 				if explicitKey && key != lastResultKey {
-					return nil, sandbox.NewHostError(sandbox.KindNotFound, nil, "key '%s' not found in this workspace (spills are scoped to the cwd that produced them, or may have been evicted/cleared)", key)
+					return nil, sandbox.NewHostError(sandbox.KindNotFound, nil, "key '%s' not found in this workspace (spills are scoped to the session and cwd that produced them, or may have been evicted/cleared)", key)
 				}
 				return nil, sandbox.NewHostError(sandbox.KindNotFound, nil, "nothing to page yet (pages the last truncated output)")
 			}

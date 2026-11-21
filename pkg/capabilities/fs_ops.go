@@ -209,33 +209,104 @@ func (b *FSSearchBinder) fileOps(env *sandbox.ExecutionEnv) map[string]sandbox.A
 			if !optBool(opts, "recursive", false) {
 				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is a directory; pass { recursive: true }", from)
 			}
-			var files []string
-			walkErr := filepath.WalkDir(absFrom, func(p string, d fs.DirEntry, err error) error {
-				if err != nil {
-					return err
-				}
-				if !d.IsDir() {
-					files = append(files, p)
-					if len(files) > maxCopyFiles {
-						return sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s has more than %d files; use sh.run", from, maxCopyFiles)
-					}
-				}
-				return nil
-			})
-			if walkErr != nil {
-				return nil, walkErr
+			absTo, err := b.Policy.ResolveAndCheckWrite(env.Cwd, to)
+			if err != nil {
+				return nil, err
+			}
+			if isSameOrDescendantDir(absFrom, absTo) {
+				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "cannot copy directory %s into itself (%s)", from, to)
 			}
 			type copyPair struct{ src, dst string }
-			pairs := make([]copyPair, 0, len(files))
-			dstPaths := make([]string, 0, len(files))
-			for _, src := range files {
-				rel, _ := filepath.Rel(absFrom, src)
-				dst, err := b.Policy.ResolveAndCheckWrite(env.Cwd, filepath.Join(to, rel))
-				if err != nil {
-					return nil, err
-				}
-				pairs = append(pairs, copyPair{src: src, dst: dst})
-				dstPaths = append(dstPaths, dst)
+			var pairs []copyPair
+			var dstPaths []string
+			visitedDirs := map[string]bool{}
+			if realRoot, rErr := filepath.EvalSymlinks(absFrom); rErr == nil {
+				visitedDirs[normalizeLockKey(realRoot)] = true
+			} else {
+				visitedDirs[normalizeLockKey(absFrom)] = true
+			}
+
+			var collectDir func(srcRoot, relBase string) error
+			collectDir = func(srcRoot, relBase string) error {
+				return filepath.WalkDir(srcRoot, func(p string, d fs.DirEntry, walkErr error) error {
+					if walkErr != nil {
+						return walkErr
+					}
+					if _, pErr := b.Policy.ResolveAndCheckRead(env.Cwd, p); pErr != nil {
+						return pErr
+					}
+					relSub, _ := filepath.Rel(srcRoot, p)
+					rel := relSub
+					if relBase != "" {
+						if relSub == "." {
+							rel = relBase
+						} else {
+							rel = filepath.Join(relBase, relSub)
+						}
+					}
+					if d.Type()&os.ModeSymlink != 0 {
+						if _, lErr := os.Lstat(p); lErr != nil {
+							return lErr
+						}
+						linkDest, rlErr := os.Readlink(p)
+						if rlErr != nil {
+							return rlErr
+						}
+						resolvedLink := linkDest
+						if !filepath.IsAbs(resolvedLink) {
+							resolvedLink = filepath.Join(filepath.Dir(p), linkDest)
+						}
+						if _, pErr := b.Policy.ResolveAndCheckRead(filepath.Dir(p), resolvedLink); pErr != nil {
+							return pErr
+						}
+						evalTarget, evalErr := filepath.EvalSymlinks(p)
+						if evalErr != nil {
+							return evalErr
+						}
+						if _, pErr := b.Policy.ResolveAndCheckRead(env.Cwd, evalTarget); pErr != nil {
+							return pErr
+						}
+						tInfo, stErr := os.Stat(evalTarget)
+						if stErr != nil {
+							return stErr
+						}
+						if tInfo.IsDir() {
+							dirKey := normalizeLockKey(evalTarget)
+							if visitedDirs[dirKey] {
+								return sandbox.NewHostError(sandbox.KindBadArgs, nil, "symlink cycle detected copying %s", p)
+							}
+							visitedDirs[dirKey] = true
+							defer delete(visitedDirs, dirKey)
+							return collectDir(evalTarget, rel)
+						}
+						dst, wErr := b.Policy.ResolveAndCheckWrite(env.Cwd, filepath.Join(to, rel))
+						if wErr != nil {
+							return wErr
+						}
+						pairs = append(pairs, copyPair{src: evalTarget, dst: dst})
+						dstPaths = append(dstPaths, dst)
+						if len(pairs) > maxCopyFiles {
+							return sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s has more than %d files; use sh.run", from, maxCopyFiles)
+						}
+						return nil
+					}
+					if d.IsDir() {
+						return nil
+					}
+					dst, wErr := b.Policy.ResolveAndCheckWrite(env.Cwd, filepath.Join(to, rel))
+					if wErr != nil {
+						return wErr
+					}
+					pairs = append(pairs, copyPair{src: p, dst: dst})
+					dstPaths = append(dstPaths, dst)
+					if len(pairs) > maxCopyFiles {
+						return sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s has more than %d files; use sh.run", from, maxCopyFiles)
+					}
+					return nil
+				})
+			}
+			if walkErr := collectDir(absFrom, ""); walkErr != nil {
+				return nil, walkErr
 			}
 			if b.Locks != nil && len(dstPaths) > 0 {
 				relLock, lockErr := b.Locks.AcquireIn(ctx, env.Cwd, lockOwnerForEnv(env), dstPaths...)
@@ -244,6 +315,9 @@ func (b *FSSearchBinder) fileOps(env *sandbox.ExecutionEnv) map[string]sandbox.A
 				}
 				defer relLock()
 			}
+			if err := os.MkdirAll(absTo, 0o755); err != nil {
+				return nil, err
+			}
 			for _, pair := range pairs {
 				if err := copyFile(pair.src, pair.dst); err != nil {
 					return nil, err
@@ -251,6 +325,39 @@ func (b *FSSearchBinder) fileOps(env *sandbox.ExecutionEnv) map[string]sandbox.A
 			}
 			return nil, nil
 		},
+	}
+}
+
+func isSameOrDescendantDir(src, dst string) bool {
+	check := func(s, d string) bool {
+		sn := strings.TrimSuffix(normalizeLockKey(s), "/")
+		dn := strings.TrimSuffix(normalizeLockKey(d), "/")
+		return dn == sn || strings.HasPrefix(dn, sn+"/")
+	}
+	if check(src, dst) {
+		return true
+	}
+	realSrc := evalDeepestExisting(src)
+	realDst := evalDeepestExisting(dst)
+	return check(realSrc, realDst)
+}
+
+func evalDeepestExisting(absPath string) string {
+	cur := filepath.Clean(absPath)
+	var tail []string
+	for {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			for i := len(tail) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, tail[i])
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return filepath.Clean(absPath)
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
 	}
 }
 

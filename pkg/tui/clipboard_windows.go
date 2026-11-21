@@ -34,6 +34,9 @@ const (
 // writeSystemClipboard writes UTF-8 text directly to the Windows clipboard via Win32 CF_UNICODETEXT.
 // Zero external dependencies, zero subprocesses, full Unicode/CJK/emoji fidelity.
 func writeSystemClipboard(text string) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	u16 := utf16.Encode([]rune(text))
 	u16 = append(u16, 0)
 	byteLen := uintptr(len(u16) * 2)

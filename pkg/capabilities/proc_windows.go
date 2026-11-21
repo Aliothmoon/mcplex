@@ -5,7 +5,7 @@ package capabilities
 import (
 	"os/exec"
 	"strconv"
-	"sync/atomic"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -62,49 +62,61 @@ func setSysProcAttrHide(cmd *exec.Cmd) {
 }
 
 func configureManagedCmd(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		HideWindow:    true,
-		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
+	// Preserve any existing SysProcAttr.CmdLine (e.g. raw command line for cmd.exe).
+	cmd.SysProcAttr.HideWindow = true
+	cmd.SysProcAttr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP
+	if cmd.Cancel != nil {
+		cmd.Cancel = func() error {
+			if cmd.Process == nil {
+				return nil
+			}
+			killProcessTreeWindows(cmd.Process.Pid)
+			return cmd.Process.Kill()
 		}
-		killProcessTreeWindows(cmd.Process.Pid)
-		return cmd.Process.Kill()
+		// Force-close inherited stdout/stderr pipes if any grandchild process still holds handles
+		// after process-tree termination so cmd.Run() / cmd.Wait() NEVER blocks forever.
+		cmd.WaitDelay = 500 * time.Millisecond
 	}
-	// Force-close inherited stdout/stderr pipes if any grandchild process still holds handles
-	// after process-tree termination so cmd.Run() / cmd.Wait() NEVER blocks forever.
-	cmd.WaitDelay = 500 * time.Millisecond
 }
 
 // runManagedCmd executes cmd inside a Windows Job Object (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
 // so cancellation or exit atomically terminates all grandchild processes (e.g. pwsh -> node)
 // without leaving orphaned processes holding workspace directory handles.
 func runManagedCmd(cmd *exec.Cmd) error {
-	var jobAtom atomic.Uintptr
+	var jobMu sync.Mutex
+	var jobHandle syscall.Handle
+	jobClosed := false
+
 	origCancel := cmd.Cancel
-	cmd.Cancel = func() error {
-		if j := jobAtom.Load(); j != 0 {
-			_, _, _ = procTerminateJobObject.Call(j, 1)
-		}
-		if origCancel != nil {
+	if origCancel != nil {
+		cmd.Cancel = func() error {
+			jobMu.Lock()
+			if !jobClosed && jobHandle != 0 {
+				_, _, _ = procTerminateJobObject.Call(uintptr(jobHandle), 1)
+			}
+			jobMu.Unlock()
 			return origCancel()
 		}
-		if cmd.Process != nil {
-			return cmd.Process.Kill()
-		}
-		return nil
 	}
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	if job := attachJobObject(cmd.Process.Pid); job != 0 {
-		jobAtom.Store(job)
+		jobMu.Lock()
+		jobHandle = syscall.Handle(job)
+		jobMu.Unlock()
 		defer func() {
-			jobAtom.Store(0)
-			_, _, _ = procTerminateJobObject.Call(job, 1)
-			_ = syscall.CloseHandle(syscall.Handle(job))
+			jobMu.Lock()
+			if !jobClosed && jobHandle != 0 {
+				jobClosed = true
+				_, _, _ = procTerminateJobObject.Call(uintptr(jobHandle), 1)
+				_ = syscall.CloseHandle(jobHandle)
+				jobHandle = 0
+			}
+			jobMu.Unlock()
 		}()
 	}
 	return cmd.Wait()

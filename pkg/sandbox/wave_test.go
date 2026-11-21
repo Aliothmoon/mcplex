@@ -62,3 +62,34 @@ func TestOpTraceWaveGroupingForSequentialAndPromiseAll(t *testing.T) {
 		t.Fatalf("expected seq 5 StartMs (%d) after parallel wave 2 completed (%d+%d)", bySeq[5].StartMs, bySeq[2].StartMs, bySeq[2].DurationMs)
 	}
 }
+
+func TestOpTraceWaveAdvancesAfterUnsettledPromiseRaceBranch(t *testing.T) {
+	res, err := Execute(context.Background(), ExecRequest{
+		Cwd: t.TempDir(),
+		Code: `
+			const slowBranch = demo.slow(90);
+			await Promise.race([demo.slow(10), slowBranch]);
+			await demo.slow(10);
+			await Promise.all([demo.slow(10), demo.slow(15)]);
+			await slowBranch;
+		`,
+	}, waveTestBinder{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	bySeq := map[int]OpTrace{}
+	for _, tr := range res.Traces {
+		bySeq[tr.Seq] = tr
+	}
+	// Seq 1 & 2 = Wave 1 (Promise.race), Seq 3 = Wave 2 (sequential await while Seq 1 is still running),
+	// Seq 4 & 5 = Wave 3 (Promise.all while Seq 1 is still running)
+	if bySeq[1].Wave != 1 || bySeq[2].Wave != 1 {
+		t.Fatalf("expected race ops seq 1,2 in wave 1, got %d, %d", bySeq[1].Wave, bySeq[2].Wave)
+	}
+	if bySeq[3].Wave != 2 {
+		t.Fatalf("expected sequential op after Promise.race to advance to wave 2, got %d", bySeq[3].Wave)
+	}
+	if bySeq[4].Wave != 3 || bySeq[5].Wave != 3 {
+		t.Fatalf("expected Promise.all ops after seq 3 to share wave 3, got %d, %d", bySeq[4].Wave, bySeq[5].Wave)
+	}
+}

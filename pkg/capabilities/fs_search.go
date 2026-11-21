@@ -356,7 +356,7 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
-			tree := buildTreeList(absPath, maxDepth, treeMaxItems)
+			tree := buildTreeList(b.Policy, env.Cwd, absPath, maxDepth, treeMaxItems)
 			if len(tree) >= treeMaxItems {
 				env.AddWarning(fmt.Sprintf("fs.tree: capped at %d entries; lower depth or use search.glob", treeMaxItems))
 			}
@@ -750,6 +750,14 @@ func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, 
 		return nil, invalidRegexError(q.pattern, err.Error())
 	}
 
+	var globMatcher *compiledGlob
+	if q.glob != "" {
+		globMatcher, err = compileGlob(q.glob)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	var files []string
 	info, err := os.Stat(searchRoot)
 	if err != nil {
@@ -774,7 +782,7 @@ func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, 
 			if !canSearchPath(pol, workspaceCwd, p, permCache) {
 				return nil
 			}
-			if q.glob != "" && !matchSimpleGlob(q.glob, filepath.ToSlash(p), d.Name()) {
+			if globMatcher != nil && !globMatcher.MatchSimple(filepath.ToSlash(p), d.Name()) {
 				return nil
 			}
 			files = append(files, p)
@@ -837,18 +845,24 @@ func (b *FSSearchBinder) runGlobSearch(ctx context.Context, workspaceCwd, search
 	if maxResults <= 0 {
 		maxResults = 200
 	}
+	// Precompile and validate brace expansion caps BEFORE walking the workspace!
+	exactGlob, err := compileGlob(pattern)
+	if err != nil {
+		return nil, 0, "", err
+	}
+
 	allFiles := collectWorkspaceFiles(ctx, b.Policy, workspaceCwd, searchRoot)
 	total := 0
-	matchFiles := func(pat string) []string {
+	matchFiles := func(cg *compiledGlob) []string {
 		var matched []string
 		total = 0
 		for _, abs := range allFiles {
-			relToSearch, err := filepath.Rel(searchRoot, abs)
-			if err != nil {
+			relToSearch, relErr := filepath.Rel(searchRoot, abs)
+			if relErr != nil {
 				relToSearch = abs
 			}
 			relSlash := filepath.ToSlash(relToSearch)
-			if matchGlobPattern(pat, relSlash) {
+			if cg.Match(relSlash) {
 				total++
 				if len(matched) < maxResults {
 					matched = append(matched, relDisplayPath(workspaceCwd, abs))
@@ -859,7 +873,7 @@ func (b *FSSearchBinder) runGlobSearch(ctx context.Context, workspaceCwd, search
 		return matched
 	}
 
-	exact := matchFiles(pattern)
+	exact := matchFiles(exactGlob)
 	if len(exact) > 0 {
 		return exact, total, "", nil
 	}
@@ -867,7 +881,11 @@ func (b *FSSearchBinder) runGlobSearch(ctx context.Context, workspaceCwd, search
 	// Smart fallback 1 (inspired by agy-fast v0.2.2): expand regex alternation `a|b` mistakenly passed to glob
 	if strings.Contains(pattern, "|") && !strings.Contains(pattern, "{") {
 		expanded := "*{" + strings.ReplaceAll(pattern, "|", ",") + "}*"
-		recovered := matchFiles(expanded)
+		altGlob, altErr := compileGlob(expanded)
+		if altErr != nil {
+			return nil, 0, "", altErr
+		}
+		recovered := matchFiles(altGlob)
 		if len(recovered) > 0 {
 			return recovered, total, fmt.Sprintf("auto-expanded regex '|' to glob '%s'", expanded), nil
 		}
@@ -918,77 +936,136 @@ func collectWorkspaceFiles(ctx context.Context, pol *policy.Engine, workspaceCwd
 	return out
 }
 
-func matchGlobPattern(pattern, relSlash string) bool {
-	// Expand single-level `{a,b,c}` braces
-	for _, expanded := range expandBraces(filepath.ToSlash(pattern)) {
-		if globSingle(expanded, relSlash) {
+const maxGlobBraceExpansions = 64
+
+type compiledGlobPart struct {
+	raw      string
+	hasSlash bool
+	re       *regexp.Regexp
+}
+
+type compiledGlob struct {
+	parts []compiledGlobPart
+}
+
+func compileGlob(pattern string) (*compiledGlob, error) {
+	expanded, err := expandBracesChecked(filepath.ToSlash(pattern), maxGlobBraceExpansions)
+	if err != nil {
+		return nil, err
+	}
+	parts := make([]compiledGlobPart, 0, len(expanded))
+	for _, p := range expanded {
+		re, cErr := compileSingleGlobRegex(p)
+		if cErr != nil {
+			continue
+		}
+		parts = append(parts, compiledGlobPart{
+			raw:      p,
+			hasSlash: strings.Contains(p, "/"),
+			re:       re,
+		})
+	}
+	return &compiledGlob{parts: parts}, nil
+}
+
+func (cg *compiledGlob) Match(relSlash string) bool {
+	if cg == nil {
+		return false
+	}
+	base := path.Base(relSlash)
+	for _, p := range cg.parts {
+		if !p.hasSlash {
+			if ok, _ := path.Match(p.raw, base); ok {
+				return true
+			}
+		}
+		if p.re != nil && p.re.MatchString(relSlash) {
 			return true
 		}
 	}
 	return false
 }
 
-func expandBraces(pat string) []string {
-	open := strings.IndexByte(pat, '{')
-	closeIdx := strings.IndexByte(pat, '}')
-	if open >= 0 && closeIdx > open {
-		prefix := pat[:open]
-		suffix := pat[closeIdx+1:]
-		alts := strings.Split(pat[open+1:closeIdx], ",")
-		var out []string
-		for _, a := range alts {
-			out = append(out, expandBraces(prefix+strings.TrimSpace(a)+suffix)...)
-		}
-		return out
-	}
-	return []string{pat}
+func (cg *compiledGlob) MatchSimple(fullSlash, baseName string) bool {
+	return cg.Match(fullSlash) || cg.Match(baseName)
 }
 
-func globSingle(pat, relSlash string) bool {
-	if !strings.Contains(pat, "/") {
-		ok, _ := path.Match(pat, path.Base(relSlash))
-		if ok {
-			return true
+func expandBracesChecked(pat string, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = maxGlobBraceExpansions
+	}
+	queue := []string{pat}
+	var out []string
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		closeIdx := strings.IndexByte(cur, '}')
+		open := -1
+		if closeIdx > 0 {
+			open = strings.LastIndexByte(cur[:closeIdx], '{')
+		}
+		if open < 0 || closeIdx < 0 {
+			out = append(out, cur)
+			if len(out) > limit {
+				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "glob pattern %q exceeds max %d brace expansions", pat, limit)
+			}
+			continue
+		}
+		prefix := cur[:open]
+		suffix := cur[closeIdx+1:]
+		alts := strings.Split(cur[open+1:closeIdx], ",")
+		if len(out)+len(queue)+len(alts) > limit {
+			return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "glob pattern %q exceeds max %d brace expansions", pat, limit)
+		}
+		for _, a := range alts {
+			queue = append(queue, prefix+strings.TrimSpace(a)+suffix)
 		}
 	}
-	regexStr := "^"
+	return out, nil
+}
+
+func expandBraces(pat string) []string {
+	out, err := expandBracesChecked(pat, maxGlobBraceExpansions)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+func compileSingleGlobRegex(pat string) (*regexp.Regexp, error) {
+	var regexStr strings.Builder
+	regexStr.WriteByte('^')
 	for i := 0; i < len(pat); i++ {
 		c := pat[i]
 		switch c {
 		case '*':
 			if i+1 < len(pat) && pat[i+1] == '*' {
 				if i+2 < len(pat) && pat[i+2] == '/' {
-					regexStr += "(?:.*/)?"
+					regexStr.WriteString("(?:.*/)?")
 					i += 2
 				} else {
-					regexStr += ".*"
+					regexStr.WriteString(".*")
 					i++
 				}
 			} else {
-				regexStr += "[^/]*"
+				regexStr.WriteString("[^/]*")
 			}
 		case '?':
-			regexStr += "[^/]"
+			regexStr.WriteString("[^/]")
 		case '.', '+', '(', ')', '|', '^', '$', '[', ']', '\\':
-			regexStr += "\\" + string(c)
+			regexStr.WriteByte('\\')
+			regexStr.WriteByte(c)
 		default:
-			regexStr += string(c)
+			regexStr.WriteByte(c)
 		}
 	}
-	regexStr += "$"
-	re, err := regexp.Compile(regexStr)
-	if err != nil {
-		return false
-	}
-	return re.MatchString(relSlash)
+	regexStr.WriteByte('$')
+	return regexp.Compile(regexStr.String())
 }
 
-func matchSimpleGlob(globPat, fullSlash, baseName string) bool {
-	return matchGlobPattern(globPat, fullSlash) || matchGlobPattern(globPat, baseName)
-}
-
-func buildTreeList(root string, maxDepth, maxItems int) []string {
+func buildTreeList(pol *policy.Engine, workspaceCwd, root string, maxDepth, maxItems int) []string {
 	out := []string{}
+	permCache := map[string]bool{}
 	var walk func(dir, relPrefix string, depth int)
 	walk = func(dir, relPrefix string, depth int) {
 		if depth > maxDepth || len(out) >= maxItems {
@@ -1006,6 +1083,10 @@ func buildTreeList(root string, maxDepth, maxItems int) []string {
 			if e.IsDir() && skippedWalkDirs[name] {
 				continue
 			}
+			fullPath := filepath.Join(dir, name)
+			if !canSearchPath(pol, workspaceCwd, fullPath, permCache) {
+				continue
+			}
 			rel := name
 			if relPrefix != "" {
 				rel = relPrefix + "/" + name
@@ -1013,7 +1094,7 @@ func buildTreeList(root string, maxDepth, maxItems int) []string {
 			if e.IsDir() {
 				out = append(out, rel+"/")
 				if depth < maxDepth {
-					walk(filepath.Join(dir, name), rel, depth+1)
+					walk(fullPath, rel, depth+1)
 				}
 			} else {
 				out = append(out, rel)

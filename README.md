@@ -11,10 +11,11 @@ Give **any MCP-only runtime** (Claude Desktop/Code, Cursor, Codex, Windsurf, Cli
 ## Why Code Mode Proxy Instead of 30 Flat Tools?
 
 - **One turn instead of 10**: Search with `ripgrep`, inspect AST outlines, filter in memory, run atomic multi-file transactions (`tx.begin()` → `edit` → `verify` → `commit`/auto-rollback), query read-only `git`, stream `fs.hash`, run concurrent `sh.checks`, and call downstream `mcp.*` servers inside ONE TypeScript program.
-- **Zero manual Skill setup**: Pure MCP clients automatically receive the API guide via three layers:
+- **Zero manual Skill setup**: Pure MCP clients automatically receive the API guide via four progressive-disclosure layers:
   1. `initialize.result.instructions` (MCP `2025-03-26+`)
   2. Self-describing `exec` tool description (works even in minimal clients that ignore `instructions`/`resources`)
-  3. `mcplex://skill` MCP Resource (`resources/list` + `resources/read`) & `mcplex skill` CLI command
+  3. On-demand `docs` MCP tool (`docs()` index, `docs({ topic })`, `docs({ query })`) for exact namespace signatures & recipes
+  4. `mcplex://skill` MCP Resource (`resources/list` + `resources/read`) & `mcplex skill` CLI command
 - **Concurrent-safe & zero disk spills**: Oversized outputs auto-spill to a process-local memory pool (`__result_N`) and paginate cleanly at line boundaries via `state.page('__result_N', 2)`.
 - **Embeddable Go Core (`pkg/`)**: Downstream host plugins (such as [`agy-ptc`](https://github.com/aliothmoon/agy-ptc)) import `github.com/aliothmoon/mcplex/pkg/...` directly so there is only ONE core to maintain.
 

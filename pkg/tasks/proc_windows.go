@@ -5,7 +5,7 @@ package tasks
 import (
 	"os/exec"
 	"strconv"
-	"sync/atomic"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -57,23 +57,32 @@ type jobObjectExtendedLimitInformationStruct struct {
 	PeakJobMemoryUsed     uintptr
 }
 
+// procHandle guards the Win32 Job HANDLE lifecycle with a mutex so Kill (TerminateJobObject)
+// and Close (CloseHandle) are strictly mutually exclusive and Close is idempotent, preventing
+// TerminateJobObject from ever racing against a closed/recycled OS handle.
 type procHandle struct {
-	job atomic.Uintptr
+	mu     sync.Mutex
+	job    syscall.Handle
+	closed bool
 }
 
 func configureTaskCmd(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		HideWindow:    true,
-		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
+	// Preserve any existing SysProcAttr.CmdLine (e.g. raw command line for cmd.exe).
+	cmd.SysProcAttr.HideWindow = true
+	cmd.SysProcAttr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP
+	if cmd.Cancel != nil {
+		cmd.Cancel = func() error {
+			if cmd.Process == nil {
+				return nil
+			}
+			killWindowsTree(cmd.Process.Pid)
+			return cmd.Process.Kill()
 		}
-		killWindowsTree(cmd.Process.Pid)
-		return cmd.Process.Kill()
+		cmd.WaitDelay = 500 * time.Millisecond
 	}
-	cmd.WaitDelay = 500 * time.Millisecond
 }
 
 // attachProcessHandle binds a started child process to a Windows Job Object configured with
@@ -107,29 +116,58 @@ func attachProcessHandle(cmd *exec.Cmd) *procHandle {
 	}
 	defer syscall.CloseHandle(syscall.Handle(ph))
 
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		_ = syscall.CloseHandle(syscall.Handle(job))
+		return h
+	}
 	assigned, _, _ := procAssignProcessToJobObj.Call(job, ph)
 	if assigned == 0 {
 		_ = syscall.CloseHandle(syscall.Handle(job))
 		return h
 	}
-	h.job.Store(job)
+	h.job = syscall.Handle(job)
 	return h
 }
 
-func (h *procHandle) release() {
+// Kill terminates all processes in the Win32 Job Object if still open.
+func (h *procHandle) Kill() {
 	if h == nil {
 		return
 	}
-	if job := h.job.Swap(0); job != 0 {
-		_ = syscall.CloseHandle(syscall.Handle(job))
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || h.job == 0 {
+		return
 	}
+	_, _, _ = procTerminateJobObject.Call(uintptr(h.job), 1)
+}
+
+// Close releases the Win32 Job Object handle idempotently.
+func (h *procHandle) Close() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
+	h.closed = true
+	if h.job != 0 {
+		_ = syscall.CloseHandle(h.job)
+		h.job = 0
+	}
+}
+
+func (h *procHandle) release() {
+	h.Close()
 }
 
 func killTaskProcessTree(cmd *exec.Cmd, h *procHandle) {
 	if h != nil {
-		if job := h.job.Load(); job != 0 {
-			_, _, _ = procTerminateJobObject.Call(job, 1)
-		}
+		h.Kill()
 	}
 	if cmd == nil || cmd.Process == nil {
 		return

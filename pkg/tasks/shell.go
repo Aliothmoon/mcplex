@@ -1,64 +1,22 @@
 package tasks
 
 import (
-	"fmt"
 	"os"
-	"os/exec"
 	"runtime"
 	"strings"
+
+	"github.com/aliothmoon/mcplex/internal/shellcmd"
 )
 
 // DefaultShellName returns the default shell dialect for the current OS.
 func DefaultShellName() string {
-	if runtime.GOOS != "windows" {
-		return "sh"
-	}
-	if _, err := exec.LookPath("pwsh"); err == nil {
-		return "pwsh"
-	}
-	return "cmd"
+	return shellcmd.DefaultShellName()
 }
 
 // ResolveShell maps a shell dialect name to its executable path and command-invocation flags.
 func ResolveShell(name string) (string, []string, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		name = DefaultShellName()
-	}
-	switch strings.ToLower(name) {
-	case "pwsh":
-		p, err := exec.LookPath("pwsh")
-		if err != nil {
-			return "", nil, fmt.Errorf("pwsh: command not found")
-		}
-		return p, []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command"}, nil
-	case "powershell":
-		p, err := exec.LookPath("powershell")
-		if err != nil {
-			return "", nil, fmt.Errorf("powershell: command not found")
-		}
-		return p, []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command"}, nil
-	case "cmd":
-		p, err := exec.LookPath("cmd")
-		if err != nil {
-			return "", nil, fmt.Errorf("cmd: command not found")
-		}
-		return p, []string{"/C"}, nil
-	case "bash":
-		p, err := exec.LookPath("bash")
-		if err != nil {
-			return "", nil, fmt.Errorf("bash: command not found")
-		}
-		return p, []string{"-c"}, nil
-	case "sh":
-		p, err := exec.LookPath("sh")
-		if err != nil {
-			return "", nil, fmt.Errorf("sh: command not found")
-		}
-		return p, []string{"-c"}, nil
-	default:
-		return "", nil, fmt.Errorf("unsupported shell %q (allowed: pwsh, powershell, cmd, bash, sh)", name)
-	}
+	exe, args, _, err := shellcmd.Resolve(name)
+	return exe, args, err
 }
 
 // MergeEnv overlays extra environment variables on os.Environ().

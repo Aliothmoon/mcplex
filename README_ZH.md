@@ -11,10 +11,11 @@
 ## 为什么是 Code Mode Proxy？
 
 - **一轮完成多步编排**：在一次 TypeScript 调用里并行执行 `ripgrep` 检索、AST 符号读取、内存过滤、带自动回滚的多文件事务编辑（`tx.begin()`）、只读 `git`、流式 `fs.hash`、并发 `sh.checks` 以及下游 `mcp.*` 调用。
-- **纯 MCP 宿主零配置即可上手**：通过三层协议能力自动把 Skill 交给模型：
+- **纯 MCP 宿主零配置即可上手**：通过四层渐进式披露能力自动把 Skill 交给模型：
   1. `initialize.result.instructions`（MCP `2025-03-26+` 自动注入）
   2. `exec` 工具描述自带精简 API 速查（即使宿主忽略 `instructions` 和 `resources` 也能一把写对）
-  3. `mcplex://skill` MCP Resource（`resources/list` + `resources/read`）及 `mcplex skill` 命令
+  3. 按需检索的 `docs` MCP 工具（无参查目录、`docs({ topic })` 查精确签名与示例、`docs({ query })` 关键词检索）
+  4. `mcplex://skill` MCP Resource（`resources/list` + `resources/read`）及 `mcplex skill` 命令
 - **并发安全 & 零落盘溢出**：超长输出自动存入进程内独立内存池（`__result_N`），按行分页并通过 `state.page('__result_N', 2)` 绑定键翻页，并发不串数据。
 - **单核复用（Go Module `pkg/`）**：下游宿主插件（如 [`agy-ptc`](https://github.com/aliothmoon/agy-ptc)）直接通过 `go.mod` 引用 `github.com/aliothmoon/mcplex/pkg/...`，全生态只维护一套 Core。
 

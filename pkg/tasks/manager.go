@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aliothmoon/mcplex/internal/shellcmd"
 	"github.com/aliothmoon/mcplex/pkg/events"
 	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/policy"
@@ -134,11 +135,13 @@ type Manager struct {
 	maxRetained   int
 	events        atomic.Pointer[events.Hub]
 
-	mu     sync.Mutex
-	tasks  map[string]*managedTask
-	order  []string
-	seq    atomic.Int64
-	closed bool
+	mu       sync.Mutex
+	tasks    map[string]*managedTask
+	order    []string
+	starting int
+	startCh  chan struct{}
+	seq      atomic.Int64
+	closed   bool
 }
 
 // SetEventHub attaches an optional real-time event hub for streaming live task output.
@@ -149,18 +152,38 @@ func (m *Manager) SetEventHub(hub *events.Hub) {
 	m.events.Store(hub)
 }
 
+const orphanTaskLogMaxAge = 24 * time.Hour
+
 // NewManager creates a TaskManager storing per-task logs under <dataDir>/tasks when dataDir != "".
 func NewManager(dataDir string) *Manager {
 	logDir := ""
 	if strings.TrimSpace(dataDir) != "" {
 		logDir = filepath.Join(dataDir, "tasks")
 		_ = os.MkdirAll(logDir, 0o755)
+		cleanupOrphanTaskLogs(logDir, orphanTaskLogMaxAge)
 	}
 	return &Manager{
 		logDir:        logDir,
 		maxConcurrent: DefaultMaxConcurrent,
 		maxRetained:   DefaultMaxRetained,
 		tasks:         map[string]*managedTask{},
+		startCh:       make(chan struct{}),
+	}
+}
+
+func cleanupOrphanTaskLogs(logDir string, maxAge time.Duration) {
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".log") {
+			continue
+		}
+		if info, err := e.Info(); err == nil && info.ModTime().Before(cutoff) {
+			_ = os.Remove(filepath.Join(logDir, e.Name()))
+		}
 	}
 }
 
@@ -175,6 +198,7 @@ type managedTask struct {
 	logFile   string
 
 	cmd     *exec.Cmd
+	procCtx context.Context
 	stdin   io.WriteCloser
 	proc    *procHandle
 	cancel  context.CancelFunc
@@ -227,7 +251,7 @@ func (m *Manager) Start(ctx context.Context, pol *policy.Engine, req StartReques
 		}
 	}
 
-	shellExe, shellArgs, err := ResolveShell(req.Shell)
+	shellExe, shellArgs, dialect, err := shellcmd.Resolve(req.Shell)
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +284,7 @@ func (m *Manager) Start(ctx context.Context, pol *policy.Engine, req StartReques
 		m.mu.Unlock()
 		return nil, errors.New("task manager is closed")
 	}
-	running := 0
+	running := m.starting
 	for _, tk := range m.tasks {
 		if tk.currentStatus() == StatusRunning {
 			running++
@@ -270,9 +294,21 @@ func (m *Manager) Start(ctx context.Context, pol *policy.Engine, req StartReques
 		m.mu.Unlock()
 		return nil, fmt.Errorf("too many concurrent background tasks (%d/%d running); kill finished or unused tasks first", running, m.maxConcurrent)
 	}
+	m.starting++
 	seq := m.seq.Add(1)
 	id := makeTaskID(req.Name, seq)
 	m.mu.Unlock()
+
+	releaseStartingSlot := func() {
+		m.mu.Lock()
+		m.starting--
+		if m.starting <= 0 {
+			m.starting = 0
+			close(m.startCh)
+			m.startCh = make(chan struct{})
+		}
+		m.mu.Unlock()
+	}
 
 	var logPath string
 	var logFile *os.File
@@ -287,12 +323,13 @@ func (m *Manager) Start(ctx context.Context, pol *policy.Engine, req StartReques
 	}
 
 	procCtx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(procCtx, shellExe, append(shellArgs, cmdLine)...)
+	cmd := shellcmd.BuildResolvedCommand(procCtx, shellExe, shellArgs, dialect, cmdLine)
 	cmd.Dir = cwd
 	if len(req.Env) > 0 {
 		cmd.Env = MergeEnv(req.Env)
 	}
 	configureTaskCmd(cmd)
+	shellcmd.ConfigureCmdLine(cmd, dialect, shellExe, cmdLine)
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
@@ -300,6 +337,10 @@ func (m *Manager) Start(ctx context.Context, pol *policy.Engine, req StartReques
 		if logFile != nil {
 			_ = logFile.Close()
 		}
+		if logPath != "" {
+			_ = os.Remove(logPath)
+		}
+		releaseStartingSlot()
 		return nil, fmt.Errorf("failed creating stdin pipe: %w", err)
 	}
 
@@ -313,6 +354,7 @@ func (m *Manager) Start(ctx context.Context, pol *policy.Engine, req StartReques
 		startedAt: time.Now(),
 		logFile:   logPath,
 		cmd:       cmd,
+		procCtx:   procCtx,
 		stdin:     stdinPipe,
 		cancel:    cancel,
 		doneCh:    make(chan struct{}),
@@ -356,6 +398,10 @@ func (m *Manager) Start(ctx context.Context, pol *policy.Engine, req StartReques
 		if logFile != nil {
 			_ = logFile.Close()
 		}
+		if logPath != "" {
+			_ = os.Remove(logPath)
+		}
+		releaseStartingSlot()
 		return nil, fmt.Errorf("failed starting command: %w", err)
 	}
 	tk.pid = cmd.Process.Pid
@@ -371,8 +417,23 @@ func (m *Manager) Start(ctx context.Context, pol *policy.Engine, req StartReques
 
 	m.mu.Lock()
 	if m.closed {
+		m.starting--
+		if m.starting <= 0 {
+			m.starting = 0
+			close(m.startCh)
+			m.startCh = make(chan struct{})
+		}
 		m.mu.Unlock()
 		tk.kill()
+		_ = cmd.Wait()
+		tk.proc.Close()
+		_ = stdinPipe.Close()
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		if logPath != "" {
+			_ = os.Remove(logPath)
+		}
 		if tk.live != nil {
 			tk.live.EmitEnd(events.Event{
 				Kind:       events.KindTask,
@@ -388,6 +449,12 @@ func (m *Manager) Start(ctx context.Context, pol *policy.Engine, req StartReques
 			})
 		}
 		return nil, errors.New("task manager is closed")
+	}
+	m.starting--
+	if m.starting <= 0 {
+		m.starting = 0
+		close(m.startCh)
+		m.startCh = make(chan struct{})
 	}
 	m.tasks[id] = tk
 	m.order = append(m.order, id)
@@ -460,6 +527,10 @@ func (m *Manager) reapTask(tk *managedTask) {
 		var exitErr *exec.ExitError
 		if errors.As(waitErr, &exitErr) {
 			exitCode = exitErr.ExitCode()
+		} else if errors.Is(waitErr, exec.ErrWaitDelay) && tk.procCtx != nil && tk.procCtx.Err() == nil && tk.cmd.ProcessState != nil && tk.cmd.ProcessState.ExitCode() == 0 {
+			exitCode = 0
+		} else if errors.Is(waitErr, exec.ErrWaitDelay) && tk.procCtx != nil && tk.procCtx.Err() == nil && tk.cmd.ProcessState != nil {
+			exitCode = tk.cmd.ProcessState.ExitCode()
 		} else {
 			exitCode = -1
 		}
@@ -629,7 +700,7 @@ func (m *Manager) CloseSession(sessionID string) int {
 	return m.killMatching(sessionID)
 }
 
-// Close shuts down the manager and terminates all running background process trees.
+// Close shuts down the manager, terminates all running background process trees, and removes per-task log files.
 func (m *Manager) Close() {
 	m.mu.Lock()
 	m.closed = true
@@ -642,13 +713,44 @@ func (m *Manager) Close() {
 	for _, tk := range list {
 		tk.kill()
 	}
-	deadline := time.After(3 * time.Second)
+
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+
+	// Wait for any in-flight Start() calls that reserved a slot before m.closed was set.
+	for {
+		m.mu.Lock()
+		inFlight := m.starting
+		ch := m.startCh
+		m.mu.Unlock()
+		if inFlight == 0 {
+			break
+		}
+		select {
+		case <-ch:
+		case <-deadline.C:
+			goto cleanupLogs
+		}
+	}
+
 	for _, tk := range list {
 		select {
 		case <-tk.doneCh:
-		case <-deadline:
-			return
+		case <-deadline.C:
+			goto cleanupLogs
 		}
+	}
+
+cleanupLogs:
+	m.mu.Lock()
+	allTasks := make([]*managedTask, 0, len(m.tasks))
+	for _, tk := range m.tasks {
+		allTasks = append(allTasks, tk)
+	}
+	m.mu.Unlock()
+
+	for _, tk := range allTasks {
+		tk.cleanupLogFile()
 	}
 }
 
@@ -736,9 +838,7 @@ func (m *Manager) pruneLocked() {
 	for _, id := range m.order {
 		tk := m.tasks[id]
 		if excess > 0 && tk != nil && tk.currentStatus() != StatusRunning {
-			if tk.logFile != "" {
-				_ = os.Remove(tk.logFile)
-			}
+			tk.cleanupLogFile()
 			delete(m.tasks, id)
 			excess--
 			continue
@@ -746,6 +846,23 @@ func (m *Manager) pruneLocked() {
 		kept = append(kept, id)
 	}
 	m.order = kept
+}
+
+func (tk *managedTask) cleanupLogFile() {
+	if tk == nil {
+		return
+	}
+	tk.mu.Lock()
+	if tk.file != nil {
+		_ = tk.file.Close()
+		tk.file = nil
+	}
+	logPath := tk.logFile
+	tk.logFile = ""
+	tk.mu.Unlock()
+	if logPath != "" {
+		_ = os.Remove(logPath)
+	}
 }
 
 func (tk *managedTask) currentStatus() Status {

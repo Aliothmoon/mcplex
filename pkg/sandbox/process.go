@@ -49,8 +49,24 @@ func installProcessOS(env *ExecutionEnv) error {
 			const upper = {};
 			for (const k of Object.keys(envObj)) upper[k.toUpperCase()] = envObj[k];
 			envObj = new Proxy(envObj, {
-				get(t, p) { return typeof p === "string" && !(p in t) ? upper[p.toUpperCase()] : t[p]; },
-				has(t, p) { return typeof p === "string" ? (p in t) || (p.toUpperCase() in upper) : (p in t); },
+				get(t, p) {
+					if (typeof p !== "string" || p in t || p === "toJSON" || p === "then" || p in Object.prototype) {
+						return t[p];
+					}
+					return upper[p.toUpperCase()];
+				},
+				has(t, p) {
+					return typeof p === "string" ? (p in t) || (p.toUpperCase() in upper) : (p in t);
+				},
+				ownKeys(t) {
+					return Reflect.ownKeys(t);
+				},
+				getOwnPropertyDescriptor(t, p) {
+					if (typeof p === "string" && !(p in t) && (p.toUpperCase() in upper)) {
+						return { value: upper[p.toUpperCase()], enumerable: true, configurable: true, writable: false };
+					}
+					return Object.getOwnPropertyDescriptor(t, p);
+				},
 			});
 		}
 		globalThis.process = Object.freeze({
@@ -67,10 +83,16 @@ func installProcessOS(env *ExecutionEnv) error {
 // conversation or audit logs. Child processes (sh.exec / sh.run) still inherit the real values.
 const redacted = "[redacted]"
 
-var secretEnvSubstrings = []string{"TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASSPHRASE", "CREDENTIAL", "APIKEY", "API_KEY",
-	"ACCESS_KEY", "PRIVATE_KEY", "SECRET_KEY", "COOKIE", "SESSION_KEY", "CONNECTION_STRING"}
+var secretEnvSubstrings = []string{
+	"TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASSPHRASE", "CREDENTIAL", "APIKEY", "API_KEY",
+	"ACCESS_KEY", "PRIVATE_KEY", "SECRET_KEY", "COOKIE", "SESSION", "SESSION_KEY",
+	"AUTHORIZATION", "BEARER", "CONNECTION_STRING",
+}
 
-var secretEnvSegments = map[string]bool{"KEY": true, "KEYS": true, "AUTH": true, "PAT": true, "PWD": false, "DSN": true}
+var secretEnvSegments = map[string]bool{
+	"KEY": true, "KEYS": true, "AUTH": true, "AUTHORIZATION": true, "BEARER": true,
+	"COOKIE": true, "SESSION": true, "PAT": true, "PWD": false, "DSN": true,
+}
 
 func isSecretEnvName(name string) bool {
 	up := strings.ToUpper(name)
@@ -87,16 +109,146 @@ func isSecretEnvName(name string) bool {
 	return false
 }
 
+// redactURLCredentials scrubs userinfo (`user:pass@host` -> `user:redacted@host` and single-token
+// `token@host` -> `redacted@host`), including URLs where `url.Parse` fails or misparses authority
+// due to unescaped `#`, `?`, or `%` characters inside passwords.
 func redactURLCredentials(val string) string {
-	u, err := url.Parse(val)
-	if err != nil || u.User == nil {
+	if !strings.Contains(val, "://") || !strings.Contains(val, "@") {
 		return val
 	}
-	if _, hasPass := u.User.Password(); !hasPass {
-		return val
+	// Fast path when `val` is a single standard URL with clean `u.User` and no `#`/`?` before `@`.
+	if !strings.ContainsAny(val, " \t\r\n,;\"'") {
+		if redactedSingle, handled := redactSingleURLToken(val); handled {
+			return redactedSingle
+		}
 	}
-	u.User = url.UserPassword(u.User.Username(), "redacted")
-	return u.String()
+	// General scanner over any `scheme://...` substrings inside `val`.
+	var b strings.Builder
+	b.Grow(len(val))
+	i := 0
+	for i < len(val) {
+		idx := strings.Index(val[i:], "://")
+		if idx < 0 {
+			b.WriteString(val[i:])
+			break
+		}
+		colonPos := i + idx
+		schemeStart := colonPos
+		for schemeStart > i && isURLSchemeChar(val[schemeStart-1]) {
+			schemeStart--
+		}
+		if schemeStart == colonPos || !isASCIILetter(val[schemeStart]) {
+			b.WriteString(val[i : colonPos+3])
+			i = colonPos + 3
+			continue
+		}
+		b.WriteString(val[i:schemeStart])
+		tokEnd := colonPos + 3
+		for tokEnd < len(val) && !isURLTokenStop(val[tokEnd]) {
+			tokEnd++
+		}
+		tok := val[schemeStart:tokEnd]
+		redTok, _ := redactSingleURLToken(tok)
+		b.WriteString(redTok)
+		i = tokEnd
+	}
+	return b.String()
+}
+
+func redactSingleURLToken(tok string) (string, bool) {
+	schemeSep := strings.Index(tok, "://")
+	if schemeSep <= 0 {
+		return tok, false
+	}
+	afterScheme := tok[schemeSep+3:]
+	slashIdx := strings.IndexByte(afterScheme, '/')
+	authorityCand := afterScheme
+	suffix := ""
+	if slashIdx >= 0 {
+		authorityCand = afterScheme[:slashIdx]
+		suffix = afterScheme[slashIdx:]
+	}
+	atIdx := strings.LastIndexByte(authorityCand, '@')
+	if atIdx < 0 {
+		// `@` only appears after `/` (e.g. `https://example.com/path?email=a@b.com`) -> no credentials.
+		return tok, true
+	}
+	userInfo := authorityCand[:atIdx]
+	hostPart := authorityCand[atIdx+1:]
+	if hostPart == "" {
+		return tok, true
+	}
+
+	// Guard slashless URLs with `@` in query/fragment (`https://example.com?email=a@b.com`):
+	// if `userInfo` contains `?` or `#`, check whether everything before `?`/`#` is already a valid `host[:port]`
+	// followed by a `key=val` query rather than `user:pass#...@host`.
+	if slashIdx < 0 {
+		if qIdx := strings.IndexAny(userInfo, "?#"); qIdx >= 0 {
+			preQ := userInfo[:qIdx]
+			if isCleanHostPort(preQ) && strings.Contains(userInfo[qIdx+1:], "=") {
+				return tok, true
+			}
+		}
+	}
+
+	// If standard `url.Parse` succeeds without `#`/`?`/`%` ambiguity in `userInfo`, check consistency.
+	if !strings.ContainsAny(userInfo, "#?%") {
+		if u, err := url.Parse(tok); err == nil && u.User != nil {
+			if _, hasPass := u.User.Password(); hasPass {
+				u.User = url.UserPassword(u.User.Username(), "redacted")
+			} else if u.User.Username() != "" {
+				u.User = url.User("redacted")
+			}
+			return u.String(), true
+		}
+	}
+
+	// Direct authority rewrite for single-token userinfo or passwords containing unescaped `#`, `?`, `%`, or `@`.
+	var scrubbedUser string
+	if colonIdx := strings.IndexByte(userInfo, ':'); colonIdx >= 0 {
+		user := userInfo[:colonIdx]
+		scrubbedUser = user + ":redacted"
+	} else if userInfo != "" {
+		scrubbedUser = "redacted"
+	}
+	return tok[:schemeSep+3] + scrubbedUser + "@" + hostPart + suffix, true
+}
+
+func isCleanHostPort(s string) bool {
+	if s == "" {
+		return false
+	}
+	colon := strings.IndexByte(s, ':')
+	host := s
+	if colon >= 0 {
+		host = s[:colon]
+		port := s[colon+1:]
+		if len(port) == 0 || len(port) > 5 {
+			return false
+		}
+		for i := 0; i < len(port); i++ {
+			if port[i] < '0' || port[i] > '9' {
+				return false
+			}
+		}
+	}
+	return strings.Contains(host, ".") || strings.EqualFold(host, "localhost")
+}
+
+func isASCIILetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func isURLSchemeChar(c byte) bool {
+	return isASCIILetter(c) || (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'
+}
+
+func isURLTokenStop(c byte) bool {
+	switch c {
+	case ' ', '\t', '\r', '\n', ',', ';', '"', '\'':
+		return true
+	}
+	return false
 }
 
 func nodePlatform() string {

@@ -3,7 +3,6 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,11 +22,12 @@ import (
 )
 
 const (
-	DefaultTimeout = 20 * time.Second
-	MaxTimeout     = 120 * time.Second
-	DefaultMaxOps  = 400
-	MaxLogEntries  = 2000
-	MaxLogBytes    = 256 * 1024
+	DefaultTimeout   = 20 * time.Second
+	MaxTimeout       = 120 * time.Second
+	DefaultMaxOps    = 400
+	MaxLogEntries    = 2000
+	MaxLogBytes      = 256 * 1024
+	maxLogReentrancy = 4
 )
 
 // EffectiveDefaultTimeout returns DefaultTimeout (20s) unless overridden via AGY_PTC_DEFAULT_TIMEOUT_MS.
@@ -149,8 +149,11 @@ type ExecutionEnv struct {
 	logsMu        sync.Mutex
 	logs          []string
 	logBytes      int
+	logDepth      int // VM-thread only: guards console.log re-entrancy via property getters
 	pendingOps    atomic.Int32
-	vmActiveAsync int // VM-thread only: count of unsettled async ops for exact Promise.all wave grouping
+	vmActiveAsync int // VM-thread only: count of unsettled async ops
+	loopTurn      int // VM-thread only: increments on each loopCh turn
+	asyncWaveTurn int // VM-thread only: loopTurn in which the active parallel async wave started
 	waveSeq       int // VM-thread only: increments whenever a new serial step or parallel wave starts
 	startedAt     time.Time
 	cleanupFns    []func()
@@ -158,7 +161,16 @@ type ExecutionEnv struct {
 	warnings      []string
 	warnCount     map[string]int
 	compiled      *compiler.CompileResult
-	asyncErr      error // VM-thread only: first exception thrown outside the main promise chain (timer callbacks)
+	asyncErr      error // VM-thread only: first exception/interrupt raised outside the main promise chain
+
+	timersMu      sync.Mutex
+	timers        map[int64]*timerEntry
+	nextTimerID   int64
+	timerWake     chan struct{}
+	timerDone     chan struct{}
+	timerOnce     sync.Once
+	timerStopOnce sync.Once
+	timersClosed  bool
 }
 
 // RegisterCleanup registers a function to run when the VM execution finishes (e.g. rolling back uncommitted transactions).
@@ -246,12 +258,19 @@ func (env *ExecutionEnv) wrapSync(capability string, fn SyncHostFunc) func(goja.
 		if seq > env.maxOps {
 			panic(env.newJSHostError(KindError, capability, opBudgetMessage(env.maxOps), line, nil))
 		}
-		exported := exportArgs(call.Arguments)
+		exported, argErr := safeExportArgs(env.VM, call.Arguments)
+		if argErr != nil {
+			var interrupted *goja.InterruptedError
+			if errors.As(argErr, &interrupted) {
+				panic(interrupted)
+			}
+			panic(env.newJSHostError(KindBadArgs, capability, safeErrString(argErr), line, nil))
+		}
 		target := summarizeTarget(exported)
 		if env.onOpStart != nil {
 			env.onOpStart(capability, target, seq)
 		}
-		if env.vmActiveAsync == 0 {
+		if env.vmActiveAsync == 0 || env.asyncWaveTurn != env.loopTurn {
 			env.waveSeq++
 		}
 		wave := env.waveSeq
@@ -278,19 +297,37 @@ func (env *ExecutionEnv) wrapAsync(capability string, fn AsyncHostFunc) func(goj
 		if seq > env.maxOps {
 			promise, _, reject := env.VM.NewPromise()
 			errVal := env.newJSHostError(KindError, capability, opBudgetMessage(env.maxOps), line, nil)
-			_ = reject(errVal)
-			_, _ = env.deliverFn(goja.Undefined())
+			if rErr := reject(errVal); rErr != nil {
+				env.setAsyncErr(rErr)
+			} else if _, dErr := env.deliverFn(goja.Undefined()); dErr != nil {
+				env.setAsyncErr(dErr)
+			}
 			return env.VM.ToValue(promise)
 		}
-		exported := exportArgs(call.Arguments)
+		exported, argErr := safeExportArgs(env.VM, call.Arguments)
+		if argErr != nil {
+			var interrupted *goja.InterruptedError
+			if errors.As(argErr, &interrupted) {
+				panic(interrupted)
+			}
+			promise, _, reject := env.VM.NewPromise()
+			errVal := env.newJSHostError(KindBadArgs, capability, safeErrString(argErr), line, nil)
+			if rErr := reject(errVal); rErr != nil {
+				env.setAsyncErr(rErr)
+			} else if _, dErr := env.deliverFn(goja.Undefined()); dErr != nil {
+				env.setAsyncErr(dErr)
+			}
+			return env.VM.ToValue(promise)
+		}
 		target := summarizeTarget(exported)
 		if env.onOpStart != nil {
 			env.onOpStart(capability, target, seq)
 		}
 
 		promise, resolve, reject := env.VM.NewPromise()
-		if env.vmActiveAsync == 0 {
+		if env.vmActiveAsync == 0 || env.asyncWaveTurn != env.loopTurn {
 			env.waveSeq++
+			env.asyncWaveTurn = env.loopTurn
 		}
 		wave := env.waveSeq
 		env.vmActiveAsync++
@@ -302,7 +339,14 @@ func (env *ExecutionEnv) wrapAsync(capability string, fn AsyncHostFunc) func(goj
 
 		go func() {
 			defer env.asyncWG.Done()
-			res, err := fn(env.Ctx, exported)
+			res, err := func() (val any, fnErr error) {
+				defer func() {
+					if r := recover(); r != nil {
+						fnErr = fmt.Errorf("host capability panic in %s: %v", capability, safeErrString(recoveredToError(r)))
+					}
+				}()
+				return fn(env.Ctx, exported)
+			}()
 			dur := time.Since(start).Milliseconds()
 			env.trackInFlightDone(seq)
 			var jsErr func() goja.Value
@@ -320,19 +364,34 @@ func (env *ExecutionEnv) wrapAsync(capability string, fn AsyncHostFunc) func(goj
 			case env.loopCh <- loopAction{
 				run: func() {
 					defer env.pendingOps.Add(-1)
+					defer func() {
+						if r := recover(); r != nil {
+							env.setAsyncErr(recoveredToError(r))
+						}
+					}()
 					// Decrement vmActiveAsync BEFORE settling the Promise so a sequential `await`
-					// resuming inside deliverFn starts a fresh wave instead of joining this one.
+					// resuming inside resolve/deliverFn starts a fresh wave instead of joining this one.
 					if env.vmActiveAsync > 0 {
 						env.vmActiveAsync--
 					}
 					if err != nil {
-						_ = reject(jsErr())
-						_, _ = env.deliverFn(goja.Undefined())
+						if rErr := reject(jsErr()); rErr != nil {
+							env.setAsyncErr(rErr)
+							return
+						}
+						if _, dErr := env.deliverFn(goja.Undefined()); dErr != nil {
+							env.setAsyncErr(dErr)
+						}
 						return
 					}
 					val := env.toJSValue(res)
-					_ = resolve(val)
-					_, _ = env.deliverFn(goja.Undefined())
+					if rErr := resolve(val); rErr != nil {
+						env.setAsyncErr(rErr)
+						return
+					}
+					if _, dErr := env.deliverFn(goja.Undefined()); dErr != nil {
+						env.setAsyncErr(dErr)
+					}
 				},
 			}:
 			case <-env.Ctx.Done():
@@ -436,42 +495,33 @@ func (env *ExecutionEnv) getTraces() []OpTrace {
 
 func (env *ExecutionEnv) appendLog(level string, args []goja.Value) {
 	env.logsMu.Lock()
-	defer env.logsMu.Unlock()
-	if len(env.logs) >= MaxLogEntries || env.logBytes >= MaxLogBytes {
+	full := len(env.logs) >= MaxLogEntries || env.logBytes >= MaxLogBytes
+	env.logsMu.Unlock()
+	if full {
 		return
 	}
+
+	// Guard against recursive console.log calls inside JS property getters / Proxy traps.
+	if env.logDepth >= maxLogReentrancy {
+		return
+	}
+	env.logDepth++
+	defer func() { env.logDepth-- }()
+
+	// Evaluate & format all arguments OUTSIDE env.logsMu.Lock() so nested console.log calls never deadlock!
 	parts := make([]string, len(args))
 	for i, a := range args {
-		if a == nil || goja.IsUndefined(a) {
-			parts[i] = "undefined"
-			continue
-		}
-		if goja.IsNull(a) {
-			parts[i] = "null"
-			continue
-		}
-		if obj, ok := a.(*goja.Object); ok && obj.ClassName() == "Error" {
-			parts[i] = a.String()
-			continue
-		}
-		exp := a.Export()
-		switch val := exp.(type) {
-		case string:
-			parts[i] = val
-		default:
-			var buf bytes.Buffer
-			enc := json.NewEncoder(&buf)
-			enc.SetEscapeHTML(false)
-			if err := enc.Encode(val); err == nil {
-				parts[i] = strings.TrimRight(buf.String(), "\n")
-			} else {
-				parts[i] = fmt.Sprintf("%v", val)
-			}
-		}
+		parts[i] = safeFormatLogArg(env.VM, a)
 	}
 	line := strings.Join(parts, " ")
 	if level != "" && level != "log" {
 		line = "[" + level + "] " + line
+	}
+
+	env.logsMu.Lock()
+	defer env.logsMu.Unlock()
+	if len(env.logs) >= MaxLogEntries || env.logBytes >= MaxLogBytes {
+		return
 	}
 	remaining := MaxLogBytes - env.logBytes
 	if len(line) > remaining {
@@ -492,6 +542,17 @@ func (env *ExecutionEnv) getLogs() []string {
 // Execute compiles TypeScript code, boots a fresh isolated goja VM, binds capabilities, and awaits completion.
 func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (result *ExecResult, retErr error) {
 	start := time.Now()
+	defer func() {
+		if r := recover(); r != nil {
+			result = nil
+			retErr = &ExecutionError{
+				Phase:      "runtime",
+				Message:    safeErrString(recoveredToError(r)),
+				DurationMs: time.Since(start).Milliseconds(),
+			}
+		}
+	}()
+
 	cr, err := compiler.Compile(req.Code, req.Payloads)
 	if err != nil {
 		return nil, &ExecutionError{
@@ -517,29 +578,44 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 
 	vm := goja.New()
+	vm.SetMaxCallStackSize(1024)
 	vm.SetFieldNameMapper(goja.TagFieldNameMapper("json", true))
 
 	env := &ExecutionEnv{
-		ExecID:    fmt.Sprintf("exec:%d", sandboxExecSeq.Add(1)),
-		Ctx:       ctx,
-		Cwd:       req.Cwd,
-		VM:        vm,
-		loopCh:    make(chan loopAction, 256),
-		maxOps:    maxOps,
-		onOpStart: req.OnOpStart,
-		inFlight:  map[int]inFlightEntry{},
-		startedAt: start,
-		compiled:  cr,
+		ExecID:        fmt.Sprintf("exec:%d", sandboxExecSeq.Add(1)),
+		Ctx:           ctx,
+		Cwd:           req.Cwd,
+		VM:            vm,
+		loopCh:        make(chan loopAction, 256),
+		maxOps:        maxOps,
+		onOpStart:     req.OnOpStart,
+		inFlight:      map[int]inFlightEntry{},
+		asyncWaveTurn: -1,
+		startedAt:     start,
+		compiled:      cr,
 	}
 	// Crucial teardown order on exit:
-	// 1) cancel() kills all child process trees via cmd.Cancel()
+	// 0) recover any unexpected panic into a clean runtime ExecutionError BEFORE cancel() mutates env.Ctx
+	// 1) cancel() kills all child process trees via cmd.Cancel() & cleanupTimers() stops pending timers
 	// 2) waitAsyncDrain(800ms) waits for subprocess handles to release
 	// 3) cleanupFns roll back uncommitted tx.* file snapshots safely without Windows file-lock contention!
 	defer func() {
+		if r := recover(); r != nil {
+			result = nil
+			retErr = env.wrapRuntimeErr(recoveredToError(r), cr, start)
+		}
 		cancel()
+		env.cleanupTimers()
 		env.waitAsyncDrain(800 * time.Millisecond)
 		for i := len(env.cleanupFns) - 1; i >= 0; i-- {
-			env.cleanupFns[i]()
+			func(fn func()) {
+				defer func() {
+					if r := recover(); r != nil {
+						env.AddWarning("cleanup panic: " + safeErrString(recoveredToError(r)))
+					}
+				}()
+				fn()
+			}(env.cleanupFns[i])
 		}
 		if ws := env.getWarnings(); len(ws) > 0 {
 			if result != nil {
@@ -552,16 +628,27 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 		}
 	}()
 
-	// Watchdog goroutine interrupts infinite synchronous CPU loops in JS (`while(true){}`) immediately on deadline.
+	// Watchdog goroutine interrupts infinite synchronous CPU loops in JS (`while(true){}`) immediately on deadline,
+	// and re-asserts vm.Interrupt every 10ms until doneWatch closes so queued callbacks never spin after ClearInterrupt().
 	doneWatch := make(chan struct{})
 	defer close(doneWatch)
 	go func() {
 		select {
 		case <-ctx.Done():
+			reason := "execution deadline exceeded"
 			if parentCtx.Err() != nil && !errors.Is(parentCtx.Err(), context.DeadlineExceeded) {
-				vm.Interrupt("execution canceled")
-			} else {
-				vm.Interrupt("execution deadline exceeded")
+				reason = "execution canceled"
+			}
+			vm.Interrupt(reason)
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-doneWatch:
+					return
+				case <-ticker.C:
+					vm.Interrupt(reason)
+				}
 			}
 		case <-doneWatch:
 		}
@@ -660,7 +747,11 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 		hasVal := retVal != nil && !goja.IsUndefined(retVal)
 		var exported any
 		if hasVal {
-			exported = retVal.Export()
+			var expErr error
+			exported, expErr = safeExportValue(vm, retVal)
+			if expErr != nil {
+				return nil, env.wrapRuntimeErr(expErr, cr, start)
+			}
 		}
 		return &ExecResult{
 			Value:      exported,
@@ -671,7 +762,54 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 		}, nil
 	}
 
+	handleDeadlineOrCancel := func() error {
+		snapInFlight := env.snapshotInFlight()
+		cancel()
+		env.waitAsyncDrain(800 * time.Millisecond)
+		stillStuck := env.snapshotInFlight()
+		culprits := stillStuck
+		if len(culprits) == 0 {
+			traces := env.getTraces()
+			recordedErr := false
+			for _, tr := range traces {
+				if tr.Status == "error" {
+					recordedErr = true
+					break
+				}
+			}
+			if !recordedErr {
+				culprits = snapInFlight
+			}
+		}
+		if parentCtx.Err() != nil && !errors.Is(parentCtx.Err(), context.DeadlineExceeded) {
+			return &ExecutionError{
+				Phase:       "canceled",
+				Message:     "Canceled: execution canceled by client",
+				TimedOutOps: culprits,
+				Logs:        env.getLogs(),
+				Traces:      env.getTraces(),
+				DurationMs:  time.Since(start).Milliseconds(),
+			}
+		}
+		return &ExecutionError{
+			Phase:       "timeout",
+			Message:     fmt.Sprintf("Timeout: program exceeded %s (timeoutMs=%d, max %d)", timeout, timeout.Milliseconds(), EffectiveMaxTimeout().Milliseconds()),
+			TimedOutOps: culprits,
+			Logs:        env.getLogs(),
+			Traces:      env.getTraces(),
+			DurationMs:  time.Since(start).Milliseconds(),
+		}
+	}
+
 	for promise.State() == goja.PromiseStatePending {
+		if env.asyncErr != nil {
+			wrappedErr := env.wrapRuntimeErr(env.asyncErr, cr, start)
+			cancel()
+			return nil, wrappedErr
+		}
+		if ctx.Err() != nil {
+			return nil, handleDeadlineOrCancel()
+		}
 		if env.pendingOps.Load() == 0 && len(env.loopCh) == 0 {
 			cancel()
 			return nil, &ExecutionError{
@@ -684,49 +822,22 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 		}
 		select {
 		case act := <-env.loopCh:
+			env.loopTurn++
 			act.run()
 			if env.asyncErr != nil {
+				wrappedErr := env.wrapRuntimeErr(env.asyncErr, cr, start)
 				cancel()
-				return nil, env.wrapRuntimeErr(env.asyncErr, cr, start)
+				return nil, wrappedErr
 			}
 		case <-ctx.Done():
-			snapInFlight := env.snapshotInFlight()
-			cancel()
-			env.waitAsyncDrain(800 * time.Millisecond)
-			stillStuck := env.snapshotInFlight()
-			culprits := stillStuck
-			if len(culprits) == 0 {
-				traces := env.getTraces()
-				recordedErr := false
-				for _, tr := range traces {
-					if tr.Status == "error" {
-						recordedErr = true
-						break
-					}
-				}
-				if !recordedErr {
-					culprits = snapInFlight
-				}
-			}
-			if parentCtx.Err() != nil && !errors.Is(parentCtx.Err(), context.DeadlineExceeded) {
-				return nil, &ExecutionError{
-					Phase:       "canceled",
-					Message:     "Canceled: execution canceled by client",
-					TimedOutOps: culprits,
-					Logs:        env.getLogs(),
-					Traces:      env.getTraces(),
-					DurationMs:  time.Since(start).Milliseconds(),
-				}
-			}
-			return nil, &ExecutionError{
-				Phase:       "timeout",
-				Message:     fmt.Sprintf("Timeout: program exceeded %s (timeoutMs=%d, max %d)", timeout, timeout.Milliseconds(), EffectiveMaxTimeout().Milliseconds()),
-				TimedOutOps: culprits,
-				Logs:        env.getLogs(),
-				Traces:      env.getTraces(),
-				DurationMs:  time.Since(start).Milliseconds(),
-			}
+			return nil, handleDeadlineOrCancel()
 		}
+	}
+
+	if env.asyncErr != nil {
+		wrappedErr := env.wrapRuntimeErr(env.asyncErr, cr, start)
+		cancel()
+		return nil, wrappedErr
 	}
 
 	if promise.State() == goja.PromiseStateRejected {
@@ -760,7 +871,11 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 	hasVal := false
 	if res := promise.Result(); res != nil && !goja.IsUndefined(res) {
 		hasVal = true
-		exported = res.Export()
+		var expErr error
+		exported, expErr = safeExportValue(vm, res)
+		if expErr != nil {
+			return nil, env.wrapRuntimeErr(expErr, cr, start)
+		}
 	}
 	return &ExecResult{
 		Value:      exported,
@@ -785,7 +900,7 @@ func (env *ExecutionEnv) wrapRuntimeErr(err error, cr *compiler.CompileResult, s
 	} else if errors.Is(env.Ctx.Err(), context.DeadlineExceeded) {
 		phase = "timeout"
 	}
-	formattedMsg := compiler.FormatRuntimeError(err.Error(), cr)
+	formattedMsg := compiler.FormatRuntimeError(safeErrString(err), cr)
 	if phase == "runtime" {
 		formattedMsg = enrichUnknownMethodError(env.VM, formattedMsg, cr)
 		formattedMsg = addTypeHint(formattedMsg)
@@ -867,6 +982,15 @@ func buildPayloadProxy(vm *goja.Runtime, payloads map[string]string) (goja.Value
 					throw new Error("PayloadError: key '" + String(prop) + "' does not exist in payloads. Provided keys: " + (keys.length ? keys.join(", ") : "(none)"));
 				}
 				return t[prop];
+			},
+			has(t, prop) {
+				return prop in t;
+			},
+			ownKeys(t) {
+				return Reflect.ownKeys(t);
+			},
+			getOwnPropertyDescriptor(t, prop) {
+				return Object.getOwnPropertyDescriptor(t, prop);
 			}
 		});
 	})()`)
@@ -988,11 +1112,14 @@ func enrichUnknownMethodError(vm *goja.Runtime, formattedMsg string, cr *compile
 	if vm == nil || !strings.Contains(formattedMsg, "TypeError:") {
 		return formattedMsg
 	}
-	val := vm.Get("__ptcLastMissingMethod")
-	if val == nil || goja.IsUndefined(val) || goja.IsNull(val) {
-		return formattedMsg
-	}
-	m, ok := val.Export().(map[string]any)
+	var exported any
+	_ = tryJS(func() {
+		val := vm.Get("__ptcLastMissingMethod")
+		if val != nil && !goja.IsUndefined(val) && !goja.IsNull(val) {
+			exported, _ = safeExportValue(vm, val)
+		}
+	})
+	m, ok := exported.(map[string]any)
 	if !ok {
 		return formattedMsg
 	}
@@ -1046,17 +1173,35 @@ func enrichUnknownMethodError(vm *goja.Runtime, formattedMsg string, cr *compile
 	return header
 }
 
-func formatRejectedValue(vm *goja.Runtime, rej goja.Value) string {
+func formatRejectedValue(vm *goja.Runtime, rej goja.Value) (out string) {
+	defer func() {
+		if r := recover(); r != nil {
+			out = "Uncaught rejection (" + safeErrString(recoveredToError(r)) + ")"
+		}
+	}()
 	if rej == nil || goja.IsUndefined(rej) || goja.IsNull(rej) {
 		return "Promise rejected with undefined"
 	}
-	if obj := rej.ToObject(vm); obj != nil {
+	var obj *goja.Object
+	_ = tryJS(func() {
+		obj = rej.ToObject(vm)
+	})
+	if obj != nil {
 		var msgStr, stackStr string
-		if m := obj.Get("message"); m != nil && !goja.IsUndefined(m) && !goja.IsNull(m) {
-			msgStr = strings.TrimSpace(m.String())
+		var getterErr error
+		if err := tryJS(func() {
+			if m := obj.Get("message"); m != nil && !goja.IsUndefined(m) && !goja.IsNull(m) {
+				msgStr = strings.TrimSpace(m.String())
+			}
+		}); err != nil {
+			getterErr = err
 		}
-		if s := obj.Get("stack"); s != nil && !goja.IsUndefined(s) && !goja.IsNull(s) {
-			stackStr = strings.TrimSpace(s.String())
+		if err := tryJS(func() {
+			if s := obj.Get("stack"); s != nil && !goja.IsUndefined(s) && !goja.IsNull(s) {
+				stackStr = strings.TrimSpace(s.String())
+			}
+		}); err != nil && getterErr == nil {
+			getterErr = err
 		}
 		if stackStr != "" {
 			if msgStr != "" && !strings.Contains(stackStr, msgStr) {
@@ -1067,29 +1212,29 @@ func formatRejectedValue(vm *goja.Runtime, rej goja.Value) string {
 		if msgStr != "" {
 			return msgStr
 		}
-		if b, err := json.Marshal(rej.Export()); err == nil && string(b) != "{}" && string(b) != "null" {
-			return string(b)
+		if exp, expErr := safeExportValue(vm, rej); expErr == nil {
+			if b, err := json.Marshal(exp); err == nil && string(b) != "{}" && string(b) != "null" {
+				return string(b)
+			}
+		} else if getterErr == nil {
+			getterErr = expErr
+		}
+		if getterErr != nil {
+			return "Thrown object property getter failed: " + safeErrString(getterErr)
 		}
 	}
-	s := rej.String()
+	var s string
+	if err := tryJS(func() { s = rej.String() }); err != nil {
+		return "Thrown value toString failed: " + safeErrString(err)
+	}
 	if s == "[object Object]" {
-		if b, err := json.Marshal(rej.Export()); err == nil {
-			return string(b)
+		if exp, expErr := safeExportValue(vm, rej); expErr == nil {
+			if b, err := json.Marshal(exp); err == nil {
+				return string(b)
+			}
 		}
 	}
 	return s
-}
-
-func exportArgs(vals []goja.Value) []any {
-	out := make([]any, len(vals))
-	for i, v := range vals {
-		if v == nil || goja.IsUndefined(v) || goja.IsNull(v) {
-			out[i] = nil
-		} else {
-			out[i] = v.Export()
-		}
-	}
-	return out
 }
 
 func summarizeTarget(args []any) string {

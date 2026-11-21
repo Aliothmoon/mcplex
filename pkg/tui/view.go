@@ -35,7 +35,7 @@ func (m *Model) renderMainView() string {
 	}
 	divider := paintLineBg(divStyle.Render(strings.Repeat("─", m.width)), colorCanvas, m.width)
 
-	rows, targets := m.buildFeedRows()
+	rows, targets := m.ensureFeedRows()
 	m.rowTargets = targets
 	m.totalVisRows = len(rows)
 
@@ -334,16 +334,118 @@ func (m *Model) renderFooterBar() string {
 	return composeSplitRow(left, right, colorSurface, m.width)
 }
 
+func (m *Model) computeStructureHash() uint64 {
+	const offset64 = 14695981039346656037
+	const prime64 = 1099511628211
+	h := uint64(offset64)
+	mix := func(v uint64) {
+		h ^= v
+		h *= prime64
+	}
+	mix(uint64(len(m.groups)))
+	for _, g := range m.groups {
+		var flags uint64
+		if g.expanded {
+			flags |= 1
+		}
+		if g.endEv != nil {
+			flags |= 2
+		}
+		mix(flags ^ uint64(g.hScroll)<<8 ^ uint64(len(g.children))<<16)
+		for _, ch := range g.children {
+			var cf uint64
+			if ch.expanded {
+				cf = 1
+			}
+			mix(cf ^ uint64(ch.hScroll)<<8)
+		}
+	}
+	return h
+}
+
+func (m *Model) currentFeedCacheKey() feedCacheKey {
+	spin := 0
+	if m.hasActiveWork() {
+		spin = m.spinnerFrame
+	}
+	return feedCacheKey{
+		width:           m.width,
+		activeTab:       m.activeTab,
+		activeSessionID: m.activeSessionID,
+		multiSession:    len(m.sessions) >= 2,
+		feedFocused:     m.focus == focusFeed,
+		selectedID:      m.selectedID,
+		hoverNodeID:     m.hoverNodeID,
+		hoverCopyNodeID: m.hoverCopyNodeID,
+		spinnerFrame:    spin,
+		feedRev:         m.feedRev,
+		structureHash:   m.computeStructureHash(),
+	}
+}
+
+func (m *Model) ensureFeedRows() ([]string, []rowTarget) {
+	key := m.currentFeedCacheKey()
+	if !m.feedDirty && m.feedRows != nil && key == m.lastCacheKey {
+		return m.feedRows, m.rowTargets
+	}
+	rows, plains, targets := m.rebuildFeedRows()
+	m.feedRows = rows
+	m.lastFeedPlain = plains
+	m.rowTargets = targets
+	m.totalVisRows = len(rows)
+	m.feedDirty = false
+	m.lastCacheKey = key
+	return m.feedRows, m.rowTargets
+}
+
 func (m *Model) buildFeedRows() ([]string, []rowTarget) {
+	return m.ensureFeedRows()
+}
+
+func renderCachedCardLines(cache *cardRenderCache, ev events.Event, pad string, maxW, feedW int, isLast, hoverCopy bool, hScroll int) {
+	if cache.valid && cache.feedW == feedW && cache.isLast == isLast && cache.hoverCopy == hoverCopy && cache.hScroll == hScroll {
+		return
+	}
+	bodyLines, moreCount, copyX1, copyX2 := renderEventBodyLines(ev, pad, maxW, hoverCopy)
+	painted := make([]string, len(bodyLines))
+	plains := make([]string, len(bodyLines))
+	for i, bl := range bodyLines {
+		p := paintLineBg(bl, colorCanvas, feedW)
+		painted[i] = p
+		plains[i] = ansi.Strip(p)
+	}
+	*cache = cardRenderCache{
+		valid:     true,
+		feedW:     feedW,
+		isLast:    isLast,
+		hoverCopy: hoverCopy,
+		hScroll:   hScroll,
+		painted:   painted,
+		plains:    plains,
+		moreCount: moreCount,
+		copyX1:    copyX1,
+		copyX2:    copyX2,
+	}
+}
+
+func (m *Model) rebuildFeedRows() ([]string, []string, []rowTarget) {
 	var rows []string
+	var plains []string
 	var targets []rowTarget
 	m.nodeOrder = m.nodeOrder[:0]
 	feedW := max(10, m.width-1) // reserve 1 rightmost column for sleek scrollbar
 
-	m.lastFeedPlain = m.lastFeedPlain[:0]
+	spacerPainted := paintLineBg("", colorCanvas, feedW)
+	spacerPlain := strings.Repeat(" ", feedW)
+
 	appendRow := func(text string, rt rowTarget) {
 		rows = append(rows, text)
-		m.lastFeedPlain = append(m.lastFeedPlain, ansi.Strip(text))
+		plains = append(plains, ansi.Strip(text))
+		targets = append(targets, rt)
+	}
+	appendCachedRow := func(painted, plain string, rt rowTarget) {
+		rows = append(rows, painted)
+		plains = append(plains, plain)
 		targets = append(targets, rt)
 	}
 
@@ -353,8 +455,7 @@ func (m *Model) buildFeedRows() ([]string, []rowTarget) {
 			continue
 		}
 		if shownGroups > 0 {
-			// Grok Build CLI breathing room between turns
-			appendRow(paintLineBg("", colorCanvas, feedW), rowTarget{})
+			appendCachedRow(spacerPainted, spacerPlain, rowTarget{})
 		}
 		shownGroups++
 
@@ -368,15 +469,17 @@ func (m *Model) buildFeedRows() ([]string, []rowTarget) {
 		}
 
 		if !g.isExec {
-			bodyLines, moreCount, copyX1, copyX2 := renderEventBodyLines(g.startEv, "     ", feedW-6, m.hoverCopyNodeID == g.id)
-			for bi, bl := range bodyLines {
+			hoverCopy := m.hoverCopyNodeID == g.id
+			renderCachedCardLines(&g.bodyCache, g.startEv, "     ", feedW-6, feedW, true, hoverCopy, g.hScroll)
+			for bi, pLine := range g.bodyCache.painted {
 				rt := rowTarget{nodeID: g.id, action: "select"}
-				if bi == 0 && copyX2 > copyX1 {
-					rt.copyX1 = copyX1
-					rt.copyX2 = copyX2
+				if bi == 0 && g.bodyCache.copyX2 > g.bodyCache.copyX1 {
+					rt.copyX1 = g.bodyCache.copyX1
+					rt.copyX2 = g.bodyCache.copyX2
 				}
-				appendRow(paintLineBg(bl, colorCanvas, feedW), rt)
+				appendCachedRow(pLine, g.bodyCache.plains[bi], rt)
 			}
+			moreCount := g.bodyCache.moreCount
 			if moreCount > 0 || g.startEv.Truncated || g.startEv.Detail != "" || g.startEv.Status == "running" || (g.startEv.Diff != nil && len(g.startEv.Diff.Hunks) > 0) {
 				link := "     " + renderInspectFooter(moreCount, g.startEv, sel || hov, max(24, feedW-8))
 				appendRow(paintLineBg(link, colorCanvas, feedW), rowTarget{nodeID: g.id, action: "inspect"})
@@ -391,14 +494,23 @@ func (m *Model) buildFeedRows() ([]string, []rowTarget) {
 			}
 		}
 
-		// Compact chained Ops summary line right under an exec group header (clickable to inspect)
 		if g.endEv != nil && len(g.endEv.Ops) > 0 {
-			conn := "    " + styleTreeConn.Render("│") + "  "
-			if len(visChildren) == 0 {
-				conn = "    " + styleTreeConn.Render("╰─") + " "
+			noChild := len(visChildren) == 0
+			if !g.opsCache.valid || g.opsCache.feedW != feedW || g.opsCache.noChild != noChild {
+				conn := "    " + styleTreeConn.Render("│") + "  "
+				if noChild {
+					conn = "    " + styleTreeConn.Render("╰─") + " "
+				}
+				opsLine := paintLineBg(conn+renderOpsChainInline(g.endEv.Ops), colorCanvas, feedW)
+				g.opsCache = groupOpsCache{
+					valid:   true,
+					feedW:   feedW,
+					noChild: noChild,
+					painted: opsLine,
+					plain:   ansi.Strip(opsLine),
+				}
 			}
-			opsLine := conn + renderOpsChainInline(g.endEv.Ops)
-			appendRow(paintLineBg(opsLine, colorCanvas, feedW), rowTarget{nodeID: g.id, action: "inspect"})
+			appendCachedRow(g.opsCache.painted, g.opsCache.plain, rowTarget{nodeID: g.id, action: "inspect"})
 		}
 
 		for ci, ch := range visChildren {
@@ -413,15 +525,17 @@ func (m *Model) buildFeedRows() ([]string, []rowTarget) {
 				if isLast {
 					branchPrefix = "        "
 				}
-				bodyLines, moreCount, copyX1, copyX2 := renderEventBodyLines(ch.ev, branchPrefix, feedW-9, m.hoverCopyNodeID == ch.id)
-				for bi, bl := range bodyLines {
+				hoverCopy := m.hoverCopyNodeID == ch.id
+				renderCachedCardLines(&ch.cache, ch.ev, branchPrefix, feedW-9, feedW, isLast, hoverCopy, ch.hScroll)
+				for bi, pLine := range ch.cache.painted {
 					rt := rowTarget{nodeID: ch.id, action: "select"}
-					if bi == 0 && copyX2 > copyX1 {
-						rt.copyX1 = copyX1
-						rt.copyX2 = copyX2
+					if bi == 0 && ch.cache.copyX2 > ch.cache.copyX1 {
+						rt.copyX1 = ch.cache.copyX1
+						rt.copyX2 = ch.cache.copyX2
 					}
-					appendRow(paintLineBg(bl, colorCanvas, feedW), rt)
+					appendCachedRow(pLine, ch.cache.plains[bi], rt)
 				}
+				moreCount := ch.cache.moreCount
 				if moreCount > 0 || ch.ev.Truncated || ch.ev.Detail != "" || ch.ev.Status == "running" || (ch.ev.Diff != nil && len(ch.ev.Diff.Hunks) > 0) {
 					link := branchPrefix + renderInspectFooter(moreCount, ch.ev, cSel || cHov, max(24, feedW-11))
 					appendRow(paintLineBg(link, colorCanvas, feedW), rowTarget{nodeID: ch.id, action: "inspect"})
@@ -429,7 +543,7 @@ func (m *Model) buildFeedRows() ([]string, []rowTarget) {
 			}
 		}
 	}
-	return rows, targets
+	return rows, plains, targets
 }
 
 func isBoxedCardEvent(ev events.Event) bool {
@@ -1361,7 +1475,9 @@ func (m *Model) buildModalDisplayRows(contentW int) []modalVisRow {
 			if i == curMatchLine {
 				hi = styleSearchCur
 			}
-			gutter = hi.Render("›") + gutter
+			if gw := ansi.StringWidth(gutter); gw > 0 {
+				gutter = hi.Render("›") + ansi.Cut(gutter, 1, gw)
+			}
 			body = highlightPlainQuery(dl.plain, re, hi)
 		}
 
@@ -1398,8 +1514,8 @@ func (m *Model) buildModalDisplayRows(contentW int) []modalVisRow {
 		}
 
 		contGutter := buildContinuationGutter(gutterW, dl.bgHex)
-		for off := 0; off < bodyW; off += availBodyW {
-			seg := ansi.Cut(body, off, off+availBodyW)
+		for off := 0; off < bodyW; {
+			seg, step := cutWrapSegment(body, off, availBodyW)
 			g := gutter
 			if off > 0 {
 				g = contGutter
@@ -1415,9 +1531,53 @@ func (m *Model) buildModalDisplayRows(contentW int) []modalVisRow {
 				headerForGroup: dl.headerForGroup,
 				hasText:        hasTxt,
 			})
+			off += step
 		}
 	}
 	return out
+}
+
+// cutWrapSegment slices a soft-wrapped chunk of at most maxCols starting at exact rune boundary off,
+// returning the styled segment and the exact column step to advance off without splitting 2-cell CJK runes.
+func cutWrapSegment(styled string, off, maxCols int) (string, int) {
+	if maxCols <= 0 {
+		return "", 1
+	}
+	seg := ansi.Cut(styled, off, off+maxCols)
+	if ansi.StringWidth(seg) > maxCols {
+		seg = ansi.Truncate(seg, maxCols, "")
+	}
+	w := ansi.StringWidth(seg)
+	if w <= 0 {
+		return "", 1
+	}
+	return seg, w
+}
+
+// cutStyledSpan extracts display columns [startCol, startCol+maxCols) for horizontal pan,
+// replacing a split 2-cell wide CJK rune on the left boundary with a single space and strictly
+// bounding the right boundary to <= maxCols so '$' end-pan never overflows into "…" truncation.
+func cutStyledSpan(styled string, startCol, maxCols int) string {
+	if maxCols <= 0 || styled == "" {
+		return ""
+	}
+	leadPad := ""
+	if startCol > 0 {
+		leftW := ansi.StringWidth(ansi.Cut(styled, 0, startCol))
+		if leftW < startCol {
+			leadPad = " "
+			startCol++
+			maxCols--
+			if maxCols <= 0 {
+				return leadPad
+			}
+		}
+	}
+	seg := ansi.Cut(styled, startCol, startCol+maxCols)
+	if ansi.StringWidth(seg) > maxCols {
+		seg = ansi.Truncate(seg, maxCols, "")
+	}
+	return leadPad + seg
 }
 
 func buildContinuationGutter(gutterW int, bgHex string) string {
@@ -1588,7 +1748,7 @@ func (m *Model) buildModalBox(mx, my, mw, mh int) []string {
 					if overflowRight && availBodyW > 1 {
 						cutW = availBodyW - 1
 					}
-					cutSeg := ansi.Cut(vr.bodyStyled, rowHScroll, rowHScroll+cutW)
+					cutSeg := cutStyledSpan(vr.bodyStyled, rowHScroll, cutW)
 					if overflowRight && availBodyW > 1 {
 						padW := max(0, cutW-ansi.StringWidth(cutSeg))
 						rightMark := styleDim.Render("▸")
@@ -1602,7 +1762,7 @@ func (m *Model) buildModalBox(mx, my, mw, mh int) []string {
 				} else if vr.headerForGroup == 0 {
 					// Stationary row (Ops Flow, hunk separator)
 					if ansi.StringWidth(vr.bodyStyled) > availBodyW && availBodyW > 1 {
-						cutSeg := ansi.Cut(vr.bodyStyled, 0, availBodyW-1)
+						cutSeg := cutStyledSpan(vr.bodyStyled, 0, availBodyW-1)
 						padW := max(0, (availBodyW-1)-ansi.StringWidth(cutSeg))
 						bodySeg = cutSeg + strings.Repeat(" ", padW) + styleDim.Render("▸")
 					}

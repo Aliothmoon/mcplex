@@ -67,3 +67,30 @@ func TestPageFooter(t *testing.T) {
 		t.Fatalf("special key must be safely quoted: %s", got)
 	}
 }
+
+func TestPaginateNeverLoopsOnInvalidUTF8ContinuationBytes(t *testing.T) {
+	inputs := []string{
+		strings.Repeat("\x80", 5000),
+		strings.Repeat("\xbf", 4096),
+		"prefix\n" + "\xc2" + strings.Repeat("\x80", 2500) + "\nsuffix",
+	}
+	for idx, raw := range inputs {
+		pages := Paginate(raw, 200)
+		if len(pages) == 0 {
+			t.Fatalf("case %d: expected non-empty pages", idx)
+		}
+		totalBytes := 0
+		for pi, p := range pages {
+			if len(p.Text) == 0 {
+				t.Fatalf("case %d page %d made zero progress", idx, pi)
+			}
+			if len(p.Text) > 200 {
+				t.Fatalf("case %d page %d exceeded size 200: %d", idx, pi, len(p.Text))
+			}
+			totalBytes += len(p.Text)
+		}
+		if totalBytes < len(strings.ReplaceAll(raw, "\n", "")) {
+			t.Fatalf("case %d lost bytes: got %d", idx, totalBytes)
+		}
+	}
+}

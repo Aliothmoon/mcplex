@@ -5,8 +5,9 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
-
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 
 	"github.com/aliothmoon/mcplex/pkg/diff"
 	"github.com/aliothmoon/mcplex/pkg/events"
@@ -821,5 +822,249 @@ func TestMouseDragSelectToCopyAndKeyboardVisualCopy(t *testing.T) {
 	}
 	if !m.groups[0].children[0].expanded {
 		t.Fatalf("clicking feed card Copy button must not fold the card")
+	}
+}
+
+func TestDiffModalDragSelectExactZeroOffset(t *testing.T) {
+	var copied []string
+	origClip := writeClipboard
+	writeClipboard = func(s string) error {
+		copied = append(copied, s)
+		return nil
+	}
+	defer func() { writeClipboard = origClip }()
+
+	m := NewModel(Config{Endpoint: "http://127.0.0.1:8787/mcp", Version: "0.3.0", ModeLabel: "local"}, nil)
+	m.Update(tea.WindowSizeMsg{Width: 110, Height: 28})
+
+	d := diff.Compute(
+		[]byte("const targetToken = \"old_value\";\n"),
+		[]byte("const targetToken = \"exact_match\";\n"),
+		true, true, 2,
+	)
+	m.ingestEvent(events.Event{
+		Seq: 1, Kind: events.KindFileUpdate, RunID: "r_diff_sel", Tool: "edit.replace",
+		Cwd: "F:/Demo", Path: "config.ts", AbsPath: "F:/Demo/config.ts",
+		Summary: "+1 -1", Diff: &d,
+	})
+
+	m.selectedID = "solo:1"
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	_ = m.View()
+
+	contentW := m.modalContentWidth()
+	visRows := m.buildModalDisplayRows(contentW)
+	addVisIdx := -1
+	for i, vr := range visRows {
+		if strings.Contains(ansi.Strip(vr.bodyStyled), "+ const targetToken") {
+			addVisIdx = i
+			break
+		}
+	}
+	if addVisIdx < 0 {
+		t.Fatal("expected added diff line in modal")
+	}
+
+	bodyStartX, _ := m.modalRowBodyLayout(visRows, addVisIdx, contentW)
+	plainBody := ansi.Strip(visRows[addVisIdx].bodyStyled)
+	tokIdx := strings.Index(plainBody, "targetToken")
+	if tokIdx < 0 {
+		t.Fatalf("missing targetToken in %q", plainBody)
+	}
+	colStart := ansi.StringWidth(plainBody[:tokIdx])
+	colEnd := colStart + len("targetToken") - 1
+	screenY := m.detail.rect.y + 4 + (addVisIdx - m.detail.scroll)
+
+	m.Update(tea.MouseMsg{X: bodyStartX + colStart, Y: screenY, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	m.Update(tea.MouseMsg{X: bodyStartX + colEnd, Y: screenY, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
+	assertTerminalSafeView(t, m.View(), 110, 28, "diff modal drag selection")
+	m.Update(tea.MouseMsg{X: bodyStartX + colEnd, Y: screenY, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
+
+	if len(copied) != 1 || copied[0] != "targetToken" {
+		t.Fatalf("expected exact 0-offset diff modal drag copy %q, got %v", "targetToken", copied)
+	}
+}
+
+func TestModalSearchSpacePasteAndConstantGutterWidth(t *testing.T) {
+	m := NewModel(Config{Endpoint: "http://127.0.0.1:8787/mcp", Version: "0.3.0", ModeLabel: "local"}, nil)
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 26})
+
+	m.ingestEvent(events.Event{
+		Seq: 1, Kind: events.KindFileRead, RunID: "r_search", Tool: "read",
+		Cwd: "F:/Demo", Path: "main.go", AbsPath: "F:/Demo/main.go",
+		Detail: "package main\n// hello world marker\nfunc main() {}\n", DetailKind: "text",
+	})
+
+	m.selectedID = "solo:1"
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+
+	// 1. Type "hello", KeySpace, "world" in modal '/' search.
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hello")})
+	m.Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("world")})
+	if m.detail.searchInput != "hello world" || len(m.detail.matches) != 1 {
+		t.Fatalf("expected searchInput=%q with 1 match, got input=%q matches=%v", "hello world", m.detail.searchInput, m.detail.matches)
+	}
+
+	// 2. Verify gutter width stays constant between matched ("›") and unmatched lines!
+	visRows := m.buildModalDisplayRows(m.modalContentWidth())
+	if len(visRows) != 3 {
+		t.Fatalf("expected 3 modal rows, got %d", len(visRows))
+	}
+	w0 := ansi.StringWidth(visRows[0].gutter)
+	w1 := ansi.StringWidth(visRows[1].gutter)
+	if w0 != w1 || !strings.Contains(ansi.Strip(visRows[1].gutter), "›") {
+		t.Fatalf("expected matched line gutter with '›' to preserve exact width %d, got %d (%q)", w0, w1, ansi.Strip(visRows[1].gutter))
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	assertTerminalSafeView(t, m.View(), 100, 26, "modal search matched gutter")
+
+	// 3. Verify bracketed paste does NOT wrap pasted text in [...]!
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m.detail.searchInput = ""
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("func main"), Paste: true})
+	if m.detail.searchInput != "func main" || len(m.detail.matches) != 1 {
+		t.Fatalf("expected clean bracketed paste without [...] wrapper, got %q (matches=%v)", m.detail.searchInput, m.detail.matches)
+	}
+}
+
+func TestFeedSelectionBgRestoreAndOddColCJKHorizontalPan(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(prev)
+
+	// 1. Feed drag-selection must re-apply active row/card background SGR after styleTextSel reset (\x1b[0m).
+	m := NewModel(Config{Endpoint: "http://127.0.0.1:8787/mcp", Version: "0.3.0", ModeLabel: "local"}, nil)
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 26})
+	m.ingestEvent(events.Event{
+		Seq: 1, Kind: events.KindFileRead, RunID: "r_bg", Tool: "read",
+		Cwd: "F:/Demo", Path: "a.go", AbsPath: "F:/Demo/a.go",
+		Detail: "package demo\nconst val = 42;\n", DetailKind: "text",
+	})
+	m.groups[0].expanded = true
+	_ = m.View()
+
+	m.sel = textSelection{
+		scope:     selScopeFeed,
+		active:    true,
+		anchorRow: 0,
+		anchorCol: 4,
+		focusRow:  2,
+		focusCol:  18,
+	}
+	selView := m.View()
+	assertTerminalSafeView(t, selView, 100, 26, "feed TrueColor drag selection")
+
+	selSample := styleTextSel.Render("Z")
+	selPrefix := selSample[:strings.IndexByte(selSample, 'Z')]
+	foundRestoredBg := false
+	for _, rowLine := range strings.Split(selView, "\n") {
+		idx := strings.Index(rowLine, selPrefix)
+		if idx < 0 {
+			continue
+		}
+		afterSel := rowLine[idx+len(selPrefix):]
+		rst := strings.Index(afterSel, "\x1b[0m")
+		if rst < 0 {
+			t.Fatalf("expected styleTextSel reset on selected row: %q", rowLine)
+		}
+		postRst := afterSel[rst+len("\x1b[0m"):]
+		if !strings.HasPrefix(postRst, "\x1b[48;") {
+			t.Fatalf("expected row/card background SGR immediately restored after styleTextSel reset, got: %q", postRst[:min(32, len(postRst))])
+		}
+		foundRestoredBg = true
+	}
+	if !foundRestoredBg {
+		t.Fatal("expected TrueColor selection highlight in feed view")
+	}
+
+	// 2. Horizontal '$' end-pan across odd/even CJK 2-cell boundaries must never clip the final rune to '…'.
+	for _, width := range []int{90, 91} {
+		mc := NewModel(Config{Endpoint: "http://127.0.0.1:8787/mcp", Version: "0.3.0", ModeLabel: "local"}, nil)
+		mc.Update(tea.WindowSizeMsg{Width: width, Height: 24})
+		cjkBody := "a" + strings.Repeat("全部加载", 22) + "终\n" + strings.Repeat("全部加载", 23) + "尾\n"
+		mc.ingestEvent(events.Event{
+			Seq: 1, Kind: events.KindFileRead, RunID: "r_cjk", Tool: "read",
+			Cwd: "F:/Demo", Path: "cjk.txt", AbsPath: "F:/Demo/cjk.txt",
+			Detail: cjkBody, DetailKind: "text",
+		})
+		mc.selectedID = "solo:1"
+		mc.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+		mc.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'$'}})
+		vEnd := mc.View()
+		assertTerminalSafeView(t, vEnd, width, 24, "modal CJK end-pan")
+		plain := ansi.Strip(vEnd)
+		if !strings.Contains(plain, "终") || !strings.Contains(plain, "尾") {
+			t.Fatalf("width=%d: '$' end-pan clipped final CJK rune to ellipsis:\n%s", width, plain)
+		}
+	}
+}
+
+func TestModelLifecycleRemoteConnectedClearFeedAndRenderCache(t *testing.T) {
+	rem := NewModel(Config{Endpoint: "http://127.0.0.1:8787/mcp", ModeLabel: "remote"}, nil)
+	if rem.connected {
+		t.Fatal("remote SSE model must start connected=false until connStatusMsg{Connected: true}")
+	}
+	rem.Update(connStatusMsg{Connected: true})
+	if !rem.connected {
+		t.Fatal("expected connected=true after connStatusMsg")
+	}
+
+	loc := NewModel(Config{Endpoint: "in-process", ModeLabel: "local"}, nil)
+	loc.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	if !loc.connected {
+		t.Fatal("local model must start connected=true")
+	}
+
+	// Start active exec + active task stream, verify streamByID cleanup on completion and clearFeed ('x') reset.
+	loc.ingestEvent(events.Event{Seq: 1, Kind: events.KindExecStart, RunID: "r_leak", Tool: "exec", Status: "running"})
+	loc.ingestEvent(events.Event{Seq: 2, Kind: events.KindTask, RunID: "t_done", StreamID: "s_done", Tool: "spawn", Status: "running"})
+	loc.ingestEvent(events.Event{Seq: 3, Kind: events.KindTask, RunID: "t_live", StreamID: "s_live", Tool: "spawn", Status: "running"})
+	if loc.activeRuns != 3 || len(loc.streamByID) != 2 {
+		t.Fatalf("expected activeRuns=3 streams=2, got active=%d streams=%d", loc.activeRuns, len(loc.streamByID))
+	}
+	loc.ingestEvent(events.Event{Seq: 4, Kind: events.KindTask, RunID: "t_done", StreamID: "s_done", Tool: "spawn", Status: "completed"})
+	if _, stillTracked := loc.streamByID["s_done"]; stillTracked {
+		t.Fatal("completed stream must be deleted from streamByID")
+	}
+
+	// Press 'x' while r_leak and s_live are still running -> must reset activeRuns=0 and streamByID!
+	loc.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if loc.activeRuns != 0 || len(loc.streamByID) != 0 || loc.hasActiveWork() {
+		t.Fatalf("clearFeed ('x') leaked active state: activeRuns=%d streams=%d", loc.activeRuns, len(loc.streamByID))
+	}
+
+	// Populate 60 expanded code cards + 1 running task, render once, then verify 0 syntax re-lexing
+	// across spinner ticks, 120Hz mouse motion, drag selection, and feed arrow navigation!
+	for i := 1; i <= 60; i++ {
+		loc.ingestEvent(events.Event{
+			Seq: int64(10 + i), Kind: events.KindFileRead, RunID: "rc", Tool: "read",
+			Path: "mod.ts", Detail: "export const val = await fs.read('a.ts');\nreturn val;\n",
+		})
+	}
+	loc.ingestEvent(events.Event{
+		Seq: 200, Kind: events.KindTask, RunID: "t_spin", StreamID: "t_spin", Tool: "spawn", Status: "running",
+	})
+	loc.setAllExpanded(true)
+	_ = loc.View()
+
+	lexBefore := highlightRenderCalls.Load()
+	for tick := 0; tick < 8; tick++ {
+		loc.Update(spinnerTickMsg{})
+		_ = loc.View()
+	}
+	for x := 5; x < 45; x += 2 {
+		loc.Update(tea.MouseMsg{X: x, Y: 6, Action: tea.MouseActionMotion})
+		_ = loc.View()
+	}
+	loc.focus = focusFeed
+	for step := 0; step < 6; step++ {
+		loc.Update(tea.KeyMsg{Type: tea.KeyUp})
+		_ = loc.View()
+	}
+	lexAfter := highlightRenderCalls.Load()
+	if lexAfter != lexBefore {
+		t.Fatalf("expected 0 syntax highlight passes during spinner/hover/nav with render cache, got %d new calls", lexAfter-lexBefore)
 	}
 }

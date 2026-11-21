@@ -3,6 +3,9 @@
 package events
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,6 +39,7 @@ const (
 	DefaultReadPreview  = 16 * 1024
 	DefaultShellPreview = 24 * 1024
 	DefaultCodePreview  = 16 * 1024
+	subscriberChanCap   = 256
 )
 
 // OpItem summarizes one host capability call inside an `exec` trace chain.
@@ -85,11 +89,14 @@ type subscriber struct {
 	id            int64
 	sessionFilter string
 	ch            chan Event
+	stopCh        chan struct{}
+	wg            sync.WaitGroup
 }
 
 // Hub maintains a bounded ring buffer of recent events and fans out live events non-blockingly.
 type Hub struct {
 	capacity       int
+	instanceID     string
 	alwaysRecord   atomic.Bool
 	subCount       atomic.Int32
 	seq            atomic.Int64
@@ -106,12 +113,36 @@ func NewHub(capacity int) *Hub {
 	if capacity <= 0 {
 		capacity = DefaultHubCapacity
 	}
+	var rnd [8]byte
+	var inst string
+	if _, err := rand.Read(rnd[:]); err == nil {
+		inst = hex.EncodeToString(rnd[:])
+	} else {
+		inst = fmt.Sprintf("%016x", uint64(time.Now().UnixNano()))
+	}
 	return &Hub{
 		capacity:      capacity,
+		instanceID:    inst,
 		ring:          make([]Event, 0, min(capacity, 64)),
 		subs:          map[int64]*subscriber{},
 		sessionLabels: map[string]string{},
 	}
+}
+
+// InstanceID returns the unique 8-byte hex server boot identifier for this Hub.
+func (h *Hub) InstanceID() string {
+	if h == nil {
+		return ""
+	}
+	return h.instanceID
+}
+
+// CurrentSeq returns the latest sequence number assigned by this Hub.
+func (h *Hub) CurrentSeq() int64 {
+	if h == nil {
+		return 0
+	}
+	return h.seq.Load()
 }
 
 // SetSessionLabel associates a human-readable client name (e.g. from MCP initialize clientInfo)
@@ -151,44 +182,128 @@ func (h *Hub) Active() bool {
 	return h.alwaysRecord.Load() || h.subCount.Load() > 0
 }
 
+// isTerminalLifecycleEvent identifies run/task/shell completion events that must never be dropped
+// under slow-consumer backpressure (otherwise TUI activeRuns would spin forever).
+func isTerminalLifecycleEvent(ev Event) bool {
+	switch ev.Kind {
+	case KindExecEnd, Kind("task_exit"):
+		return true
+	case KindTask, KindShell:
+		return ev.Status != "" && ev.Status != "running"
+	}
+	if ev.StreamID != "" && ev.Kind != KindStreamChunk && ev.Status != "" && ev.Status != "running" {
+		return true
+	}
+	return false
+}
+
 // Emit timestamps, sequences, buffers, and broadcasts an event without ever blocking the caller.
 func (h *Hub) Emit(ev Event) Event {
 	if h == nil || !h.Active() {
 		return ev
 	}
-	ev.Seq = h.seq.Add(1)
 	if ev.Timestamp == "" {
 		ev.Timestamp = time.Now().Format(time.RFC3339)
 	}
 
 	h.mu.Lock()
+	ev.Seq = h.seq.Add(1)
 	if ev.SessionID != "" && ev.SessionLabel == "" {
 		if lbl := h.sessionLabels[ev.SessionID]; lbl != "" {
 			ev.SessionLabel = lbl
 		}
 	}
-	h.recordRingLocked(ev)
+	h.recordRingLocked(&ev)
 	for _, sub := range h.subs {
 		if sub.sessionFilter != "" && ev.SessionID != sub.sessionFilter {
 			continue
 		}
-		select {
-		case sub.ch <- ev:
-		default:
-			// Slow consumer: drop oldest buffered event to make room for fresher state.
-			select {
-			case <-sub.ch:
-			default:
-			}
-			select {
-			case sub.ch <- ev:
-			default:
-			}
+		if deliverToSubscriberLocked(sub, ev) {
 			h.droppedDeliver.Add(1)
 		}
 	}
 	h.mu.Unlock()
 	return ev
+}
+
+func deliverToSubscriberLocked(sub *subscriber, ev Event) (dropped bool) {
+	select {
+	case sub.ch <- ev:
+		return false
+	default:
+	}
+
+	select {
+	case head := <-sub.ch:
+		if !isTerminalLifecycleEvent(head) {
+			select {
+			case sub.ch <- ev:
+			default:
+			}
+			return true
+		}
+		var scratch [subscriberChanCap]Event
+		scratch[0] = head
+		n := 1
+		for n < len(scratch) {
+			select {
+			case item := <-sub.ch:
+				scratch[n] = item
+				n++
+			default:
+				goto drained
+			}
+		}
+	drained:
+		dropIdx := -1
+		for i := 0; i < n; i++ {
+			if !isTerminalLifecycleEvent(scratch[i]) {
+				dropIdx = i
+				break
+			}
+		}
+		if dropIdx >= 0 {
+			for i := 0; i < n; i++ {
+				if i == dropIdx {
+					continue
+				}
+				select {
+				case sub.ch <- scratch[i]:
+				default:
+				}
+			}
+			select {
+			case sub.ch <- ev:
+			default:
+			}
+			return true
+		}
+		for i := 0; i < n; i++ {
+			select {
+			case sub.ch <- scratch[i]:
+			default:
+			}
+		}
+		if !isTerminalLifecycleEvent(ev) {
+			return true
+		}
+		sub.wg.Add(1)
+		go func(e Event) {
+			defer sub.wg.Done()
+			select {
+			case sub.ch <- e:
+			case <-sub.stopCh:
+			}
+		}(ev)
+		return false
+	default:
+		select {
+		case sub.ch <- ev:
+			return false
+		default:
+			return true
+		}
+	}
 }
 
 // Subscribe attaches a live subscriber and returns matching replay events atomically under the same lock.
@@ -203,7 +318,8 @@ func (h *Hub) Subscribe(sessionFilter string, replay int, afterSeq int64) (<-cha
 	sub := &subscriber{
 		id:            id,
 		sessionFilter: sf,
-		ch:            make(chan Event, 256),
+		ch:            make(chan Event, subscriberChanCap),
+		stopCh:        make(chan struct{}),
 	}
 
 	h.mu.Lock()
@@ -216,12 +332,17 @@ func (h *Hub) Subscribe(sessionFilter string, replay int, afterSeq int64) (<-cha
 	cancel := func() {
 		once.Do(func() {
 			h.mu.Lock()
-			if _, ok := h.subs[id]; ok {
+			_, ok := h.subs[id]
+			if ok {
 				delete(h.subs, id)
 				h.subCount.Add(-1)
-				close(sub.ch)
+				close(sub.stopCh)
 			}
 			h.mu.Unlock()
+			if ok {
+				sub.wg.Wait()
+				close(sub.ch)
+			}
 		})
 	}
 	return sub.ch, history, cancel
@@ -256,21 +377,31 @@ func (h *Hub) matchingLocked(sessionFilter string, limit int, afterSeq int64) []
 	return cp
 }
 
-func (h *Hub) recordRingLocked(ev Event) {
+func (h *Hub) recordRingLocked(ev *Event) {
 	if ev.Kind == KindStreamChunk && ev.StreamID != "" {
 		// Coalesce live stream chunks into the existing ring entry so long-running logs
-		// never evict earlier CRUD/diff events, while late-attaching clients still see accumulated output.
+		// never evict earlier CRUD/diff events, while updating Seq & Timestamp and keeping
+		// ring entries monotonic so Last-Event-ID (afterSeq) reconnects replay missed output!
 		for i := len(h.ring) - 1; i >= 0; i-- {
 			if h.ring[i].StreamID == ev.StreamID && h.ring[i].Kind != KindStreamChunk {
-				combined := h.ring[i].Detail + ev.Detail
+				updated := h.ring[i]
+				combined := updated.Detail + ev.Detail
 				trimmed, capped := CapTailPreview(combined, DefaultShellPreview)
-				h.ring[i].Detail = trimmed
+				updated.Detail = trimmed
 				if capped {
-					h.ring[i].Truncated = true
+					updated.Truncated = true
 				}
 				if ev.Summary != "" {
-					h.ring[i].Summary = ev.Summary
+					updated.Summary = ev.Summary
 				}
+				updated.Seq = ev.Seq
+				if ev.Timestamp != "" {
+					updated.Timestamp = ev.Timestamp
+				}
+				if i < len(h.ring)-1 {
+					copy(h.ring[i:], h.ring[i+1:])
+				}
+				h.ring[len(h.ring)-1] = updated
 				return
 			}
 		}
@@ -281,6 +412,10 @@ func (h *Hub) recordRingLocked(ev Event) {
 	if ev.StreamID != "" && ev.Status != "running" {
 		for i := len(h.ring) - 1; i >= 0; i-- {
 			if h.ring[i].StreamID == ev.StreamID {
+				if ev.Detail == "" && h.ring[i].Detail != "" {
+					ev.Detail = h.ring[i].Detail
+					ev.Truncated = ev.Truncated || h.ring[i].Truncated
+				}
 				h.ring = append(h.ring[:i], h.ring[i+1:]...)
 				break
 			}
@@ -288,9 +423,9 @@ func (h *Hub) recordRingLocked(ev Event) {
 	}
 	if len(h.ring) >= h.capacity {
 		copy(h.ring, h.ring[1:])
-		h.ring[len(h.ring)-1] = ev
+		h.ring[len(h.ring)-1] = *ev
 	} else {
-		h.ring = append(h.ring, ev)
+		h.ring = append(h.ring, *ev)
 	}
 }
 

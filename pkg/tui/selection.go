@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
@@ -220,7 +221,6 @@ func (m *Model) finishMouseDrag(x, y int) tea.Cmd {
 	}
 	m.sel.dragging = false
 
-	// Dragged text -> select-to-copy (选中即复制) automatically on mouse release!
 	if m.sel.moved && m.sel.active {
 		var copied string
 		switch m.sel.scope {
@@ -236,7 +236,6 @@ func (m *Model) finishMouseDrag(x, y int) tea.Cmd {
 		return nil
 	}
 
-	// Plain single click (no drag movement) -> clear stale selection and fire normal feed click if pending.
 	pendingFeed := m.sel.scope == selScopeFeed && m.sel.hasPendingFeed
 	pendingRow := m.sel.pendingFeedRow
 	m.clearSelection()
@@ -268,6 +267,18 @@ func (m *Model) activateFeedRowClick(visIdx int) {
 		m.toggleNode(rt.nodeID)
 		m.syncFeedLayout()
 	}
+}
+
+func snapWideSelectionBounds(s string, totalW, sc, ec int) (int, int) {
+	sc = max(0, min(totalW, sc))
+	if sc > 0 && ansi.StringWidth(ansi.Cut(s, 0, sc)) < sc {
+		sc--
+	}
+	ec = max(sc, min(totalW, ec))
+	if ec < totalW && ansi.StringWidth(ansi.Cut(s, 0, ec)) < ec {
+		ec++
+	}
+	return sc, ec
 }
 
 func (m *Model) extractModalSelectionText() string {
@@ -315,9 +326,9 @@ func (m *Model) extractModalSelectionText() string {
 		if r == r2 {
 			ec = max(sc, min(rowW, c2+1))
 		}
+		sc, ec = snapWideSelectionBounds(plainRow, rowW, sc, ec)
 		seg := ansi.Cut(plainRow, sc, ec)
 		if r > r1 {
-			// Do not insert artificial newlines across soft-wrapped continuations of the same logical line.
 			if !(vr.isCont && vr.logicalIdx == visRows[r-1].logicalIdx) {
 				out.WriteByte('\n')
 			}
@@ -330,6 +341,7 @@ func (m *Model) extractModalSelectionText() string {
 var reFeedCardLinePrefix = regexp.MustCompile(`^\s*[│├└─\s]*│\s*\d+\s*│\s?(.*)$`)
 
 func (m *Model) extractFeedSelectionText() string {
+	m.ensureFeedRows()
 	if !m.sel.active || m.sel.scope != selScopeFeed || len(m.lastFeedPlain) == 0 {
 		return ""
 	}
@@ -340,8 +352,7 @@ func (m *Model) extractFeedSelectionText() string {
 	if r1 == r2 {
 		plain := m.lastFeedPlain[r1]
 		rowW := ansi.StringWidth(plain)
-		sc := max(0, min(rowW, c1))
-		ec := max(sc, min(rowW, c2+1))
+		sc, ec := snapWideSelectionBounds(plain, rowW, c1, c2+1)
 		return strings.TrimRight(ansi.Cut(plain, sc, ec), " ")
 	}
 
@@ -357,8 +368,8 @@ func (m *Model) extractFeedSelectionText() string {
 		if r == r2 {
 			ec = max(sc, min(rowW, c2+1))
 		}
+		sc, ec = snapWideSelectionBounds(plain, rowW, sc, ec)
 		seg := strings.TrimRight(ansi.Cut(plain, sc, ec), " ")
-		// When dragging across multiple lines of a framed inline code card, strip card border & line numbers!
 		if mMatch := reFeedCardLinePrefix.FindStringSubmatch(seg); mMatch != nil {
 			seg = strings.TrimRight(mMatch[1], " ")
 			seg = strings.TrimRight(strings.TrimSuffix(seg, "│"), " ")
@@ -385,7 +396,6 @@ func (m *Model) copyFromModal(copyAll bool) tea.Cmd {
 		return m.performCopy(strings.Join(all, "\n"))
 	}
 
-	// Copy the currently active block (CODE / OUTPUT / file / diff), or current line if on Ops Flow.
 	contentW := m.modalContentWidth()
 	visRows := m.buildModalDisplayRows(contentW)
 	grp := m.detailActivePanGroup(visRows)
@@ -403,7 +413,6 @@ func (m *Model) copyFromModal(copyAll bool) tea.Cmd {
 	return nil
 }
 
-// copyModalGroup copies all clean plain lines belonging to a modal section block (e.g. CODE=1, OUTPUT=2).
 func (m *Model) copyModalGroup(group int) tea.Cmd {
 	if group <= 0 {
 		return nil
@@ -427,7 +436,6 @@ func (m *Model) copyFromFeed() tea.Cmd {
 	return m.copyEventNodeContent(m.selectedID)
 }
 
-// copyEventNodeContent copies the full clean payload of a feed node (dedented for Code cards).
 func (m *Model) copyEventNodeContent(nodeID string) tea.Cmd {
 	if nodeID == "" {
 		return nil
@@ -483,6 +491,19 @@ func (m *Model) findEventByNodeID(nodeID string) (*events.Event, *events.Event) 
 	return nil, nil
 }
 
+func (m *Model) feedRowOuterBgHex(visIdx int) string {
+	if visIdx < 0 || visIdx >= len(m.rowTargets) {
+		return colorCanvas
+	}
+	rt := m.rowTargets[visIdx]
+	if rt.action != "toggle" || rt.nodeID == "" {
+		return colorCanvas
+	}
+	sel := m.focus == focusFeed && rt.nodeID == m.selectedID
+	hov := rt.nodeID == m.hoverNodeID && !sel
+	return m.rowBgHex(sel, hov)
+}
+
 func (m *Model) highlightFeedRowSelection(line string, visIdx, feedW int) string {
 	r1, c1, r2, c2 := m.sel.normalized()
 	if visIdx < r1 || visIdx > r2 {
@@ -496,22 +517,121 @@ func (m *Model) highlightFeedRowSelection(line string, visIdx, feedW int) string
 	if visIdx == r2 {
 		ec = max(sc, min(feedW, c2+1))
 	}
-	return applySelectionHighlight(line, feedW, sc, ec)
+	return applySelectionHighlightWithBg(line, feedW, sc, ec, m.feedRowOuterBgHex(visIdx))
 }
 
 // applySelectionHighlight tints display columns [selStart, selEnd) in styled with crisp cobalt
 // selection colors while strictly preserving total display width and surrounding ANSI styling.
 func applySelectionHighlight(styled string, totalW, selStart, selEnd int) string {
+	return applySelectionHighlightWithBg(styled, totalW, selStart, selEnd, "")
+}
+
+func applySelectionHighlightWithBg(styled string, totalW, selStart, selEnd int, fallbackBgHex string) string {
 	if totalW <= 0 {
 		return styled
 	}
-	selStart = max(0, min(totalW, selStart))
-	selEnd = max(selStart, min(totalW, selEnd))
+	selStart, selEnd = snapWideSelectionBounds(styled, totalW, selStart, selEnd)
 	if selStart >= selEnd {
 		return styled
 	}
 	before := ansi.Cut(styled, 0, selStart)
 	midPlain := ansi.Strip(ansi.Cut(styled, selStart, selEnd))
+	midRendered := styleTextSel.Render(midPlain)
+	if selEnd >= totalW {
+		return before + midRendered
+	}
+
 	after := ansi.Cut(styled, selEnd, totalW)
-	return before + styleTextSel.Render(midPlain) + after
+	fallbackBg := ""
+	if fallbackBgHex != "" {
+		fallbackBg = bgEscapeSeq(fallbackBgHex)
+	}
+	activeBg := activeBgSGRAtCol(styled, selEnd)
+	if activeBg == "" {
+		activeBg = fallbackBg
+	}
+	if activeBg == "" {
+		return before + midRendered + after
+	}
+
+	hasEndReset := strings.HasSuffix(after, "\x1b[0m")
+	afterCore := strings.TrimSuffix(after, "\x1b[0m")
+	afterCore = strings.TrimPrefix(strings.TrimPrefix(afterCore, "\x1b[0m"), "\x1b[m")
+	if fallbackBg != "" {
+		afterCore = reapplyBgAfterResets(afterCore, fallbackBg)
+	}
+	prefixBg := activeBg
+	if strings.HasPrefix(afterCore, "\x1b[48;") {
+		prefixBg = ""
+	}
+	tailReset := "\x1b[0m"
+	if !hasEndReset && fallbackBg == "" {
+		tailReset = ""
+	}
+	return before + midRendered + prefixBg + afterCore + tailReset
+}
+
+func activeBgSGRAtCol(styled string, targetCol int) string {
+	curBg := ""
+	col := 0
+	for i := 0; i < len(styled); {
+		if styled[i] == '\x1b' {
+			if end := matchSGRSeq(styled, i); end > 0 {
+				curBg = updateBgFromSGRParams(curBg, styled[i+2:end-1])
+				i = end
+				continue
+			}
+			i = skipEscapeSeq(styled, i)
+			continue
+		}
+		if col >= targetCol {
+			break
+		}
+		r, size := utf8.DecodeRuneInString(styled[i:])
+		if size <= 0 {
+			break
+		}
+		if r < 0x7f {
+			col++
+		} else if w := ansi.StringWidth(styled[i : i+size]); w > 0 {
+			col += w
+		}
+		i += size
+	}
+	return curBg
+}
+
+func updateBgFromSGRParams(curBg, params string) string {
+	if params == "" || params == "0" {
+		return ""
+	}
+	parts := strings.Split(params, ";")
+	for i := 0; i < len(parts); {
+		p := parts[i]
+		switch {
+		case p == "" || p == "0" || p == "49":
+			curBg = ""
+			i++
+		case strings.HasPrefix(p, "48:"):
+			curBg = "\x1b[" + p + "m"
+			i++
+		case p == "48":
+			if i+2 < len(parts) && parts[i+1] == "5" {
+				curBg = "\x1b[48;5;" + parts[i+2] + "m"
+				i += 3
+			} else if i+4 < len(parts) && parts[i+1] == "2" {
+				curBg = "\x1b[48;2;" + parts[i+2] + ";" + parts[i+3] + ";" + parts[i+4] + "m"
+				i += 5
+			} else {
+				i++
+			}
+		case (len(p) == 2 && p[0] == '4' && p[1] >= '0' && p[1] <= '7') ||
+			(len(p) == 3 && p[0] == '1' && p[1] == '0' && p[2] >= '0' && p[2] <= '7'):
+			curBg = "\x1b[" + p + "m"
+			i++
+		default:
+			i++
+		}
+	}
+	return curBg
 }

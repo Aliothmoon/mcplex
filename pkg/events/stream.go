@@ -10,6 +10,8 @@ import (
 	"github.com/aliothmoon/mcplex/pkg/output"
 )
 
+const MaxPendingStreamBytes = 64 * 1024
+
 // LiveStream is a race-free, throttled io.Writer that strictly orders:
 //
 //	EmitStart (running) -> 0..N KindStreamChunk -> EmitEnd (terminal status).
@@ -24,13 +26,15 @@ type LiveStream struct {
 
 	emitMu sync.Mutex // serializes hub.Emit calls for strict causal order
 
-	bufMu      sync.Mutex
-	started    bool
-	ended      bool
-	pending    []byte
-	totalBytes int64
-	lastFlush  time.Time
-	timer      *time.Timer
+	bufMu        sync.Mutex
+	startCalled  bool
+	startSummary string
+	started      bool
+	ended        bool
+	pending      []byte
+	totalBytes   int64
+	lastFlush    time.Time
+	timer        *time.Timer
 }
 
 // NewLiveStream constructs a throttled live output emitter for a shell command or background task.
@@ -52,24 +56,25 @@ func NewLiveStream(hub *Hub, base Event, interval time.Duration, maxChunkBytes i
 
 // Write buffers raw stdout/stderr bytes and flushes throttled UTF-8-safe chunks to the Hub.
 func (s *LiveStream) Write(p []byte) (int, error) {
-	if s == nil || len(p) == 0 || s.hub == nil || !s.hub.Active() {
-		return len(p), nil
+	origLen := len(p)
+	if s == nil || origLen == 0 || s.hub == nil || !s.hub.Active() {
+		return origLen, nil
 	}
 
 	s.bufMu.Lock()
 	if s.ended {
 		s.bufMu.Unlock()
-		return len(p), nil
+		return origLen, nil
 	}
-	s.pending = append(s.pending, p...)
-	s.totalBytes += int64(len(p))
+	s.totalBytes += int64(origLen)
+	s.appendCappedLocked(p)
 
-	if !s.started {
+	if !s.started && !s.startCalled {
 		s.bufMu.Unlock()
-		return len(p), nil
+		return origLen, nil
 	}
 
-	shouldFlushNow := len(s.pending) >= s.maxChunkBytes || (!s.lastFlush.IsZero() && time.Since(s.lastFlush) >= s.interval)
+	shouldFlushNow := !s.started || len(s.pending) >= s.maxChunkBytes || (!s.lastFlush.IsZero() && time.Since(s.lastFlush) >= s.interval)
 	if !shouldFlushNow && s.timer == nil {
 		s.timer = time.AfterFunc(s.interval, s.Flush)
 	}
@@ -78,12 +83,34 @@ func (s *LiveStream) Write(p []byte) (int, error) {
 	if shouldFlushNow {
 		s.Flush()
 	}
-	return len(p), nil
+	return origLen, nil
+}
+
+func (s *LiveStream) appendCappedLocked(p []byte) {
+	if len(p) > MaxPendingStreamBytes {
+		cut := len(p) - MaxPendingStreamBytes
+		for back := 0; back < 3 && cut < len(p) && (p[cut]&0xC0) == 0x80; back++ {
+			cut++
+		}
+		p = p[cut:]
+		s.pending = append(s.pending[:0], p...)
+		return
+	}
+	s.pending = append(s.pending, p...)
+	if len(s.pending) > MaxPendingStreamBytes {
+		cut := len(s.pending) - MaxPendingStreamBytes
+		for back := 0; back < 3 && cut < len(s.pending) && (s.pending[cut]&0xC0) == 0x80; back++ {
+			cut++
+		}
+		rem := len(s.pending) - cut
+		copy(s.pending, s.pending[cut:])
+		s.pending = s.pending[:rem]
+	}
 }
 
 // EmitStart emits the initial "running" event, folding in any early bytes written before EmitStart.
 func (s *LiveStream) EmitStart(summary string) {
-	if s == nil || s.hub == nil || !s.hub.Active() {
+	if s == nil || s.hub == nil {
 		return
 	}
 
@@ -92,6 +119,12 @@ func (s *LiveStream) EmitStart(summary string) {
 
 	s.bufMu.Lock()
 	if s.started || s.ended {
+		s.bufMu.Unlock()
+		return
+	}
+	s.startCalled = true
+	s.startSummary = summary
+	if !s.hub.Active() {
 		s.bufMu.Unlock()
 		return
 	}
@@ -124,7 +157,22 @@ func (s *LiveStream) Flush() {
 		s.timer.Stop()
 		s.timer = nil
 	}
-	if !s.started || s.ended || len(s.pending) == 0 {
+	if s.ended {
+		s.bufMu.Unlock()
+		return
+	}
+	emitDeferredStart := false
+	startSum := ""
+	if !s.started {
+		if !s.startCalled {
+			s.bufMu.Unlock()
+			return
+		}
+		s.started = true
+		emitDeferredStart = true
+		startSum = s.startSummary
+	}
+	if !emitDeferredStart && len(s.pending) == 0 {
 		s.bufMu.Unlock()
 		return
 	}
@@ -132,6 +180,18 @@ func (s *LiveStream) Flush() {
 	total := s.totalBytes
 	s.lastFlush = time.Now()
 	s.bufMu.Unlock()
+
+	if emitDeferredStart {
+		ev := s.base
+		ev.Status = "running"
+		ev.Summary = startSum
+		if len(chunk) > 0 {
+			clean := cleanLiveChunk(chunk)
+			ev.Detail, ev.Truncated = CapTailPreview(clean, DefaultShellPreview)
+		}
+		s.hub.Emit(ev)
+		return
+	}
 
 	if len(chunk) == 0 {
 		return
@@ -157,7 +217,7 @@ func (s *LiveStream) Flush() {
 	})
 }
 
-// EmitEnd stops all pending flush timers and emits the authoritative terminal event for this stream.
+// EmitEnd stops all pending flush timers, flushes any trailing buffered bytes, and emits the authoritative terminal event.
 func (s *LiveStream) EmitEnd(finalEv Event) {
 	if s == nil || s.hub == nil || !s.hub.Active() {
 		return
@@ -171,9 +231,37 @@ func (s *LiveStream) EmitEnd(finalEv Event) {
 		s.timer.Stop()
 		s.timer = nil
 	}
+	wasStarted := s.started
+	trailing := s.popValidUTF8Locked(true)
+	total := s.totalBytes
 	s.ended = true
 	s.pending = nil
 	s.bufMu.Unlock()
+
+	if len(trailing) > 0 {
+		clean := cleanLiveChunk(trailing)
+		if clean != "" {
+			if wasStarted {
+				sum := ""
+				if s.summaryFn != nil {
+					sum = s.summaryFn(total)
+				}
+				s.hub.Emit(Event{
+					Kind:       KindStreamChunk,
+					SessionID:  s.base.SessionID,
+					RunID:      s.base.RunID,
+					StreamID:   s.base.StreamID,
+					Tool:       s.base.Tool,
+					Cwd:        s.base.Cwd,
+					Summary:    sum,
+					Detail:     clean,
+					DetailKind: "shell",
+				})
+			} else if finalEv.Detail == "" {
+				finalEv.Detail, finalEv.Truncated = CapTailPreview(clean, DefaultShellPreview)
+			}
+		}
+	}
 
 	if finalEv.StreamID == "" {
 		finalEv.StreamID = s.base.StreamID
@@ -181,8 +269,6 @@ func (s *LiveStream) EmitEnd(finalEv Event) {
 	s.hub.Emit(finalEv)
 }
 
-// popValidUTF8Locked removes and returns the maximal valid-UTF-8 prefix of s.pending,
-// retaining up to 3 trailing incomplete UTF-8 bytes or a trailing '\r' (for CRLF) unless flushAll is true.
 func (s *LiveStream) popValidUTF8Locked(flushAll bool) []byte {
 	if len(s.pending) == 0 {
 		return nil
@@ -223,6 +309,9 @@ func (s *LiveStream) popValidUTF8Locked(flushAll bool) []byte {
 
 func cleanLiveChunk(b []byte) string {
 	s := strings.ReplaceAll(string(b), "\r\n", "\n")
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "\uFFFD")
+	}
 	return output.StripAnsi(s)
 }
 

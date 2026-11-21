@@ -125,15 +125,13 @@ func matchBuiltinCommandGuard(cmdLine string) string {
 	if hostPrivEscPattern.MatchString(surface) {
 		return "privilege escalation"
 	}
-	for _, r := range rawCommandRules {
-		loc := r.re.FindStringIndex(cmdLine)
-		if loc == nil {
-			continue
+	if name := matchRawCommandRules(cmdLine); name != "" {
+		return name
+	}
+	if normCmd := normalizeCommandVerbs(cmdLine, 0); normCmd != cmdLine {
+		if name := matchRawCommandRules(normCmd); name != "" {
+			return name
 		}
-		if r.veto != nil && r.veto(cmdLine[loc[0]:loc[1]]) {
-			continue
-		}
-		return r.name
 	}
 	for _, r := range surfaceCommandRules {
 		if r.re.MatchString(surface) {
@@ -141,6 +139,230 @@ func matchBuiltinCommandGuard(cmdLine string) string {
 		}
 	}
 	return ""
+}
+
+func matchRawCommandRules(s string) string {
+	for _, r := range rawCommandRules {
+		loc := r.re.FindStringIndex(s)
+		if loc == nil {
+			continue
+		}
+		if r.veto != nil && r.veto(s[loc[0]:loc[1]]) {
+			continue
+		}
+		return r.name
+	}
+	return ""
+}
+
+var transparentVerbWrappers = map[string]bool{
+	"env": true, "command": true, "builtin": true, "exec": true, "nohup": true, "nice": true, "time": true,
+}
+
+// normalizeCommandVerbs rewrites the command verb of each shell segment (and nested $() / backtick /
+// host-shell wrapper bodies) by stripping quotes, directory paths, and .exe/.cmd/.bat/.com extensions
+// while preserving argument tokens verbatim so `"rm" -rf /`, `'git' push`, and
+// `"C:\Program Files\Git\cmd\git.exe" reset --hard` match rawCommandRules cleanly.
+func normalizeCommandVerbs(cmdLine string, depth int) string {
+	if depth > 6 || cmdLine == "" {
+		return cmdLine
+	}
+	type tok struct {
+		raw        string
+		wsBefore   string
+		hasQuoted  bool
+		singleOnly bool
+	}
+	var out strings.Builder
+	var tokens []tok
+	var trailingWS string
+
+	flushSeg := func(sep string) {
+		if len(tokens) > 0 {
+			verbIdx := -1
+			inWrapper := false
+			for i, tk := range tokens {
+				unq := stripOuterQuotes(tk.raw)
+				if isEnvPrefixToken(unq) {
+					continue
+				}
+				if inWrapper && strings.HasPrefix(unq, "-") {
+					continue
+				}
+				normV := normalizeCmdVerb(tk.raw)
+				if transparentVerbWrappers[normV] {
+					inWrapper = true
+					continue
+				}
+				verbIdx = i
+				break
+			}
+			isShell := false
+			if verbIdx >= 0 {
+				v := normalizeCmdVerb(tokens[verbIdx].raw)
+				isShell = isHostShellWrapper(v)
+			}
+			for i, tk := range tokens {
+				out.WriteString(tk.wsBefore)
+				if i == verbIdx {
+					v := normalizeCmdVerb(tk.raw)
+					if v != "" && !strings.HasPrefix(strings.TrimSpace(tk.raw), "$") && !strings.HasPrefix(strings.TrimSpace(tk.raw), "`") {
+						out.WriteString(v)
+						continue
+					}
+				} else if isShell && i > verbIdx && tk.hasQuoted {
+					out.WriteString(rewriteQuotedShellArg(tk.raw, depth+1))
+					continue
+				}
+				out.WriteString(tk.raw)
+			}
+		}
+		out.WriteString(trailingWS)
+		out.WriteString(sep)
+		tokens = nil
+		trailingWS = ""
+	}
+
+	var curWS strings.Builder
+	var curTok strings.Builder
+	curHasQuoted := false
+	curSingle := true
+	finishTok := func() {
+		if curTok.Len() > 0 {
+			tokens = append(tokens, tok{
+				raw:        curTok.String(),
+				wsBefore:   curWS.String(),
+				hasQuoted:  curHasQuoted,
+				singleOnly: curSingle,
+			})
+			curWS.Reset()
+			curTok.Reset()
+			curHasQuoted = false
+			curSingle = true
+		}
+	}
+
+	n := len(cmdLine)
+	for i := 0; i < n; i++ {
+		ch := cmdLine[i]
+		switch ch {
+		case ' ', '\t':
+			finishTok()
+			curWS.WriteByte(ch)
+		case ';', '\n', '(', ')':
+			finishTok()
+			trailingWS = curWS.String()
+			curWS.Reset()
+			flushSeg(string(ch))
+		case '&', '|':
+			finishTok()
+			trailingWS = curWS.String()
+			curWS.Reset()
+			if i+1 < n && cmdLine[i+1] == ch {
+				flushSeg(cmdLine[i : i+2])
+				i++
+			} else {
+				flushSeg(string(ch))
+			}
+		case '\'':
+			curHasQuoted = true
+			start := i
+			i++
+			for i < n && cmdLine[i] != '\'' {
+				i++
+			}
+			if i < n {
+				curTok.WriteString(cmdLine[start : i+1])
+			} else {
+				curTok.WriteString(cmdLine[start:])
+			}
+		case '"':
+			curHasQuoted = true
+			curSingle = false
+			curTok.WriteByte('"')
+			i++
+			for i < n && cmdLine[i] != '"' {
+				if cmdLine[i] == '\\' && i+1 < n {
+					curTok.WriteByte(cmdLine[i])
+					curTok.WriteByte(cmdLine[i+1])
+					i += 2
+					continue
+				}
+				if cmdLine[i] == '$' && i+1 < n && cmdLine[i+1] == '(' {
+					sub, nextIdx := scanCommandSubst(cmdLine, i+2)
+					curTok.WriteString("$(")
+					curTok.WriteString(normalizeCommandVerbs(sub, depth+1))
+					if nextIdx < n && cmdLine[nextIdx] == ')' {
+						curTok.WriteByte(')')
+					}
+					i = nextIdx + 1
+					continue
+				}
+				if cmdLine[i] == '`' {
+					if sub, nextIdx, closed := scanBacktickSubst(cmdLine, i+1); closed {
+						curTok.WriteByte('`')
+						curTok.WriteString(normalizeCommandVerbs(sub, depth+1))
+						curTok.WriteByte('`')
+						i = nextIdx + 1
+						continue
+					}
+				}
+				curTok.WriteByte(cmdLine[i])
+				i++
+			}
+			if i < n && cmdLine[i] == '"' {
+				curTok.WriteByte('"')
+			}
+		case '$':
+			curSingle = false
+			if i+1 < n && cmdLine[i+1] == '(' {
+				sub, nextIdx := scanCommandSubst(cmdLine, i+2)
+				curTok.WriteString("$(")
+				curTok.WriteString(normalizeCommandVerbs(sub, depth+1))
+				if nextIdx < n && cmdLine[nextIdx] == ')' {
+					curTok.WriteByte(')')
+				}
+				i = nextIdx
+				continue
+			}
+			curTok.WriteByte(ch)
+		case '`':
+			curSingle = false
+			if sub, nextIdx, closed := scanBacktickSubst(cmdLine, i+1); closed {
+				curTok.WriteByte('`')
+				curTok.WriteString(normalizeCommandVerbs(sub, depth+1))
+				curTok.WriteByte('`')
+				i = nextIdx
+				continue
+			}
+			curTok.WriteByte(ch)
+		default:
+			curSingle = false
+			curTok.WriteByte(ch)
+		}
+	}
+	finishTok()
+	trailingWS = curWS.String()
+	curWS.Reset()
+	flushSeg("")
+	return out.String()
+}
+
+func stripOuterQuotes(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && ((s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'')) {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+func rewriteQuotedShellArg(raw string, depth int) string {
+	if len(raw) >= 2 && (raw[0] == '"' || raw[0] == '\'') && raw[len(raw)-1] == raw[0] {
+		q := raw[0]
+		inner := raw[1 : len(raw)-1]
+		return string(q) + normalizeCommandVerbs(inner, depth) + string(q)
+	}
+	return raw
 }
 
 // ---------------------------------------------------------------------------------------------

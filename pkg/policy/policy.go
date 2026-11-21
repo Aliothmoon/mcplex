@@ -113,6 +113,7 @@ type Options struct {
 type Engine struct {
 	workspaceRoots          []string
 	allowNonWorkspaceAccess bool
+	strictConfinement       bool
 	trustWorkspaceMCP       bool
 	nativeEscalationHint    bool
 	denyRules               []parsedRule
@@ -137,6 +138,7 @@ func NewEngineWithOptions(workspaceDir string, opts Options) *Engine {
 	trustEnv := os.Getenv("AGY_PTC_TRUST_WORKSPACE_MCP") == "1" || os.Getenv("MCPLEX_TRUST_WORKSPACE_MCP") == "1"
 	e := &Engine{
 		allowNonWorkspaceAccess: !opts.StrictWorkspace && !strictEnv,
+		strictConfinement:       (opts.StrictWorkspace || strictEnv) && !opts.LoadAntigravityConfig,
 		trustWorkspaceMCP:       opts.TrustWorkspaceMCP || trustEnv,
 		nativeEscalationHint:    opts.NativeEscalationHint,
 	}
@@ -293,8 +295,44 @@ func (e *Engine) ResolveAndCheckRead(baseDir, targetPath string) (string, error)
 	if dec, matched := e.evalRules("write_file", realPath); matched && dec == DecisionAllow {
 		return abs, nil
 	}
-	if !e.isInsideWorkspace(realPath) && !e.isTempOrScratch(realPath) && !e.allowNonWorkspaceAccess {
+	allowScratch := !e.strictConfinement && e.isTempOrScratch(realPath)
+	if !e.isInsideWorkspace(realPath) && !allowScratch && !e.allowNonWorkspaceAccess {
 		return "", e.policyErr(DecisionAsk, "read_file", targetPath, "outside workspace")
+	}
+	return abs, nil
+}
+
+// ResolveAndCheckStrictCwd resolves a working directory (`cwd`) when `--strict-root` is active,
+// enforcing that `cwd` resides strictly inside `[workspaceDir, ...ExtraRoots]` (never `/tmp` or outside roots).
+func (e *Engine) ResolveAndCheckStrictCwd(baseDir, targetDir string) (string, error) {
+	abs, realPath, err := resolveWithSymlinks(baseDir, targetDir)
+	if err != nil {
+		return "", err
+	}
+	if e.isSensitivePath(realPath) || e.isSensitivePath(abs) {
+		return "", &PolicyError{
+			Decision: DecisionDeny,
+			Action:   "cwd",
+			Target:   targetDir,
+			Reason:   "credential path",
+		}
+	}
+	if dec, matched := e.evalRules("read_file", realPath); matched && dec == DecisionDeny {
+		return "", &PolicyError{
+			Decision: DecisionDeny,
+			Action:   "cwd",
+			Target:   targetDir,
+			Reason:   "read deny rule",
+		}
+	}
+	if !e.isInsideWorkspace(realPath) {
+		return "", &PolicyError{
+			Decision:     DecisionDeny,
+			Action:       "cwd",
+			Target:       targetDir,
+			Reason:       "outside strict workspace roots",
+			NoNativeHint: !e.nativeEscalationHint,
+		}
 	}
 	return abs, nil
 }
@@ -344,7 +382,7 @@ func (e *Engine) CheckCommand(cmdLine string) error {
 	if trimmed == "" {
 		return errors.New("command cannot be empty")
 	}
-	dec, matched := e.evalRules("command", trimmed)
+	dec, matched := e.evalCommandRules(trimmed)
 	if matched && dec == DecisionDeny {
 		return &PolicyError{Decision: DecisionDeny, Action: "command", Target: trimmed, Reason: "settings deny rule"}
 	}
@@ -355,6 +393,290 @@ func (e *Engine) CheckCommand(cmdLine string) error {
 		return e.policyErr(dec, "command", trimmed, "settings rule")
 	}
 	return nil
+}
+
+// evalCommandRules evaluates user command(...) deny/ask/allow rules against BOTH the full cmdLine
+// and each compound shell segment (&&, ||, ;, |, \n, $(), backticks, and shell wrapper bodies)
+// so compound commands like `true && curl https://evil` cannot bypass `deny: ["command(curl)"]`.
+func (e *Engine) evalCommandRules(trimmed string) (Decision, bool) {
+	segForms := extractCommandRuleSegments(trimmed, 0)
+
+	if matchRuleSet(e.denyRules, "command", trimmed, e.workspaceRoots) {
+		return DecisionDeny, true
+	}
+	for _, forms := range segForms {
+		for _, f := range forms {
+			if matchRuleSet(e.denyRules, "command", f, e.workspaceRoots) {
+				return DecisionDeny, true
+			}
+		}
+	}
+
+	if matchRuleSet(e.askRules, "command", trimmed, e.workspaceRoots) {
+		return DecisionAsk, true
+	}
+	for _, forms := range segForms {
+		for _, f := range forms {
+			if matchRuleSet(e.askRules, "command", f, e.workspaceRoots) {
+				return DecisionAsk, true
+			}
+		}
+	}
+
+	if matchRuleSet(e.allowRules, "command", trimmed, e.workspaceRoots) {
+		return DecisionAllow, true
+	}
+	if len(segForms) > 0 {
+		allAllowed := true
+		for _, forms := range segForms {
+			segAllowed := false
+			for _, f := range forms {
+				if matchRuleSet(e.allowRules, "command", f, e.workspaceRoots) {
+					segAllowed = true
+					break
+				}
+			}
+			if !segAllowed {
+				allAllowed = false
+				break
+			}
+		}
+		if allAllowed {
+			return DecisionAllow, true
+		}
+	}
+	return "", false
+}
+
+// extractCommandRuleSegments splits cmdLine into quote-aware compound command segments
+// (&&, ||, ;, |, &, \n, subshell parens, $(), backticks, and host-shell wrapper bodies).
+// Each returned element contains [rawTrimmedSegment, canonicalVerbSegment?].
+func extractCommandRuleSegments(cmdLine string, depth int) [][]string {
+	if depth > 6 {
+		return nil
+	}
+	var groups [][]string
+	var cur strings.Builder
+	var substs []string
+
+	addSeg := func(raw string) {
+		s := strings.TrimSpace(raw)
+		for len(s) > 0 && (s[0] == '(' || s[0] == ')') {
+			s = strings.TrimSpace(s[1:])
+		}
+		for len(s) > 0 && s[len(s)-1] == ')' && !strings.Contains(s, "(") {
+			s = strings.TrimSpace(s[:len(s)-1])
+		}
+		if s == "" {
+			return
+		}
+		forms := []string{s}
+		canon, shellBody := canonicalizeSegmentForRule(s)
+		if canon != "" && canon != s {
+			forms = append(forms, canon)
+		}
+		groups = append(groups, forms)
+		if shellBody != "" {
+			groups = append(groups, extractCommandRuleSegments(shellBody, depth+1)...)
+		}
+	}
+
+	flush := func() {
+		addSeg(cur.String())
+		cur.Reset()
+		for _, sub := range substs {
+			groups = append(groups, extractCommandRuleSegments(sub, depth+1)...)
+		}
+		substs = nil
+	}
+
+	n := len(cmdLine)
+	for i := 0; i < n; i++ {
+		ch := cmdLine[i]
+		switch ch {
+		case '\'':
+			cur.WriteByte(ch)
+			i++
+			for i < n && cmdLine[i] != '\'' {
+				cur.WriteByte(cmdLine[i])
+				i++
+			}
+			if i < n {
+				cur.WriteByte('\'')
+			}
+		case '"':
+			cur.WriteByte(ch)
+			i++
+			for i < n && cmdLine[i] != '"' {
+				if cmdLine[i] == '\\' && i+1 < n {
+					cur.WriteByte(cmdLine[i])
+					cur.WriteByte(cmdLine[i+1])
+					i += 2
+					continue
+				}
+				if cmdLine[i] == '$' && i+1 < n && cmdLine[i+1] == '(' {
+					sub, nextIdx := scanCommandSubst(cmdLine, i+2)
+					substs = append(substs, sub)
+					cur.WriteString("$(")
+					cur.WriteString(sub)
+					if nextIdx < n && cmdLine[nextIdx] == ')' {
+						cur.WriteByte(')')
+					}
+					i = nextIdx + 1
+					continue
+				}
+				if cmdLine[i] == '`' {
+					if sub, nextIdx, closed := scanBacktickSubst(cmdLine, i+1); closed {
+						substs = append(substs, sub)
+						cur.WriteByte('`')
+						curTok := sub
+						cur.WriteString(curTok)
+						cur.WriteByte('`')
+						i = nextIdx + 1
+						continue
+					}
+				}
+				cur.WriteByte(cmdLine[i])
+				i++
+			}
+			if i < n && cmdLine[i] == '"' {
+				cur.WriteByte('"')
+			}
+		case '$':
+			if i+1 < n && cmdLine[i+1] == '(' {
+				sub, nextIdx := scanCommandSubst(cmdLine, i+2)
+				substs = append(substs, sub)
+				cur.WriteString("$(")
+				cur.WriteString(sub)
+				if nextIdx < n && cmdLine[nextIdx] == ')' {
+					cur.WriteByte(')')
+				}
+				i = nextIdx
+				continue
+			}
+			cur.WriteByte(ch)
+		case '`':
+			if sub, nextIdx, closed := scanBacktickSubst(cmdLine, i+1); closed {
+				substs = append(substs, sub)
+				cur.WriteByte('`')
+				cur.WriteString(sub)
+				cur.WriteByte('`')
+				i = nextIdx
+				continue
+			}
+			cur.WriteByte(ch)
+		case ';', '\n':
+			flush()
+		case '&', '|':
+			if i+1 < n && cmdLine[i+1] == ch {
+				i++
+			}
+			flush()
+		default:
+			cur.WriteByte(ch)
+		}
+	}
+	flush()
+	return groups
+}
+
+// canonicalizeSegmentForRule strips leading ENV=val assignments and normalizes a quoted or path-qualified
+// command verb (e.g. `"C:\Program Files\Git\cmd\git.exe" push` -> `git push`). If the verb is a host shell
+// wrapper (`sh -c "..."`, `cmd /c "..."`), it also returns the unquoted script body for nested evaluation.
+func canonicalizeSegmentForRule(seg string) (canon string, shellBody string) {
+	words := splitShellWordsWithQuotes(seg)
+	if len(words) == 0 {
+		return "", ""
+	}
+	idx := 0
+	for idx < len(words) && isEnvPrefixToken(words[idx].unquoted) {
+		idx++
+	}
+	if idx >= len(words) {
+		return "", ""
+	}
+	verb := normalizeCmdVerb(words[idx].raw)
+	if verb == "" {
+		return "", ""
+	}
+	tail := strings.TrimSpace(seg[words[idx].end:])
+	if tail == "" {
+		canon = verb
+	} else {
+		canon = verb + " " + tail
+	}
+	if isHostShellWrapper(verb) && idx+1 < len(words) {
+		last := words[len(words)-1]
+		if last.wasQuoted {
+			shellBody = last.unquoted
+		}
+	}
+	return canon, shellBody
+}
+
+type shellWordSpan struct {
+	raw       string
+	unquoted  string
+	wasQuoted bool
+	start     int
+	end       int
+}
+
+func splitShellWordsWithQuotes(s string) []shellWordSpan {
+	var out []shellWordSpan
+	n := len(s)
+	i := 0
+	for i < n {
+		for i < n && (s[i] == ' ' || s[i] == '\t') {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		start := i
+		var unq strings.Builder
+		wasQuoted := false
+		for i < n && s[i] != ' ' && s[i] != '\t' {
+			switch s[i] {
+			case '\'':
+				wasQuoted = true
+				i++
+				for i < n && s[i] != '\'' {
+					unq.WriteByte(s[i])
+					i++
+				}
+				if i < n {
+					i++
+				}
+			case '"':
+				wasQuoted = true
+				i++
+				for i < n && s[i] != '"' {
+					if s[i] == '\\' && i+1 < n {
+						unq.WriteByte(s[i+1])
+						i += 2
+						continue
+					}
+					unq.WriteByte(s[i])
+					i++
+				}
+				if i < n {
+					i++
+				}
+			default:
+				unq.WriteByte(s[i])
+				i++
+			}
+		}
+		out = append(out, shellWordSpan{
+			raw:       s[start:i],
+			unquoted:  unq.String(),
+			wasQuoted: wasQuoted,
+			start:     start,
+			end:       i,
+		})
+	}
+	return out
 }
 
 // extractHostCommandSurface strips literal quoted arguments of non-shell commands (e.g. `adb shell "...; su -c id"` or `rg "; sudo"`)
@@ -437,8 +759,10 @@ func extractHostCommandSurface(cmdLine string, depth int) string {
 			if wi > 0 {
 				out.WriteByte(' ')
 			}
-			if wi <= verbWordIdx {
+			if wi < verbWordIdx {
 				out.WriteString(w.raw)
+			} else if wi == verbWordIdx {
+				out.WriteString(verb)
 			} else if isShell && w.hasQuoted {
 				out.WriteString("; ")
 				out.WriteString(extractHostCommandSurface(w.raw, depth+1))
@@ -552,9 +876,57 @@ func scanCommandSubst(s string, start int) (string, int) {
 	i := start
 	for i < len(s) && depth > 0 {
 		c := s[i]
-		if c == '(' {
+		switch c {
+		case '\\':
+			if i+1 < len(s) {
+				b.WriteByte(c)
+				b.WriteByte(s[i+1])
+				i += 2
+				continue
+			}
+		case '\'':
+			b.WriteByte(c)
+			i++
+			for i < len(s) && s[i] != '\'' {
+				b.WriteByte(s[i])
+				i++
+			}
+			if i < len(s) {
+				b.WriteByte('\'')
+				i++
+			}
+			continue
+		case '"':
+			b.WriteByte(c)
+			i++
+			for i < len(s) && s[i] != '"' {
+				if s[i] == '\\' && i+1 < len(s) {
+					b.WriteByte(s[i])
+					b.WriteByte(s[i+1])
+					i += 2
+					continue
+				}
+				if s[i] == '$' && i+1 < len(s) && s[i+1] == '(' {
+					sub, nextIdx := scanCommandSubst(s, i+2)
+					b.WriteString("$(")
+					b.WriteString(sub)
+					if nextIdx < len(s) && s[nextIdx] == ')' {
+						b.WriteByte(')')
+					}
+					i = nextIdx + 1
+					continue
+				}
+				b.WriteByte(s[i])
+				i++
+			}
+			if i < len(s) {
+				b.WriteByte('"')
+				i++
+			}
+			continue
+		case '(':
 			depth++
-		} else if c == ')' {
+		case ')':
 			depth--
 			if depth == 0 {
 				return b.String(), i
@@ -601,11 +973,13 @@ func isEnvPrefixToken(tok string) bool {
 
 func normalizeCmdVerb(tok string) string {
 	tok = strings.TrimSpace(tok)
+	tok = strings.NewReplacer(`"`, "", `'`, "").Replace(tok)
+	tok = strings.TrimSpace(tok)
 	if idx := strings.LastIndexAny(tok, `/\`); idx >= 0 {
 		tok = tok[idx+1:]
 	}
 	tok = strings.ToLower(tok)
-	for _, ext := range []string{".exe", ".cmd", ".bat"} {
+	for _, ext := range []string{".exe", ".cmd", ".bat", ".com"} {
 		tok = strings.TrimSuffix(tok, ext)
 	}
 	return tok
@@ -704,9 +1078,14 @@ func matchRuleSet(rules []parsedRule, action, target string, roots []string) boo
 			}
 		case "read_file", "write_file":
 			normTarget := normalizeRulePath(target)
-			rulePath := r.target
-			if !strings.HasPrefix(rulePath, "/") && len(roots) > 0 {
+			rulePath := expandRuleHome(r.target)
+			if !isRulePathAbs(rulePath) && len(roots) > 0 {
 				rulePath = filepath.Join(roots[0], filepath.FromSlash(rulePath))
+			}
+			targetDrive := extractWindowsDrive(target)
+			ruleDrive := extractWindowsDrive(rulePath)
+			if ruleDrive != "" && targetDrive != "" && ruleDrive != targetDrive {
+				continue
 			}
 			normRule := strings.TrimSuffix(normalizeRulePath(rulePath), "/")
 			if normTarget == normRule || strings.HasPrefix(normTarget, normRule+"/") {
@@ -778,7 +1157,11 @@ func (e *Engine) isProtectedExplicitFile(realPath string) bool {
 
 func isProtectedGitInternal(realPath string) bool {
 	norm := "/" + strings.Trim(strings.ToLower(normalizeRulePath(realPath)), "/") + "/"
-	if strings.Contains(norm, "/.git/hooks/") || strings.HasSuffix(norm, "/.git/config/") || strings.Contains(norm, "/.git/objects/") {
+	if strings.HasSuffix(norm, "/.git/") ||
+		strings.Contains(norm, "/.git/hooks/") ||
+		strings.Contains(norm, "/.git/config/") ||
+		strings.Contains(norm, "/.git/objects/") ||
+		strings.Contains(norm, "/.git/modules/") {
 		return true
 	}
 	return false
@@ -876,15 +1259,15 @@ func normalizeWindowsExtendedPath(p string) (cleaned string, blockedDevice bool)
 }
 
 // hasWindowsAlternateDataStream detects NTFS Alternate Data Stream suffixes (e.g. ".git/config::$DATA",
-// "file.txt:stream") or raw device namespaces ("\\.\", "\\?\Volume{...}") that can bypass suffix/name checks on Windows.
+// "file.txt:stream", 1-letter "a:stream") or raw device namespaces ("\\.\", "\\?\Volume{...}") that can bypass suffix/name checks on Windows.
 func hasWindowsAlternateDataStream(p string) bool {
 	cleaned, blocked := normalizeWindowsExtendedPath(p)
 	if blocked {
 		return true
 	}
 	s := strings.ReplaceAll(cleaned, "\\", "/")
-	// Skip valid leading drive prefix "C:" (ASCII letter + ':').
-	if len(s) >= 2 && ((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z')) && s[1] == ':' {
+	// Skip valid leading Windows drive volume prefix ("C:" alone or "C:/..."), NOT 1-letter ADS ("a:stream").
+	if len(s) >= 2 && isASCIIAlpha(s[0]) && s[1] == ':' && (len(s) == 2 || s[2] == '/') {
 		s = s[2:]
 	}
 	return strings.Contains(s, ":")
@@ -962,8 +1345,8 @@ func normalizeComparePath(p string) string {
 
 // normalizeRulePath strips Windows drive letters and converts backslashes to forward slashes per Antigravity CLI docs.
 func normalizeRulePath(p string) string {
-	s := filepath.ToSlash(filepath.Clean(p))
-	if len(s) >= 2 && s[1] == ':' {
+	s := filepath.ToSlash(filepath.Clean(strings.ReplaceAll(p, "\\", "/")))
+	if len(s) >= 2 && isASCIIAlpha(s[0]) && s[1] == ':' {
 		s = s[2:]
 	}
 	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
@@ -973,6 +1356,41 @@ func normalizeRulePath(p string) string {
 		s = "/" + s
 	}
 	return s
+}
+
+func expandRuleHome(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "~" || strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+		if h := userHomeDir(); h != "" {
+			if len(p) == 1 {
+				return h
+			}
+			return filepath.Join(h, filepath.FromSlash(strings.ReplaceAll(p[2:], "\\", "/")))
+		}
+	}
+	return p
+}
+
+func isRulePathAbs(p string) bool {
+	if strings.HasPrefix(p, "/") || strings.HasPrefix(p, `\`) {
+		return true
+	}
+	if len(p) >= 2 && isASCIIAlpha(p[0]) && p[1] == ':' && (len(p) == 2 || p[2] == '/' || p[2] == '\\') {
+		return true
+	}
+	return filepath.IsAbs(p)
+}
+
+func extractWindowsDrive(p string) string {
+	s := strings.TrimSpace(p)
+	if len(s) >= 2 && isASCIIAlpha(s[0]) && s[1] == ':' && (len(s) == 2 || s[2] == '/' || s[2] == '\\') {
+		return strings.ToLower(s[:2])
+	}
+	return ""
+}
+
+func isASCIIAlpha(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
 func userHomeDir() string {

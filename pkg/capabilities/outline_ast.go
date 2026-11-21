@@ -109,19 +109,29 @@ func (b *ASTBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
-			end := minInt(s.EndLine, len(lines))
-			body := lines[s.StartLine-1 : end]
+			if len(lines) == 0 {
+				return map[string]any{
+					"kind":      s.Kind,
+					"name":      qualifiedName(syms, s, symbolSep(rel)),
+					"startLine": 1,
+					"endLine":   1,
+					"text":      "",
+				}, nil
+			}
+			start := maxInt(1, minInt(s.StartLine, len(lines)))
+			end := maxInt(start, minInt(s.EndLine, len(lines)))
+			body := lines[start-1 : end]
 			if optBool(opts, "lineNumbers", false) {
 				numbered := make([]string, len(body))
 				for i, l := range body {
-					numbered[i] = fmt.Sprintf("%d: %s", s.StartLine+i, l)
+					numbered[i] = fmt.Sprintf("%d: %s", start+i, l)
 				}
 				body = numbered
 			}
 			return map[string]any{
 				"kind":      s.Kind,
 				"name":      qualifiedName(syms, s, symbolSep(rel)),
-				"startLine": s.StartLine,
+				"startLine": start,
 				"endLine":   end,
 				"text":      strings.Join(body, "\n"),
 			}, nil
@@ -181,11 +191,20 @@ func extractGoASTSymbols(absPath string, src []byte, lines []string) ([]SymbolIn
 	}
 
 	syms := []SymbolInfo{}
+	clampLines := func(start, end int) (int, int) {
+		if len(lines) == 0 {
+			return 1, 1
+		}
+		s := maxInt(1, minInt(start, len(lines)))
+		e := maxInt(s, minInt(end, len(lines)))
+		return s, e
+	}
 	for _, decl := range fileNode.Decls {
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
-			start := fset.Position(d.Pos()).Line
-			end := fset.Position(d.End()).Line
+			start := fset.PositionFor(d.Pos(), false).Line
+			end := fset.PositionFor(d.End(), false).Line
+			start, end = clampLines(start, end)
 			name := d.Name.Name
 			kind := "func"
 			if d.Recv != nil && len(d.Recv.List) > 0 {
@@ -210,12 +229,13 @@ func extractGoASTSymbols(absPath string, src []byte, lines []string) ([]SymbolIn
 			for _, spec := range d.Specs {
 				switch s := spec.(type) {
 				case *ast.TypeSpec:
-					start := fset.Position(s.Pos()).Line
-					end := fset.Position(s.End()).Line
+					start := fset.PositionFor(s.Pos(), false).Line
+					end := fset.PositionFor(s.End(), false).Line
 					if len(d.Specs) == 1 {
-						start = fset.Position(d.Pos()).Line
-						end = fset.Position(d.End()).Line
+						start = fset.PositionFor(d.Pos(), false).Line
+						end = fset.PositionFor(d.End(), false).Line
 					}
+					start, end = clampLines(start, end)
 					kind := "type"
 					switch s.Type.(type) {
 					case *ast.StructType:

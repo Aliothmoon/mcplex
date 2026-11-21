@@ -1,6 +1,8 @@
 package output
 
 import (
+	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -74,5 +76,71 @@ func TestFitSectionsToByteBudget(t *testing.T) {
 	}
 	if !strings.HasPrefix(out, "header\n\n") {
 		t.Fatalf("small sections must survive intact: %q", out[:20])
+	}
+}
+
+type cyclicNode struct {
+	Name string      `json:"name"`
+	Next *cyclicNode `json:"next"`
+}
+
+func TestMarshalResultForBudgetAndPrettyHandleCyclesNaNAndDeepDAGs(t *testing.T) {
+	// 1. Cyclic map (previously triggered 1GB stack overflow via fmt.Sprintf("%v", val))
+	cycMap := map[string]any{"ok": true}
+	cycMap["self"] = cycMap
+	for _, fn := range []func(any) string{
+		func(v any) string { return MarshalResultForBudget(v, 9600) },
+		MarshalPretty,
+	} {
+		got := fn(cycMap)
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+			t.Fatalf("cyclic map did not produce valid JSON: %v\ngot: %s", err, got)
+		}
+		if parsed["self"] != "[Circular]" {
+			t.Fatalf("expected [Circular] marker, got: %v", parsed)
+		}
+	}
+
+	// 2. Cyclic slice & cyclic struct pointer
+	cycSlice := make([]any, 2)
+	cycSlice[0] = "head"
+	cycSlice[1] = cycSlice
+	gotSlice := MarshalResultForBudget(cycSlice, 9600)
+	var parsedSlice []any
+	if err := json.Unmarshal([]byte(gotSlice), &parsedSlice); err != nil || len(parsedSlice) != 2 || parsedSlice[1] != "[Circular]" {
+		t.Fatalf("unexpected cyclic slice JSON: %q (err=%v)", gotSlice, err)
+	}
+
+	node := &cyclicNode{Name: "root"}
+	node.Next = node
+	gotNode := MarshalPretty(node)
+	var parsedNode map[string]any
+	if err := json.Unmarshal([]byte(gotNode), &parsedNode); err != nil || parsedNode["next"] != "[Circular]" {
+		t.Fatalf("unexpected cyclic struct JSON: %q (err=%v)", gotNode, err)
+	}
+
+	// 3. Shared DAG diamond + NaN/Inf + func fallback: shared non-cyclic nodes must NOT become [Circular]
+	shared := map[string]any{"val": 42}
+	dagWithNaN := map[string]any{
+		"left":   shared,
+		"right":  shared,
+		"nan":    math.NaN(),
+		"posInf": math.Inf(1),
+		"negInf": math.Inf(-1),
+		"fn":     func() {},
+	}
+	gotDAG := MarshalResultForBudget(dagWithNaN, 9600)
+	var parsedDAG map[string]any
+	if err := json.Unmarshal([]byte(gotDAG), &parsedDAG); err != nil {
+		t.Fatalf("DAG+NaN JSON invalid: %v\ngot: %s", err, gotDAG)
+	}
+	left, _ := parsedDAG["left"].(map[string]any)
+	right, _ := parsedDAG["right"].(map[string]any)
+	if left["val"] != float64(42) || right["val"] != float64(42) {
+		t.Fatalf("shared DAG diamond corrupted: left=%v right=%v", left, right)
+	}
+	if parsedDAG["nan"] != nil || parsedDAG["posInf"] != nil || parsedDAG["negInf"] != nil {
+		t.Fatalf("expected NaN/Inf to scrub to null, got: %v", parsedDAG)
 	}
 }

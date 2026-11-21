@@ -4,6 +4,7 @@ package diff
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"unicode/utf8"
 )
@@ -13,6 +14,9 @@ const (
 	MaxDiffHunkLines    = 400
 	MaxMyersWindowLines = 4000
 	MaxMyersEditDist    = 1000
+	MaxDiffLineBytes    = 4096
+	MaxIntralineBytes   = 2048
+	MaxDiffInputBytes   = 2 * 1024 * 1024
 )
 
 // LineKind classifies one line inside a unified diff hunk.
@@ -66,15 +70,18 @@ func Compute(before, after []byte, existedBefore, existsAfter bool, contextLines
 	if isBinarySample(before) || isBinarySample(after) {
 		return Result{IsBinary: true}
 	}
+	if !existedBefore && !existsAfter {
+		return Result{}
+	}
+	if len(before)+len(after) > MaxDiffInputBytes {
+		return computeHugeDiff(before, after, existedBefore, existsAfter, contextLines)
+	}
 
 	if !existedBefore && existsAfter {
 		return buildCreateDiff(splitNormalizedLines(after))
 	}
 	if existedBefore && !existsAfter {
 		return buildDeleteDiff(splitNormalizedLines(before))
-	}
-	if !existedBefore && !existsAfter {
-		return Result{}
 	}
 
 	oldLines := splitNormalizedLines(before)
@@ -100,6 +107,9 @@ func Compute(before, after []byte, existedBefore, existsAfter bool, contextLines
 	hunks, truncated := groupIntoHunks(ops, contextLines, MaxDiffHunkLines)
 	for i := range hunks {
 		annotateIntraline(hunks[i].Lines)
+		if capHunkLines(hunks[i].Lines, MaxDiffLineBytes) {
+			truncated = true
+		}
 	}
 	return Result{
 		Added:     added,
@@ -123,10 +133,13 @@ func buildCreateDiff(lines []string) Result {
 	dl := make([]DiffLine, limit)
 	for i := 0; i < limit; i++ {
 		dl[i] = DiffLine{Kind: LineAdd, NewLine: i + 1, Text: lines[i]}
+		if capDiffLine(&dl[i], MaxDiffLineBytes) {
+			truncated = true
+		}
 	}
 	return Result{
 		Added:     total,
-		Hunks:     []Hunk{{OldStart: 0, OldCount: 0, NewStart: 1, NewCount: total, Lines: dl}},
+		Hunks:     []Hunk{{OldStart: 0, OldCount: 0, NewStart: 1, NewCount: limit, Lines: dl}},
 		Truncated: truncated,
 	}
 }
@@ -145,12 +158,438 @@ func buildDeleteDiff(lines []string) Result {
 	dl := make([]DiffLine, limit)
 	for i := 0; i < limit; i++ {
 		dl[i] = DiffLine{Kind: LineDel, OldLine: i + 1, Text: lines[i]}
+		if capDiffLine(&dl[i], MaxDiffLineBytes) {
+			truncated = true
+		}
 	}
 	return Result{
 		Removed:   total,
-		Hunks:     []Hunk{{OldStart: 1, OldCount: total, NewStart: 0, NewCount: 0, Lines: dl}},
+		Hunks:     []Hunk{{OldStart: 1, OldCount: limit, NewStart: 0, NewCount: 0, Lines: dl}},
 		Truncated: truncated,
 	}
+}
+
+// computeHugeDiff handles >2MB combined inputs using zero-allocation byte scanning so single-line
+// minified bundles or multi-MB files never spike memory or produce oversized >4MB SSE JSON payloads.
+func computeHugeDiff(before, after []byte, existedBefore, existsAfter bool, contextLines int) Result {
+	if !existedBefore && existsAfter {
+		it := newByteLineIter(after)
+		total := 0
+		var dl []DiffLine
+		for {
+			line, ok := it.next()
+			if !ok {
+				break
+			}
+			total++
+			if len(dl) < MaxDiffHunkLines {
+				d := DiffLine{Kind: LineAdd, NewLine: total, Text: capRawLineBytes(line, MaxDiffLineBytes)}
+				dl = append(dl, d)
+			}
+		}
+		if total == 0 {
+			return Result{}
+		}
+		return Result{
+			Added:     total,
+			Hunks:     []Hunk{{OldStart: 0, OldCount: 0, NewStart: 1, NewCount: len(dl), Lines: dl}},
+			Truncated: true,
+		}
+	}
+
+	if existedBefore && !existsAfter {
+		it := newByteLineIter(before)
+		total := 0
+		var dl []DiffLine
+		for {
+			line, ok := it.next()
+			if !ok {
+				break
+			}
+			total++
+			if len(dl) < MaxDiffHunkLines {
+				d := DiffLine{Kind: LineDel, OldLine: total, Text: capRawLineBytes(line, MaxDiffLineBytes)}
+				dl = append(dl, d)
+			}
+		}
+		if total == 0 {
+			return Result{}
+		}
+		return Result{
+			Removed:   total,
+			Hunks:     []Hunk{{OldStart: 1, OldCount: len(dl), NewStart: 0, NewCount: 0, Lines: dl}},
+			Truncated: true,
+		}
+	}
+
+	if bytes.Equal(before, after) {
+		return Result{}
+	}
+
+	bTrim := trimTrailingNewlineBytes(before)
+	aTrim := trimTrailingNewlineBytes(after)
+	if len(bTrim) == 0 && len(aTrim) == 0 {
+		return Result{}
+	}
+
+	// Scan common prefix lines in O(1) memory, retaining at most contextLines raw slices.
+	ctxCap := min(contextLines, 32)
+	var leadSlices [][]byte
+	if ctxCap > 0 {
+		leadSlices = make([][]byte, 0, ctxCap)
+	}
+	itB := newByteLineIterFromTrimmed(bTrim)
+	itA := newByteLineIterFromTrimmed(aTrim)
+	prefixCount := 0
+
+	var firstMismatchB, firstMismatchA []byte
+	var hasB, hasA bool
+	bMidStart, aMidStart := 0, 0
+	for {
+		bLinePos := itB.pos
+		aLinePos := itA.pos
+		lb, okB := itB.next()
+		la, okA := itA.next()
+		if okB && okA && bytes.Equal(lb, la) {
+			prefixCount++
+			if ctxCap > 0 {
+				if len(leadSlices) == ctxCap {
+					copy(leadSlices, leadSlices[1:])
+					leadSlices[ctxCap-1] = lb
+				} else {
+					leadSlices = append(leadSlices, lb)
+				}
+			}
+			continue
+		}
+		firstMismatchB, hasB = lb, okB
+		firstMismatchA, hasA = la, okA
+		bMidStart = bLinePos
+		aMidStart = aLinePos
+		break
+	}
+	if !hasB && !hasA {
+		return Result{}
+	}
+
+	// Scan common suffix lines backwards on the unconsumed tails bTrim[bMidStart:] and aTrim[aMidStart:].
+	bTailEnd := len(bTrim)
+	aTailEnd := len(aTrim)
+	var tailSlices [][]byte
+	if ctxCap > 0 {
+		tailSlices = make([][]byte, 0, ctxCap)
+	}
+	for hasB && hasA && bTailEnd > bMidStart && aTailEnd > aMidStart {
+		lb, prevB, okB := prevTrimmedLine(bTrim, bMidStart, bTailEnd)
+		la, prevA, okA := prevTrimmedLine(aTrim, aMidStart, aTailEnd)
+		if !okB || !okA || !bytes.Equal(lb, la) {
+			break
+		}
+		if len(tailSlices) < ctxCap {
+			tailSlices = append(tailSlices, lb)
+		}
+		bTailEnd = prevB
+		aTailEnd = prevA
+	}
+	for i, j := 0, len(tailSlices)-1; i < j; i, j = i+1, j-1 {
+		tailSlices[i], tailSlices[j] = tailSlices[j], tailSlices[i]
+	}
+
+	var h Hunk
+	appendHunkLine := func(dl DiffLine) {
+		if len(h.Lines) >= MaxDiffHunkLines {
+			return
+		}
+		if dl.OldLine > 0 {
+			if h.OldStart == 0 {
+				h.OldStart = dl.OldLine
+			}
+			h.OldCount++
+		}
+		if dl.NewLine > 0 {
+			if h.NewStart == 0 {
+				h.NewStart = dl.NewLine
+			}
+			h.NewCount++
+		}
+		h.Lines = append(h.Lines, dl)
+	}
+
+	ctxStartLine := prefixCount - len(leadSlices) + 1
+	for idx, rawCtx := range leadSlices {
+		ln := ctxStartLine + idx
+		appendHunkLine(DiffLine{
+			Kind:    LineContext,
+			OldLine: ln,
+			NewLine: ln,
+			Text:    capRawLineBytes(rawCtx, MaxDiffLineBytes),
+		})
+	}
+
+	removed := 0
+	if hasB && bTailEnd > bMidStart {
+		midItB := newByteLineIterSlice(bTrim, bMidStart, bTailEnd)
+		for {
+			lb, ok := midItB.next()
+			if !ok {
+				break
+			}
+			removed++
+			appendHunkLine(DiffLine{
+				Kind:    LineDel,
+				OldLine: prefixCount + removed,
+				Text:    capRawLineBytes(lb, MaxDiffLineBytes),
+			})
+		}
+	} else if hasB && bMidStart == len(bTrim) && len(firstMismatchB) == 0 {
+		removed = 1
+		appendHunkLine(DiffLine{
+			Kind:    LineDel,
+			OldLine: prefixCount + 1,
+			Text:    "",
+		})
+	}
+
+	added := 0
+	if hasA && aTailEnd > aMidStart {
+		midItA := newByteLineIterSlice(aTrim, aMidStart, aTailEnd)
+		for {
+			la, ok := midItA.next()
+			if !ok {
+				break
+			}
+			added++
+			appendHunkLine(DiffLine{
+				Kind:    LineAdd,
+				NewLine: prefixCount + added,
+				Text:    capRawLineBytes(la, MaxDiffLineBytes),
+			})
+		}
+	} else if hasA && aMidStart == len(aTrim) && len(firstMismatchA) == 0 {
+		added = 1
+		appendHunkLine(DiffLine{
+			Kind:    LineAdd,
+			NewLine: prefixCount + 1,
+			Text:    "",
+		})
+	}
+
+	if added == 0 && removed == 0 {
+		return Result{}
+	}
+
+	for idx, rawTail := range tailSlices {
+		appendHunkLine(DiffLine{
+			Kind:    LineContext,
+			OldLine: prefixCount + removed + idx + 1,
+			NewLine: prefixCount + added + idx + 1,
+			Text:    capRawLineBytes(rawTail, MaxDiffLineBytes),
+		})
+	}
+
+	annotateIntraline(h.Lines)
+	capHunkLines(h.Lines, MaxDiffLineBytes)
+
+	var hunks []Hunk
+	if len(h.Lines) > 0 {
+		hunks = []Hunk{h}
+	}
+	return Result{
+		Added:     added,
+		Removed:   removed,
+		Hunks:     hunks,
+		Truncated: true,
+	}
+}
+
+type byteLineIter struct {
+	buf  []byte
+	pos  int
+	end  int
+	done bool
+}
+
+func trimTrailingNewlineBytes(raw []byte) []byte {
+	if len(raw) > 0 && raw[len(raw)-1] == '\n' {
+		raw = raw[:len(raw)-1]
+		if len(raw) > 0 && raw[len(raw)-1] == '\r' {
+			raw = raw[:len(raw)-1]
+		}
+	}
+	return raw
+}
+
+func newByteLineIter(raw []byte) byteLineIter {
+	return newByteLineIterFromTrimmed(trimTrailingNewlineBytes(raw))
+}
+
+func newByteLineIterFromTrimmed(trimmed []byte) byteLineIter {
+	if len(trimmed) == 0 {
+		return byteLineIter{done: true}
+	}
+	return byteLineIter{buf: trimmed, pos: 0, end: len(trimmed)}
+}
+
+func newByteLineIterSlice(trimmed []byte, start, end int) byteLineIter {
+	if end < len(trimmed) && end > start && trimmed[end-1] == '\n' {
+		end--
+		if end > start && trimmed[end-1] == '\r' {
+			end--
+		}
+	}
+	if start >= end {
+		return byteLineIter{done: true}
+	}
+	return byteLineIter{buf: trimmed, pos: start, end: end}
+}
+
+func (it *byteLineIter) next() ([]byte, bool) {
+	if it.done {
+		return nil, false
+	}
+	if nl := bytes.IndexByte(it.buf[it.pos:it.end], '\n'); nl >= 0 {
+		line := it.buf[it.pos : it.pos+nl]
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		it.pos += nl + 1
+		return line, true
+	}
+	line := it.buf[it.pos:it.end]
+	if len(line) > 0 && line[len(line)-1] == '\r' {
+		line = line[:len(line)-1]
+	}
+	it.pos = it.end
+	it.done = true
+	return line, true
+}
+
+func prevTrimmedLine(trimmed []byte, minStart, curEnd int) (line []byte, nextEnd int, ok bool) {
+	limit := curEnd
+	if limit < len(trimmed) && limit > minStart && trimmed[limit-1] == '\n' {
+		limit--
+	}
+	if limit <= minStart {
+		return nil, curEnd, false
+	}
+	nl := bytes.LastIndexByte(trimmed[minStart:limit], '\n')
+	if nl < 0 {
+		return nil, curEnd, false
+	}
+	lineStart := minStart + nl + 1
+	l := trimmed[lineStart:limit]
+	if len(l) > 0 && l[len(l)-1] == '\r' {
+		l = l[:len(l)-1]
+	}
+	return l, minStart + nl + 1, true
+}
+
+func capRawLineBytes(raw []byte, maxBytes int) string {
+	if maxBytes <= 0 || len(raw) <= maxBytes {
+		return string(raw)
+	}
+	suffixEst := fmt.Sprintf(" … (+%d bytes)", len(raw))
+	if maxBytes <= len(suffixEst) {
+		cut := utf8SafeCutBytes(raw, maxBytes)
+		return string(raw[:cut])
+	}
+	budget := maxBytes - len(suffixEst)
+	cut := utf8SafeCutBytes(raw, budget)
+	omitted := len(raw) - cut
+	return fmt.Sprintf("%s … (+%d bytes)", string(raw[:cut]), omitted)
+}
+
+func capHunkLines(lines []DiffLine, maxBytes int) bool {
+	anyTruncated := false
+	for i := range lines {
+		if capDiffLine(&lines[i], maxBytes) {
+			anyTruncated = true
+		}
+	}
+	return anyTruncated
+}
+
+func capDiffLine(dl *DiffLine, maxBytes int) bool {
+	if maxBytes <= 0 || len(dl.Text) <= maxBytes {
+		return false
+	}
+	origLen := len(dl.Text)
+	suffixEst := fmt.Sprintf(" … (+%d bytes)", origLen)
+	if maxBytes <= len(suffixEst) {
+		cut := utf8SafeCutString(dl.Text, maxBytes)
+		dl.Text = dl.Text[:cut]
+		dl.Spans = nil
+		return true
+	}
+	budget := maxBytes - len(suffixEst)
+	cut := utf8SafeCutString(dl.Text, budget)
+	omitted := origLen - cut
+	newText := fmt.Sprintf("%s … (+%d bytes)", dl.Text[:cut], omitted)
+
+	if len(dl.Spans) > 0 {
+		var kept []Span
+		hasChanged := false
+		for _, sp := range dl.Spans {
+			if sp.Start >= cut || sp.Start >= sp.End {
+				continue
+			}
+			end := min(sp.End, cut)
+			if end > sp.Start {
+				if sp.Changed {
+					hasChanged = true
+				}
+				kept = append(kept, Span{Start: sp.Start, End: end, Changed: sp.Changed})
+			}
+		}
+		if hasChanged {
+			kept = append(kept, Span{Start: cut, End: len(newText), Changed: false})
+			dl.Spans = kept
+		} else {
+			dl.Spans = nil
+		}
+	}
+	dl.Text = newText
+	return true
+}
+
+func utf8SafeCutString(s string, maxBytes int) int {
+	if maxBytes >= len(s) {
+		return len(s)
+	}
+	if maxBytes <= 0 {
+		return 0
+	}
+	cut := maxBytes
+	for back := 0; back < 3 && cut > 0 && (s[cut]&0xC0) == 0x80; back++ {
+		cut--
+	}
+	for i := max(0, cut-3); i < cut; i++ {
+		if s[i] >= 0xC0 && !utf8.FullRuneInString(s[i:cut]) {
+			cut = i
+			break
+		}
+	}
+	return cut
+}
+
+func utf8SafeCutBytes(b []byte, maxBytes int) int {
+	if maxBytes >= len(b) {
+		return len(b)
+	}
+	if maxBytes <= 0 {
+		return 0
+	}
+	cut := maxBytes
+	for back := 0; back < 3 && cut > 0 && (b[cut]&0xC0) == 0x80; back++ {
+		cut--
+	}
+	for i := max(0, cut-3); i < cut; i++ {
+		if b[i] >= 0xC0 && !utf8.FullRune(b[i:cut]) {
+			cut = i
+			break
+		}
+	}
+	return cut
 }
 
 type rawOp struct {
@@ -161,7 +600,6 @@ type rawOp struct {
 }
 
 func computeEditOps(a, b []string) []rawOp {
-	// Trim identical prefix and suffix first to keep Myers DP tiny on large files.
 	prefix := 0
 	for prefix < len(a) && prefix < len(b) && a[prefix] == b[prefix] {
 		prefix++
@@ -212,7 +650,6 @@ func myersMiddle(a, b []string, oldBase, newBase int) []rawOp {
 		return out
 	}
 
-	// Guard against pathological huge completely-different files.
 	if n+m > MaxMyersWindowLines {
 		return fallbackReplaceOps(a, b, oldBase, newBase)
 	}
@@ -256,7 +693,6 @@ func myersMiddle(a, b []string, oldBase, newBase int) []rawOp {
 		return fallbackReplaceOps(a, b, oldBase, newBase)
 	}
 
-	// Backtrack shortest edit script.
 	var rev []rawOp
 	x, y := n, m
 	for d := foundD; d > 0; d-- {
@@ -289,7 +725,6 @@ func myersMiddle(a, b []string, oldBase, newBase int) []rawOp {
 		rev = append(rev, rawOp{kind: LineContext, oldLine: oldBase + x, newLine: newBase + y, text: a[x]})
 	}
 
-	// Reverse in place.
 	for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
 		rev[i], rev[j] = rev[j], rev[i]
 	}
@@ -336,6 +771,10 @@ func groupIntoHunks(ops []rawOp, ctxLines, maxTotalLines int) ([]Hunk, bool) {
 		sub := ops[r.start:r.end]
 		h := Hunk{}
 		for _, op := range sub {
+			if emitted >= maxTotalLines {
+				truncated = true
+				break
+			}
 			if op.oldLine > 0 {
 				if h.OldStart == 0 {
 					h.OldStart = op.oldLine
@@ -348,17 +787,13 @@ func groupIntoHunks(ops []rawOp, ctxLines, maxTotalLines int) ([]Hunk, bool) {
 				}
 				h.NewCount++
 			}
-			if emitted < maxTotalLines {
-				h.Lines = append(h.Lines, DiffLine{
-					Kind:    op.kind,
-					OldLine: op.oldLine,
-					NewLine: op.newLine,
-					Text:    op.text,
-				})
-				emitted++
-			} else {
-				truncated = true
-			}
+			h.Lines = append(h.Lines, DiffLine{
+				Kind:    op.kind,
+				OldLine: op.oldLine,
+				NewLine: op.newLine,
+				Text:    op.text,
+			})
+			emitted++
 		}
 		if len(h.Lines) > 0 {
 			hunks = append(hunks, h)
@@ -391,6 +826,9 @@ func annotateIntraline(lines []DiffLine) {
 		for p := 0; p < pairs; p++ {
 			dl := &lines[delStart+p]
 			al := &lines[addStart+p]
+			if len(dl.Text) > MaxIntralineBytes || len(al.Text) > MaxIntralineBytes {
+				continue
+			}
 			dSpans, aSpans := computeIntralineSpans(dl.Text, al.Text)
 			dl.Spans = dSpans
 			al.Spans = aSpans
@@ -413,7 +851,6 @@ func computeIntralineSpans(a, b string) ([]Span, []Span) {
 	for suff < len(ar)-pref && suff < len(br)-pref && ar[len(ar)-1-suff] == br[len(br)-1-suff] {
 		suff++
 	}
-	// If almost nothing is shared, skip intraline highlight so the entire line stays uniformly shaded.
 	if pref+suff == 0 || (pref+suff)*5 < min(len(ar), len(br)) {
 		return nil, nil
 	}

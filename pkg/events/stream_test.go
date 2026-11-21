@@ -11,7 +11,6 @@ func TestLiveStreamOrderingUTF8SplitAndRingCoalesce(t *testing.T) {
 	hub := NewHub(5)
 	hub.SetAlwaysRecord(true)
 
-	// Pre-fill ring with an earlier CRUD event that must NOT be evicted by 30 stream chunks.
 	hub.Emit(Event{Kind: KindFileCreate, Tool: "fs.write", Path: "keep.go", Status: "ok"})
 
 	ch, _, cancel := hub.Subscribe("", 0, 0)
@@ -28,26 +27,22 @@ func TestLiveStreamOrderingUTF8SplitAndRingCoalesce(t *testing.T) {
 		return "running · " + FormatBytes(n)
 	})
 
-	// Early bytes before EmitStart are folded cleanly into start event.
 	_, _ = ls.Write([]byte("boot\r\n"))
 	ls.EmitStart("task-1 · running")
 
-	// Split a 3-byte Chinese UTF-8 rune ("中" = E4 B8 AD) across two writes + CRLF split!
 	raw := []byte("进度中\r\n")
-	_, _ = ls.Write(raw[:7]) // splits right inside '中' (bytes 6..8)
+	_, _ = ls.Write(raw[:7])
 	ls.Flush()
-	_, _ = ls.Write(raw[7 : len(raw)-1]) // finishes '中' and ends with '\r'
+	_, _ = ls.Write(raw[7 : len(raw)-1])
 	ls.Flush()
-	_, _ = ls.Write(raw[len(raw)-1:]) // trailing '\n'
+	_, _ = ls.Write(raw[len(raw)-1:])
 	ls.Flush()
 
-	// Emit 30 additional chunks to verify ring buffer does NOT evict keep.go.
 	for i := 0; i < 30; i++ {
 		_, _ = ls.Write([]byte("tick line\n"))
 		ls.Flush()
 	}
 
-	// Late-attaching subscriber BEFORE EmitEnd should see keep.go + 1 running task with accumulated Detail!
 	recentRunning := hub.Recent("", 10, 0)
 	if len(recentRunning) != 2 {
 		t.Fatalf("expected 2 ring entries (create + coalesced running task), got %d", len(recentRunning))
@@ -59,7 +54,8 @@ func TestLiveStreamOrderingUTF8SplitAndRingCoalesce(t *testing.T) {
 		t.Fatalf("expected valid coalesced UTF-8 detail with '进度中\\n', got %q", recentRunning[1].Detail)
 	}
 
-	// Now finish stream.
+	_, _ = ls.Write([]byte("trailing_unflushed_tail\n"))
+
 	ec := 0
 	ls.EmitEnd(Event{
 		Kind:       KindTask,
@@ -70,11 +66,10 @@ func TestLiveStreamOrderingUTF8SplitAndRingCoalesce(t *testing.T) {
 		Status:     "completed",
 		ExitCode:   &ec,
 		Summary:    "task-1 · completed (exit=0)",
-		Detail:     "boot\n进度中\nfinal\n",
+		Detail:     "boot\n进度中\ntrailing_unflushed_tail\nfinal\n",
 		DetailKind: "shell",
 	})
 
-	// Verify live subscriber got strictly ordered start -> chunks -> completed.
 	var received []Event
 	timeout := time.After(500 * time.Millisecond)
 drain:
@@ -105,13 +100,67 @@ drain:
 		}
 		chunkJoined.WriteString(ev.Detail)
 	}
-	if !strings.Contains(chunkJoined.String(), "进度中\n") {
-		t.Fatalf("expected joined chunks to contain '进度中\\n', got %q", chunkJoined.String())
+	if !strings.Contains(chunkJoined.String(), "进度中\n") || !strings.Contains(chunkJoined.String(), "trailing_unflushed_tail\n") {
+		t.Fatalf("expected joined chunks to contain '进度中\\n' and 'trailing_unflushed_tail\\n', got %q", chunkJoined.String())
 	}
 
-	// Ring after completion should still have 2 entries: keep.go + completed task (not duplicate running).
 	recentDone := hub.Recent("", 10, 0)
 	if len(recentDone) != 2 || recentDone[1].Status != "completed" {
 		t.Fatalf("expected 2 ring entries ending with completed task, got %+v", recentDone)
+	}
+}
+
+func TestLiveStreamPendingCapAndLateHubActivation(t *testing.T) {
+	hub := NewHub(10)
+	ls := NewLiveStream(hub, Event{
+		Kind:       KindShell,
+		RunID:      "sh-1",
+		StreamID:   "sh-1",
+		Tool:       "sh.exec",
+		Title:      "noisy command",
+		DetailKind: "shell",
+	}, time.Hour, 1024*1024, nil)
+
+	ls.EmitStart("running")
+	ch, _, cancel := hub.Subscribe("", 0, 0)
+	defer cancel()
+
+	lsUnstarted := NewLiveStream(hub, Event{Kind: KindShell, StreamID: "sh-unstarted", Tool: "sh.exec"}, time.Hour, 1024*1024, nil)
+	bigChunk := []byte(strings.Repeat("全部加载_0123456789\n", 10_000))
+	_, _ = lsUnstarted.Write(bigChunk)
+	lsUnstarted.bufMu.Lock()
+	pendLen := len(lsUnstarted.pending)
+	pendValid := utf8.Valid(lsUnstarted.pending)
+	lsUnstarted.bufMu.Unlock()
+	if pendLen > MaxPendingStreamBytes {
+		t.Fatalf("expected unstarted pending capped at %d, got %d", MaxPendingStreamBytes, pendLen)
+	}
+	if !pendValid {
+		t.Fatal("expected UTF-8-aligned pending tail cap")
+	}
+
+	_, _ = ls.Write([]byte("midstream_hello\n"))
+	ls.EmitEnd(Event{Kind: KindShell, RunID: "sh-1", StreamID: "sh-1", Tool: "sh.exec", Status: "ok"})
+
+	var gotStart, gotEnd bool
+	for {
+		select {
+		case ev := <-ch:
+			if ev.Status == "running" {
+				gotStart = true
+			}
+			if ev.Status == "ok" {
+				gotEnd = true
+				if !strings.Contains(ev.Detail, "midstream_hello\n") {
+					t.Fatalf("expected preserved streamed detail on final event, got %q", ev.Detail)
+				}
+			}
+		default:
+			goto done
+		}
+	}
+done:
+	if !gotStart || !gotEnd {
+		t.Fatalf("expected deferred start + terminal end on mid-stream hub activation: start=%v end=%v", gotStart, gotEnd)
 	}
 }

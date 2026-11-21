@@ -82,3 +82,98 @@ return { doc1, doc2, tmpl, re: re.source, v };`
 		t.Fatalf("expected PayloadError for missing optional/bracket keys, got: %v", err)
 	}
 }
+
+func TestCompilePreservesImportsInsideMultilineTemplateLiteralsAndComments(t *testing.T) {
+	code := "import { join } from \"path\";\n" +
+		"const generatedFile = `// header\n" +
+		"import { join } from \"path\";\n" +
+		"import type { Bar } from \"./types\";\n" +
+		"import fs from \"node:fs\";\n" +
+		"export const x = ${join(\"a\", \"b\")};\n" +
+		"`;\n" +
+		"/*\n" +
+		"import { createHash } from \"crypto\";\n" +
+		"import type { Hidden } from \"./hidden\";\n" +
+		"*/\n" +
+		"return { generatedFile, p: join(\"x\", \"y\") };"
+
+	res, err := Compile(code, nil)
+	if err != nil {
+		t.Fatalf("unexpected compile error: %v", err)
+	}
+	// The template literal text MUST still contain the literal `import { join } from "path";` and `import type { Bar }` lines!
+	if !strings.Contains(res.JSCode, `import { join } from "path";`) {
+		t.Fatalf("import line inside template literal was corrupted:\n%s", res.JSCode)
+	}
+	if !strings.Contains(res.JSCode, `import type { Bar } from "./types";`) {
+		t.Fatalf("import type line inside template literal was stripped:\n%s", res.JSCode)
+	}
+	if !strings.Contains(res.JSCode, `import fs from "node:fs";`) {
+		t.Fatalf("default import line inside template literal was corrupted:\n%s", res.JSCode)
+	}
+	// Meanwhile top-level line 1 MUST have been rewritten to sandbox path shim!
+	if !strings.Contains(res.JSCode, "(globalThis).path") && !strings.Contains(res.JSCode, "globalThis.path") {
+		t.Fatalf("top-level import { join } from 'path' was not rewritten:\n%s", res.JSCode)
+	}
+}
+
+func TestCompileRegexVsDivisionDisambiguation(t *testing.T) {
+	cases := []string{
+		`const m = new Map([["a", 10]]); const x = m.get("a")! / 2 + P.missingAfterDiv / 2; return x;`,
+		`let n = 4; const x = n++ / 2 + n-- / 2 + P.missingAfterDiv / 2; return x;`,
+		`const arr = [10]; const x = (arr[0]) / 2 + arr[0] / 2 + ({ a: 4 } as any) / 2 + P.missingAfterDiv / 2; return x;`,
+		`const x = (true as any) / 2 + (false as any) / 2 + (null as any) / 2 + (this as any) / 2 + 10 / 2 + P.missingAfterDiv / 2; return x;`,
+	}
+	for i, code := range cases {
+		_, err := Compile(code, nil)
+		if err == nil || !strings.Contains(err.Error(), "missingAfterDiv") {
+			t.Fatalf("case %d: expected missingAfterDiv to be detected after division, got err=%v", i, err)
+		}
+	}
+
+	// Prefix `!` before regex literal `!/P\.ignoredRegex/` MUST still be parsed as regex!
+	prefixRegexCode := `const ok = !/P\.ignoredRegex/.test("abc"); return ok;`
+	if _, err := Compile(prefixRegexCode, nil); err != nil {
+		t.Fatalf("prefix !/regex/ should not trigger PayloadError: %v", err)
+	}
+}
+
+func TestCompileShadowedPayloadIdentifiersDoNotTriggerFalsePayloadError(t *testing.T) {
+	shadowedCode := `
+function withFn(payloads: { localA: string }, { P }: { P: { localB: string } }) {
+	return payloads.localA + P.localB;
+}
+const arrowParen = (payloads: Record<string, string>): string => payloads.localArrow;
+const arrowBare = [{ localItem: "x" }].map(P => P.localItem);
+const objMethod = {
+	run(payloads: any) {
+		return payloads.localMethod;
+	}
+};
+for (const P of [{ inLoop: 1 }]) {
+	void P.inLoop;
+}
+try {
+	throw { inCatch: "ok" };
+} catch (P: any) {
+	void P.inCatch;
+}
+{
+	const payloads = { blockLocal: 123 };
+	const [P] = [{ destructured: 456 }];
+	void payloads.blockLocal;
+	void P.destructured;
+}
+return { arrowParen: typeof arrowParen, arrowBare, objMethod: typeof objMethod, real: P.providedKey };
+`
+	if _, err := Compile(shadowedCode, map[string]string{"providedKey": "yes"}); err != nil {
+		t.Fatalf("shadowed P/payloads triggered false PayloadError: %v", err)
+	}
+
+	// Unshadowed reference right after an ASI expression-bodied arrow MUST still be caught!
+	unshadowedAfterArrow := "const f = (P: any) => P.shadowed\nreturn P.realMissing"
+	_, err := Compile(unshadowedAfterArrow, nil)
+	if err == nil || !strings.Contains(err.Error(), "realMissing") || strings.Contains(err.Error(), "shadowed") {
+		t.Fatalf("expected PayloadError only for realMissing after arrow scope ended, got: %v", err)
+	}
+}

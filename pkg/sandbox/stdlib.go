@@ -205,10 +205,10 @@ func extractGoBytes(vm *goja.Runtime, val goja.Value) []byte {
 			if lenVal := obj.Get("byteLength"); lenVal != nil && !goja.IsUndefined(lenVal) {
 				length = int(lenVal.ToInteger())
 			}
-			if offset >= 0 && length >= 0 && offset+length <= len(raw) {
+			if offset >= 0 && length >= 0 && offset <= len(raw) && length <= len(raw)-offset {
 				return raw[offset : offset+length]
 			}
-			return raw
+			return nil
 		}
 	}
 	if lenVal := obj.Get("length"); lenVal != nil && !goja.IsUndefined(lenVal) {
@@ -299,7 +299,7 @@ func encodeStringBytes(str, enc string) ([]byte, error) {
 func decodeBytesToString(data []byte, enc string) (string, error) {
 	switch normalizeEncodingName(enc) {
 	case "utf8":
-		return string(data), nil
+		return strings.ToValidUTF8(string(data), "�"), nil
 	case "base64":
 		return base64.StdEncoding.EncodeToString(data), nil
 	case "base64url":

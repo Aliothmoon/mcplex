@@ -3,8 +3,13 @@ package tui
 import (
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"unicode"
+	"unicode/utf8"
 )
+
+// highlightRenderCalls counts full line-slice syntax highlight passes (used by unit tests to verify render caching).
+var highlightRenderCalls atomic.Int64
 
 type langSpec struct {
 	keywords      map[string]bool
@@ -184,7 +189,6 @@ func detectLang(filePath, detailKind, tool, sample string) string {
 		return "css"
 	}
 
-	// Content-sniff fallback (e.g. JSON or Markdown payloads without a file extension)
 	trimmed := strings.TrimSpace(sample)
 	if (strings.HasPrefix(trimmed, "{") && strings.Contains(trimmed, `":`)) ||
 		(strings.HasPrefix(trimmed, "[") && strings.Contains(trimmed, `"`)) {
@@ -238,6 +242,7 @@ func normalizeFenceLang(raw string) string {
 // highlightLines highlights a whole document slice, preserving stateful constructs such as
 // Markdown fenced code blocks (```ts / ```go / ```json) across lines.
 func highlightLines(lines []string, lang string) []string {
+	highlightRenderCalls.Add(1)
 	out := make([]string, len(lines))
 	if lang == "markdown" {
 		inFence := false
@@ -360,7 +365,6 @@ func highlightCodeWithSpec(line string, spec langSpec) string {
 		return ""
 	}
 	trimmed := strings.TrimSpace(line)
-	// C/C++ preprocessor directives (#include, #define, #ifdef) or Rust attributes (#[derive(...)])
 	if spec.slashComment && (strings.HasPrefix(trimmed, "#include") || strings.HasPrefix(trimmed, "#define") || strings.HasPrefix(trimmed, "#if") || strings.HasPrefix(trimmed, "#end") || strings.HasPrefix(trimmed, "#[")) {
 		return styleSynKeyword.Render(line)
 	}
@@ -372,7 +376,6 @@ func highlightCodeWithSpec(line string, spec langSpec) string {
 	for i < n {
 		ch := r[i]
 
-		// Line comments: //, #, --
 		if spec.slashComment && ch == '/' && i+1 < n && r[i+1] == '/' {
 			b.WriteString(styleSynComment.Render(string(r[i:])))
 			break
@@ -385,7 +388,6 @@ func highlightCodeWithSpec(line string, spec langSpec) string {
 			b.WriteString(styleSynComment.Render(string(r[i:])))
 			break
 		}
-		// Inline block comment /* ... */
 		if spec.slashComment && ch == '/' && i+1 < n && r[i+1] == '*' {
 			end := i + 2
 			for end+1 < n && !(r[end] == '*' && r[end+1] == '/') {
@@ -400,7 +402,6 @@ func highlightCodeWithSpec(line string, spec langSpec) string {
 			i = end
 			continue
 		}
-		// Decorators / annotations (@decorator, @Override)
 		if spec.decoratorChar != 0 && ch == spec.decoratorChar && i+1 < n && isIdentStart(r[i+1]) {
 			end := i + 2
 			for end < n && (isIdentRune(r[end]) || r[end] == '.') {
@@ -410,7 +411,6 @@ func highlightCodeWithSpec(line string, spec langSpec) string {
 			i = end
 			continue
 		}
-		// String / char / raw template literals
 		if ch == '"' || ch == '\'' || (spec.backtickStr && ch == '`') {
 			quote := ch
 			end := i + 1
@@ -429,7 +429,6 @@ func highlightCodeWithSpec(line string, spec langSpec) string {
 			i = end
 			continue
 		}
-		// Numeric literal
 		if unicode.IsDigit(ch) && (i == 0 || !isIdentRune(r[i-1])) {
 			end := i + 1
 			for end < n && (unicode.IsDigit(r[end]) || r[end] == '.' || r[end] == '_' || r[end] == 'x' || r[end] == 'X' || (r[end] >= 'a' && r[end] <= 'f') || (r[end] >= 'A' && r[end] <= 'F')) {
@@ -439,7 +438,6 @@ func highlightCodeWithSpec(line string, spec langSpec) string {
 			i = end
 			continue
 		}
-		// Identifier / keyword / builtin / method call / Rust macro!
 		if isIdentStart(ch) {
 			end := i + 1
 			for end < n && isIdentRune(r[end]) {
@@ -467,7 +465,6 @@ func highlightCodeWithSpec(line string, spec langSpec) string {
 			i = end
 			continue
 		}
-		// Punctuation & operators
 		if strings.ContainsRune("{}[]().,:;=>+-*/!&|?<>~^%", ch) {
 			end := i + 1
 			for end < n && strings.ContainsRune("{}[]().,:;=>+-*/!&|?<>~^%", r[end]) {
@@ -483,7 +480,6 @@ func highlightCodeWithSpec(line string, spec langSpec) string {
 			i = end
 			continue
 		}
-		// Whitespace or other runes
 		end := i + 1
 		for end < n && unicode.IsSpace(r[end]) {
 			end++
@@ -494,7 +490,6 @@ func highlightCodeWithSpec(line string, spec langSpec) string {
 	return b.String()
 }
 
-// highlightKVConfigLine colors YAML, TOML, INI, and .env files cleanly.
 func highlightKVConfigLine(line string) string {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
@@ -503,16 +498,13 @@ func highlightKVConfigLine(line string) string {
 	if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
 		return styleSynComment.Render(line)
 	}
-	// TOML / INI [section.header]
 	if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
 		return styleSynKeyword.Render(line)
 	}
-	// YAML document markers --- / ...
 	if trimmed == "---" || trimmed == "..." {
 		return styleSynPunct.Render(line)
 	}
 
-	// Find key separator (`:` for YAML or `=` for TOML/ENV)
 	sepIdx := -1
 	sepChar := byte(0)
 	inQuote := byte(0)
@@ -538,7 +530,6 @@ func highlightKVConfigLine(line string) string {
 		}
 	}
 	if sepIdx < 0 {
-		// YAML list item `- value`
 		if idx := strings.Index(line, "- "); idx >= 0 && strings.TrimSpace(line[:idx]) == "" {
 			return line[:idx] + styleSynPunct.Render("- ") + highlightScalarValue(line[idx+2:])
 		}
@@ -547,7 +538,6 @@ func highlightKVConfigLine(line string) string {
 
 	keyPart := line[:sepIdx]
 	valPart := line[sepIdx+1:]
-	// Preserve YAML leading `- ` before key
 	prefix := ""
 	if idx := strings.Index(keyPart, "- "); idx >= 0 && strings.TrimSpace(keyPart[:idx]) == "" {
 		prefix = keyPart[:idx] + styleSynPunct.Render("- ")
@@ -560,7 +550,6 @@ func highlightScalarValue(raw string) string {
 	if raw == "" {
 		return ""
 	}
-	// Split trailing # comment if outside quotes
 	commentPart := ""
 	inQ := byte(0)
 	for i := 0; i < len(raw); i++ {
@@ -664,7 +653,6 @@ func highlightMarkdownLine(line string) string {
 
 	var b strings.Builder
 	i := 0
-	// Leading bullet / table pipe styling
 	lead := len(line) - len(strings.TrimLeft(line, " \t"))
 	if lead > 0 {
 		b.WriteString(line[:lead])
@@ -676,7 +664,6 @@ func highlightMarkdownLine(line string) string {
 	}
 
 	for i < len(line) {
-		// Inline `code`
 		if line[i] == '`' {
 			if end := strings.IndexByte(line[i+1:], '`'); end >= 0 {
 				b.WriteString(styleSynGlobal.Render(line[i : i+1+end+1]))
@@ -684,7 +671,6 @@ func highlightMarkdownLine(line string) string {
 				continue
 			}
 		}
-		// **bold**
 		if strings.HasPrefix(line[i:], "**") {
 			if end := strings.Index(line[i+2:], "**"); end >= 0 {
 				b.WriteString(styleGroupText.Render(line[i+2 : i+2+end]))
@@ -692,27 +678,32 @@ func highlightMarkdownLine(line string) string {
 				continue
 			}
 		}
-		// URLs
+		// URLs: decode full UTF-8 runes so multi-byte characters with 0x85/0xA0 continuation bytes (e.g. '全', '加') never split!
 		if strings.HasPrefix(line[i:], "https://") || strings.HasPrefix(line[i:], "http://") {
 			end := i
-			for end < len(line) && !unicode.IsSpace(rune(line[end])) && line[end] != ')' && line[end] != ']' {
-				end++
+			for end < len(line) {
+				r, w := utf8.DecodeRuneInString(line[end:])
+				if unicode.IsSpace(r) || r == ')' || r == ']' {
+					break
+				}
+				end += w
 			}
 			b.WriteString(styleSynURL.Render(line[i:end]))
 			i = end
 			continue
 		}
+		_, firstW := utf8.DecodeRuneInString(line[i:])
 		start := i
-		i++
+		i += firstW
 		for i < len(line) && line[i] != '`' && line[i] != '*' && line[i] != 'h' {
-			i++
+			_, rw := utf8.DecodeRuneInString(line[i:])
+			i += rw
 		}
 		b.WriteString(styleDiffCtx.Render(line[start:i]))
 	}
 	return b.String()
 }
 
-// highlightHTMLLine colors HTML/XML/SVG/Vue tags, attributes, values, and comments.
 func highlightHTMLLine(line string) string {
 	var b strings.Builder
 	i := 0
@@ -755,7 +746,6 @@ func highlightHTMLTag(tag string) string {
 	}
 	var b strings.Builder
 	i := 0
-	// '<' or '</'
 	if strings.HasPrefix(tag, "</") {
 		b.WriteString(styleSynPunct.Render("</"))
 		i = 2
@@ -763,7 +753,6 @@ func highlightHTMLTag(tag string) string {
 		b.WriteString(styleSynPunct.Render("<"))
 		i = 1
 	}
-	// Tag name
 	nameStart := i
 	for i < len(tag) && tag[i] != ' ' && tag[i] != '\t' && tag[i] != '>' && tag[i] != '/' {
 		i++
@@ -771,7 +760,6 @@ func highlightHTMLTag(tag string) string {
 	if i > nameStart {
 		b.WriteString(styleSynKeyword.Render(tag[nameStart:i]))
 	}
-	// Attributes & values
 	for i < len(tag) {
 		c := tag[i]
 		if c == '>' || c == '/' {
@@ -811,7 +799,6 @@ func highlightHTMLTag(tag string) string {
 	return b.String()
 }
 
-// highlightCSSLine styles CSS selectors, properties, hex colors, and numbers.
 func highlightCSSLine(line string) string {
 	trimmed := strings.TrimSpace(line)
 	if strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "*") || strings.HasPrefix(trimmed, "//") {
@@ -828,12 +815,10 @@ func highlightCSSLine(line string) string {
 	return styleDiffCtx.Render(line)
 }
 
-// highlightSearchHitLine styles `file.go:42: matched code` with colored path, line number, and language-aware snippet!
 func highlightSearchHitLine(line string) string {
 	if strings.HasPrefix(strings.TrimSpace(line), "... (+") {
 		return styleDim.Render(line)
 	}
-	// Find `:digits:` separator (handling Windows drive letters like C:\... safely by scanning from index 2)
 	scanStart := 0
 	if len(line) >= 2 && line[1] == ':' {
 		scanStart = 2
@@ -862,7 +847,6 @@ func highlightSearchHitLine(line string) string {
 		highlightLineByLang(codePart, lang)
 }
 
-// highlightOutputLine styles MCPlex result envelopes, pretty JSON, and structured output lines.
 func highlightOutputLine(line string) string {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
@@ -930,28 +914,38 @@ func highlightShellLine(line string) string {
 		}
 		if strings.HasPrefix(line[i:], "https://") || strings.HasPrefix(line[i:], "http://") {
 			end := i
-			for end < len(line) && !unicode.IsSpace(rune(line[end])) && line[end] != ')' && line[end] != '"' && line[end] != '\'' {
-				end++
+			for end < len(line) {
+				r, w := utf8.DecodeRuneInString(line[end:])
+				if unicode.IsSpace(r) || r == ')' || r == '"' || r == '\'' {
+					break
+				}
+				end += w
 			}
 			b.WriteString(styleSynURL.Render(line[i:end]))
 			i = end
 			continue
 		}
-		// $VAR / ${VAR} environment variables
-		if line[i] == '$' && i+1 < len(line) && (isIdentStart(rune(line[i+1])) || line[i+1] == '{') {
-			end := i + 1
-			if line[end] == '{' {
-				if closeBrace := strings.IndexByte(line[end:], '}'); closeBrace > 0 {
-					end += closeBrace + 1
+		if line[i] == '$' && i+1 < len(line) {
+			nextR, _ := utf8.DecodeRuneInString(line[i+1:])
+			if isIdentStart(nextR) || line[i+1] == '{' {
+				end := i + 1
+				if line[end] == '{' {
+					if closeBrace := strings.IndexByte(line[end:], '}'); closeBrace > 0 {
+						end += closeBrace + 1
+					}
+				} else {
+					for end < len(line) {
+						r, w := utf8.DecodeRuneInString(line[end:])
+						if !isIdentRune(r) {
+							break
+						}
+						end += w
+					}
 				}
-			} else {
-				for end < len(line) && isIdentRune(rune(line[end])) {
-					end++
-				}
+				b.WriteString(styleSynNumber.Render(line[i:end]))
+				i = end
+				continue
 			}
-			b.WriteString(styleSynNumber.Render(line[i:end]))
-			i = end
-			continue
 		}
 		if isWordBoundary(line, i) {
 			if hasWord(line, i, "PASS") || hasWord(line, i, "OK") {
@@ -973,10 +967,12 @@ func highlightShellLine(line string) string {
 				continue
 			}
 		}
+		_, firstW := utf8.DecodeRuneInString(line[i:])
 		start := i
-		i++
+		i += firstW
 		for i < len(line) && line[i] != '[' && line[i] != '$' && line[i] != 'h' && line[i] != 'P' && line[i] != 'O' && line[i] != 'F' && line[i] != 'E' {
-			i++
+			_, rw := utf8.DecodeRuneInString(line[i:])
+			i += rw
 		}
 		b.WriteString(styleDiffCtx.Render(line[start:i]))
 	}
@@ -1083,7 +1079,7 @@ func isWordBoundary(s string, i int) bool {
 	if i == 0 {
 		return true
 	}
-	prev := rune(s[i-1])
+	prev, _ := utf8.DecodeLastRuneInString(s[:i])
 	return !unicode.IsLetter(prev) && !unicode.IsDigit(prev) && prev != '_' && prev != '-'
 }
 
@@ -1095,6 +1091,6 @@ func hasWord(s string, i int, word string) bool {
 	if end >= len(s) {
 		return true
 	}
-	next := rune(s[end])
+	next, _ := utf8.DecodeRuneInString(s[end:])
 	return !unicode.IsLetter(next) && !unicode.IsDigit(next) && next != '_' && next != '-'
 }

@@ -40,8 +40,11 @@ func Paginate(text string, size int) []Page {
 				flush(n - 1)
 			}
 			cut := size
-			for cut > 0 && !utf8.RuneStart(line[cut]) {
+			for steps := 0; steps < utf8.UTFMax-1 && cut > 0 && !utf8.RuneStart(line[cut]); steps++ {
 				cut--
+			}
+			if cut <= 0 || !utf8.RuneStart(line[cut]) {
+				cut = size
 			}
 			cur.WriteString(line[:cut])
 			pages = append(pages, Page{Text: cur.String(), FirstLine: n, LastLine: n})
@@ -98,12 +101,19 @@ func quoteJSKey(k string) string {
 
 // MarshalPretty renders a value as indented JSON (no HTML escaping) so it pages line by line.
 func MarshalPretty(val any) string {
+	if val == nil {
+		return "null"
+	}
 	if s, ok := val.(string); ok {
 		return s
 	}
 	out, err := marshalNoEscapeHTML(val, true)
 	if err != nil {
-		return fmt.Sprintf("%v", val)
+		scrubbed := sanitizeForJSON(val)
+		out, err = marshalNoEscapeHTML(scrubbed, true)
+		if err != nil {
+			return marshalFallbackError(err)
+		}
 	}
 	return out
 }

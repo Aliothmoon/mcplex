@@ -62,3 +62,19 @@ func TestProgressiveDisclosureSizesAndLookup(t *testing.T) {
 		t.Fatalf("FullGuideForTools missing expected sections")
 	}
 }
+
+func TestToolsetOmitsDocsWhenDisabled(t *testing.T) {
+	instr := InstructionsForToolset(false, false, false)
+	if strings.Contains(instr, "docs(") || strings.Contains(instr, "- `docs`") {
+		t.Fatalf("expected InstructionsForToolset(false,false,false) to omit disabled docs tool, got:\n%s", instr)
+	}
+	desc := CompactExecDescriptionForToolset(9600, false, false, false)
+	if strings.Contains(desc, "docs(") {
+		t.Fatalf("expected CompactExecDescriptionForToolset(..., false) to omit disabled docs tool, got:\n%s", desc)
+	}
+	guide := FullGuideForToolset(false, false, false)
+	firstLine, _, _ := strings.Cut(guide, "\n")
+	if strings.Contains(firstLine, "`docs`") {
+		t.Fatalf("expected FullGuideForToolset(false,false,false) header to omit docs tool, got: %s", firstLine)
+	}
+}

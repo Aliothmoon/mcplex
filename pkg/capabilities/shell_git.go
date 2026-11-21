@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aliothmoon/mcplex/internal/shellcmd"
 	"github.com/aliothmoon/mcplex/pkg/events"
 	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/policy"
@@ -125,7 +126,11 @@ func (b *ShellGitBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
-			out, dropped, err := runReadOnlyGitSoft(ctx, repoDir, append([]string{"diff"}, extra...))
+			gitArgs := append([]string{"diff"}, extra...)
+			if err := b.validateGitReadPaths(repoDir, gitArgs); err != nil {
+				return nil, err
+			}
+			out, dropped, err := runReadOnlyGitSoft(ctx, repoDir, gitArgs)
 			return gitText(env, "git.diff", out, dropped, err)
 		},
 		"log": func(ctx context.Context, args []any) (any, error) {
@@ -139,7 +144,11 @@ func (b *ShellGitBinder) Bind(env *sandbox.ExecutionEnv) error {
 				// Object form keeps the concise defaults unless overridden: git.log({ n: 5 }) -> 5 oneline entries.
 				extra = withLogDefaults(extra)
 			}
-			out, dropped, err := runReadOnlyGitSoft(ctx, repoDir, append([]string{"log"}, extra...))
+			gitArgs := append([]string{"log"}, extra...)
+			if err := b.validateGitReadPaths(repoDir, gitArgs); err != nil {
+				return nil, err
+			}
+			out, dropped, err := runReadOnlyGitSoft(ctx, repoDir, gitArgs)
 			return gitText(env, "git.log", out, dropped, err)
 		},
 		"show": func(ctx context.Context, args []any) (any, error) {
@@ -150,7 +159,11 @@ func (b *ShellGitBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if len(extra) == 0 {
 				extra = []string{"--stat", "HEAD"}
 			}
-			out, dropped, err := runReadOnlyGitSoft(ctx, repoDir, append([]string{"show"}, extra...))
+			gitArgs := append([]string{"show"}, extra...)
+			if err := b.validateGitReadPaths(repoDir, gitArgs); err != nil {
+				return nil, err
+			}
+			out, dropped, err := runReadOnlyGitSoft(ctx, repoDir, gitArgs)
 			return gitText(env, "git.show", out, dropped, err)
 		},
 		"branch": func(ctx context.Context, args []any) (any, error) {
@@ -209,6 +222,9 @@ func (b *ShellGitBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if len(tokens) > 0 && tokens[0] == "git" {
 				tokens = tokens[1:]
 			}
+			if err := b.validateGitReadPaths(repoDir, tokens); err != nil {
+				return nil, err
+			}
 			out, dropped, err := runReadOnlyGitSoft(ctx, repoDir, tokens)
 			return gitText(env, "git.query", out, dropped, err)
 		},
@@ -265,10 +281,12 @@ func (b *ShellGitBinder) RunSingleCommandDuration(parentCtx context.Context, cwd
 
 // runShell runs cmdLine through `shell` ("" = platform default) with optional extra environment variables.
 func (b *ShellGitBinder) runShell(parentCtx context.Context, toolName, cwd, cmdLine string, timeoutDur time.Duration, settle, compact bool, shell string, extraEnv map[string]any) (map[string]any, error) {
-	if err := b.Policy.CheckCommand(cmdLine); err != nil {
-		return nil, err
+	if b.Policy != nil {
+		if err := b.Policy.CheckCommand(cmdLine); err != nil {
+			return nil, err
+		}
 	}
-	shellExe, shellArgs, err := resolveShell(shell)
+	shellExe, shellArgs, dialect, err := resolveShellFull(shell)
 	if err != nil {
 		return nil, err
 	}
@@ -282,9 +300,10 @@ func (b *ShellGitBinder) runShell(parentCtx context.Context, toolName, cwd, cmdL
 	defer cancel()
 
 	start := time.Now()
-	cmd := exec.CommandContext(ctx, shellExe, append(shellArgs, cmdLine)...)
+	cmd := shellcmd.BuildResolvedCommand(ctx, shellExe, shellArgs, dialect, cmdLine)
 	cmd.Dir = cwd
 	setSysProcAttrHide(cmd)
+	shellcmd.ConfigureCmdLine(cmd, dialect, shellExe, cmdLine)
 	if len(extraEnv) > 0 {
 		cmd.Env = mergeEnv(extraEnv)
 	}
@@ -321,7 +340,10 @@ func (b *ShellGitBinder) runShell(parentCtx context.Context, toolName, cwd, cmdL
 	parentErr := parentCtx.Err()
 	parentTimedOut := errors.Is(parentErr, context.DeadlineExceeded)
 	parentAborted := parentErr != nil && !parentTimedOut
-	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(runErr, exec.ErrWaitDelay) || parentTimedOut
+	if errors.Is(runErr, exec.ErrWaitDelay) && ctx.Err() == nil && parentErr == nil && cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 0 {
+		runErr = nil
+	}
+	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded) || parentTimedOut
 	exitCode := 0
 	spawnErr := ""
 
@@ -331,6 +353,8 @@ func (b *ShellGitBinder) runShell(parentCtx context.Context, toolName, cwd, cmdL
 			exitCode = -1
 		} else if errors.As(runErr, &exitErr) {
 			exitCode = exitErr.ExitCode()
+		} else if errors.Is(runErr, exec.ErrWaitDelay) && ctx.Err() == nil && cmd.ProcessState != nil {
+			exitCode = cmd.ProcessState.ExitCode()
 		} else {
 			exitCode = -1
 			spawnErr = runErr.Error()
@@ -626,7 +650,7 @@ var (
 	gitTagListShort = "li"
 )
 
-// validateReadOnlyGitArgs rejects any git invocation that could mutate the repository or execute helpers.
+// validateReadOnlyGitArgs rejects any git invocation that could mutate the repository, read outside the repo, or execute helpers.
 func validateReadOnlyGitArgs(gitArgs []string) error {
 	if len(gitArgs) == 0 {
 		return errors.New("git subcommand required")
@@ -638,8 +662,20 @@ func validateReadOnlyGitArgs(gitArgs []string) error {
 	}
 	rest := gitArgs[1:]
 	for _, a := range rest {
-		if strings.HasPrefix(a, "--upload-pack") || strings.HasPrefix(a, "--exec") || strings.HasPrefix(a, "--output") ||
-			strings.HasPrefix(a, "--ext-diff") || strings.HasPrefix(a, "--open-files-in-pager") {
+		if a == "--" {
+			break
+		}
+		if a == "--no-index" ||
+			a == "--contents" || strings.HasPrefix(a, "--contents=") ||
+			a == "-O" || strings.HasPrefix(a, "-O") || strings.HasPrefix(a, "--orderfile") ||
+			a == "--textconv" ||
+			a == "--ext-diff" ||
+			a == "--output" || strings.HasPrefix(a, "--output=") ||
+			strings.HasPrefix(a, "--upload-pack") ||
+			strings.HasPrefix(a, "--exec") ||
+			strings.HasPrefix(a, "--open-files-in-pager") ||
+			strings.HasPrefix(a, "--git-dir") ||
+			strings.HasPrefix(a, "--work-tree") {
 			return fmt.Errorf("disallowed git flag '%s' in read-only git query", a)
 		}
 	}
@@ -667,6 +703,99 @@ func validateReadOnlyGitArgs(gitArgs []string) error {
 		return fmt.Errorf("only read-only 'git remote [-v]', 'git remote show' and 'git remote get-url' are allowed in git.* (got '%s')", rest[i])
 	}
 	return nil
+}
+
+var gitFlagsTakingSeparateValue = map[string]bool{
+	"-n": true, "-U": true, "-L": true,
+	"--max-count": true, "--unified": true, "--grep": true, "--since": true, "--after": true,
+	"--until": true, "--before": true, "--author": true, "--committer": true, "--format": true, "--pretty": true,
+}
+
+// validateGitReadPaths enforces b.Policy.ResolveAndCheckRead on file paths passed to git.diff, git.log,
+// git.show, and git.query (including paths after `--`, `blame <file>`, `<rev>:<path>`, and existing files).
+func (b *ShellGitBinder) validateGitReadPaths(repoDir string, gitArgs []string) error {
+	if b == nil || b.Policy == nil || len(gitArgs) == 0 {
+		return nil
+	}
+	sub := gitArgs[0]
+	rest := gitArgs[1:]
+
+	dashIdx := -1
+	for i, a := range rest {
+		if a == "--" {
+			dashIdx = i
+			break
+		}
+	}
+
+	preDash := rest
+	if dashIdx >= 0 {
+		preDash = rest[:dashIdx]
+		for _, p := range rest[dashIdx+1:] {
+			if p == "" {
+				continue
+			}
+			if strings.HasPrefix(p, ":") {
+				return sandbox.NewHostError(sandbox.KindBadArgs, nil, "git pathspec magic %q is not allowed in read-only git.*", p)
+			}
+			if _, err := b.Policy.ResolveAndCheckRead(repoDir, p); err != nil {
+				return err
+			}
+		}
+	}
+
+	var positionals []string
+	for i := 0; i < len(preDash); i++ {
+		a := preDash[i]
+		if a == "" {
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			if gitFlagsTakingSeparateValue[a] && i+1 < len(preDash) {
+				i++
+			}
+			continue
+		}
+		positionals = append(positionals, a)
+	}
+
+	if sub == "blame" && dashIdx < 0 && len(positionals) > 0 {
+		target := positionals[len(positionals)-1]
+		if _, err := b.Policy.ResolveAndCheckRead(repoDir, target); err != nil {
+			return err
+		}
+		positionals = positionals[:len(positionals)-1]
+	}
+
+	for _, pos := range positionals {
+		// Check <rev>:<path> syntax (e.g. `HEAD:vault/secret.txt` or `:0:vault/secret.txt`).
+		if !isWindowsVolumeArg(pos) && strings.Contains(pos, ":") {
+			idx := strings.LastIndexByte(pos, ':')
+			revPath := pos[idx+1:]
+			if revPath != "" {
+				if _, err := b.Policy.ResolveAndCheckRead(repoDir, revPath); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if filepath.IsAbs(pos) || strings.HasPrefix(pos, "~/") || strings.HasPrefix(pos, `~\`) {
+			if _, err := b.Policy.ResolveAndCheckRead(repoDir, pos); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, stErr := os.Lstat(filepath.Join(repoDir, pos)); stErr == nil {
+			if _, err := b.Policy.ResolveAndCheckRead(repoDir, pos); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func isWindowsVolumeArg(s string) bool {
+	return len(s) >= 2 && ((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z')) && s[1] == ':' && (len(s) == 2 || s[2] == '/' || s[2] == '\\')
 }
 
 // validateListOnlyArgs accepts only listing options; positional arguments (patterns) require explicit list mode,
@@ -722,7 +851,14 @@ func runReadOnlyGit(ctx context.Context, cwd string, gitArgs []string) (string, 
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	fullArgs := append([]string{"--no-pager"}, gitArgs...)
+	// Disable core.fsmonitor before the subcommand on ALL git invocations to block malicious repo hook RCE,
+	// and disable external diff / textconv helpers on diff/show/log where supported.
+	fullArgs := []string{"--no-pager", "-c", "core.fsmonitor=false", sub}
+	if sub == "diff" || sub == "show" || sub == "log" {
+		fullArgs = append(fullArgs, "--no-ext-diff", "--no-textconv")
+	}
+	fullArgs = append(fullArgs, gitArgs[1:]...)
+
 	cmd := exec.CommandContext(cctx, "git", fullArgs...)
 	cmd.Dir = cwd
 	setSysProcAttrHide(cmd)

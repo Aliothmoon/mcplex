@@ -18,7 +18,11 @@ import (
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
 )
 
-const maxLogFileBytes = 10 * 1024 * 1024 // 10 MB per JSONL file before rotation
+const (
+	maxLogFileBytes  = 10 * 1024 * 1024 // 10 MB per JSONL file before rotation
+	maxAuditLogLines = 32
+	maxAuditLogBytes = 8 * 1024 // 8 KB total console log cap per audit entry
+)
 
 // Entry represents a single recorded `mcp_agy-ptc_vm_exec` run in `executions.jsonl` / `errors.jsonl`.
 type Entry struct {
@@ -65,8 +69,59 @@ func NewLogger(dataDir string) *Logger {
 		return &Logger{}
 	}
 	dir := filepath.Join(dataDir, "logs")
-	_ = os.MkdirAll(dir, 0o755)
+	_ = os.MkdirAll(dir, 0o700)
+	_ = os.Chmod(dir, 0o700)
 	return &Logger{logsDir: dir}
+}
+
+func capAuditLogs(logs []string) []string {
+	if len(logs) == 0 {
+		return nil
+	}
+	limitLines := maxAuditLogLines
+	hasLineOverflow := len(logs) > maxAuditLogLines
+	if hasLineOverflow {
+		limitLines = maxAuditLogLines - 1
+	}
+	out := make([]string, 0, min(len(logs), maxAuditLogLines))
+	usedBytes := 0
+	for i := 0; i < len(logs) && i < limitLines; i++ {
+		rem := maxAuditLogBytes - usedBytes
+		if rem <= 0 {
+			break
+		}
+		line := logs[i]
+		if len(line) > rem {
+			if rem > 16 {
+				line = output.SliceUTF8Bytes(line, rem-15) + "...(truncated)"
+			} else {
+				line = output.SliceUTF8Bytes(line, rem)
+			}
+			out = append(out, line)
+			usedBytes += len(line)
+			break
+		}
+		out = append(out, line)
+		usedBytes += len(line)
+	}
+	if omitted := len(logs) - len(out); omitted > 0 {
+		notice := fmt.Sprintf("... [%d more log lines omitted]", omitted)
+		rem := maxAuditLogBytes - usedBytes
+		if rem >= len(notice) {
+			out = append(out, notice)
+		} else if len(out) > 0 && len(out[len(out)-1])+len(notice) > rem {
+			// Ensure notice fits within maxAuditLogBytes by trimming the last kept line if needed.
+			last := out[len(out)-1]
+			avail := maxAuditLogBytes - (usedBytes - len(last)) - len(notice)
+			if avail > 0 {
+				out[len(out)-1] = output.SliceUTF8Bytes(last, avail)
+				if len(out) < maxAuditLogLines {
+					out = append(out, notice)
+				}
+			}
+		}
+	}
+	return out
 }
 
 // Record persists an execution entry to `executions.jsonl`, and also to `errors.jsonl` whenever any error occurred.
@@ -82,6 +137,7 @@ func (l *Logger) Record(e Entry) {
 		n := l.seq.Add(1)
 		e.ID = fmt.Sprintf("ptc_%s_%03d", now.Format("20060102_150405"), n)
 	}
+	e.Logs = capAuditLogs(e.Logs)
 
 	isProblem := e.Status != "ok" || e.FailedOps > 0
 	execCopy := e
@@ -97,7 +153,7 @@ func (l *Logger) Record(e Entry) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.appendJSONL(filepath.Join(l.logsDir, "executions.jsonl"), execCopy)
+	l.appendJSONL(filepath.Join(l.logsDir, "executions.jsonl"), execCopy, maxLogFileBytes)
 	if isProblem {
 		errCopy := e
 		if len(errCopy.Code) > 65536 {
@@ -106,18 +162,16 @@ func (l *Logger) Record(e Entry) {
 		if len(errCopy.ResultPreview) > 65536 {
 			errCopy.ResultPreview = output.SliceUTF8Bytes(errCopy.ResultPreview, 65536) + "\n... [truncated at 64KB]"
 		}
-		l.appendJSONL(filepath.Join(l.logsDir, "errors.jsonl"), errCopy)
+		l.appendJSONL(filepath.Join(l.logsDir, "errors.jsonl"), errCopy, maxLogFileBytes)
 	}
 }
 
-func (l *Logger) appendJSONL(filePath string, item any) {
+func (l *Logger) appendJSONL(filePath string, item any, rotateBytes int64) {
 	raw, err := json.Marshal(item)
 	if err != nil {
 		return
 	}
-	if fi, err := os.Stat(filePath); err == nil && fi.Size() >= maxLogFileBytes {
-		_ = os.Rename(filePath, filePath+".1")
-	}
+	rotateJSONLSafe(filePath, rotateBytes)
 	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
@@ -126,19 +180,106 @@ func (l *Logger) appendJSONL(filePath string, item any) {
 	_, _ = f.Write(append(raw, '\n'))
 }
 
+// rotateJSONLSafe guards 10MB log rotation with an exclusive `.lock` file and re-stats inside the lock
+// so concurrent processes never overwrite `.1` with a tiny newly-created file.
+func rotateJSONLSafe(filePath string, rotateBytes int64) {
+	if rotateBytes <= 0 {
+		rotateBytes = maxLogFileBytes
+	}
+	fi, err := os.Stat(filePath)
+	if err != nil || fi.Size() < rotateBytes {
+		return
+	}
+	lockPath := filePath + ".lock"
+	lf, lErr := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if lErr != nil {
+		// Reclaim abandoned lock files left behind by crashed processes (>10s old).
+		if lfi, sErr := os.Stat(lockPath); sErr == nil && time.Since(lfi.ModTime()) > 10*time.Second {
+			_ = os.Remove(lockPath)
+			lf, lErr = os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		}
+		if lErr != nil {
+			return
+		}
+	}
+	_ = lf.Close()
+	defer func() { _ = os.Remove(lockPath) }()
+
+	// Re-stat inside exclusive lock: if another process already rotated `filePath`, its size is now < rotateBytes!
+	fi2, err := os.Stat(filePath)
+	if err != nil || fi2.Size() < rotateBytes {
+		return
+	}
+	_ = os.Rename(filePath, filePath+".1")
+}
+
 // ClassifyError assigns an actionable optimization category to compile, runtime, or capability errors.
 func ClassifyError(phase, msg string, traces []sandbox.OpTrace) string {
-	low := strings.ToLower(msg)
+	low := strings.ToLower(strings.TrimSpace(msg))
+
+	// 1. Definitive VM-phase / preflight / pure-JS error categories.
 	switch {
 	case phase == "canceled" || strings.HasPrefix(low, "canceled:") || strings.Contains(low, "execution canceled"):
 		return "canceled"
-	case phase == "timeout" || strings.Contains(low, "timeouterror") || strings.Contains(low, "deadline exceeded"):
+	case phase == "timeout":
 		return "timeout"
 	case strings.Contains(low, "payloaderror") || strings.Contains(low, "missing payload key"):
 		return "missing_payload"
 	case phase == "compile" || strings.Contains(low, "syntax check failed"):
 		return "ts_compile_error"
-	case strings.Contains(low, "unknownmethoderror") || strings.Contains(low, "has no member") || strings.Contains(low, "is not a function"):
+	case strings.Contains(low, "unknownmethoderror") || strings.HasPrefix(low, "typeerror:"):
+		return "unknown_method_or_type"
+	case strings.Contains(low, "opbudgeterror") || strings.Contains(low, "operation budget") || strings.Contains(low, "op budget"):
+		return "op_budget_exceeded"
+	case strings.HasPrefix(low, "referenceerror:") || strings.HasPrefix(low, "rangeerror:") || strings.HasPrefix(low, "deadlockerror:"):
+		return "runtime_error"
+	}
+
+	// 2. Scan host operation traces in reverse so the final uncaught failure determines the category
+	// rather than an earlier try/catch-recovered op, checking structured t.Kind BEFORE message substring heuristics.
+	for i := len(traces) - 1; i >= 0; i-- {
+		t := traces[i]
+		if t.Status != "error" {
+			continue
+		}
+		switch t.Kind {
+		case "NeedsApproval", "Denied":
+			return "policy_gate"
+		case "NoMatch", "Ambiguous":
+			if isEditCapability(t.Capability) {
+				return "edit_hunk_mismatch"
+			}
+			if t.Kind == "NoMatch" {
+				return "not_found"
+			}
+			return "capability_error:" + t.Capability
+		case "NotFound":
+			return "not_found"
+		case "Timeout":
+			return "timeout"
+		case "BadArgs":
+			if isEditCapability(t.Capability) && strings.Contains(strings.ToLower(t.Error), "overlap") {
+				return "edit_hunk_mismatch"
+			}
+			return "bad_args:" + t.Capability
+		case "CmdFailed":
+			return "command_failed"
+		}
+		el := strings.ToLower(t.Error)
+		if strings.Contains(el, "target not found") && isEditCapability(t.Capability) {
+			return "edit_hunk_mismatch"
+		}
+		if strings.Contains(el, "approval_required") || strings.Contains(el, "policy_denied") {
+			return "policy_gate"
+		}
+		return "capability_error:" + t.Capability
+	}
+
+	// 3. Fallback message substring heuristics when no structured trace entry is present.
+	switch {
+	case strings.Contains(low, "timeouterror") || strings.Contains(low, "deadline exceeded"):
+		return "timeout"
+	case strings.Contains(low, "has no member") || strings.Contains(low, "is not a function"):
 		return "unknown_method_or_type"
 	case strings.HasPrefix(low, "needsapproval:") || strings.HasPrefix(low, "denied:") ||
 		strings.Contains(low, "approval_required") || strings.Contains(low, "policy_denied"):
@@ -147,41 +288,8 @@ func ClassifyError(phase, msg string, traces []sandbox.OpTrace) string {
 		strings.Contains(low, "overlapping hunks") || (strings.Contains(low, "hunk") && strings.Contains(low, "overlap")) ||
 		(strings.Contains(low, "matches ") && strings.Contains(low, " places")):
 		return "edit_hunk_mismatch"
-	case strings.Contains(low, "opbudgeterror") || strings.Contains(low, "operation budget") || strings.Contains(low, "op budget"):
-		return "op_budget_exceeded"
 	}
-	for _, t := range traces {
-		if t.Status == "error" {
-			switch t.Kind {
-			case "NeedsApproval", "Denied":
-				return "policy_gate"
-			case "NoMatch", "Ambiguous":
-				if isEditCapability(t.Capability) {
-					return "edit_hunk_mismatch"
-				}
-				if t.Kind == "NoMatch" {
-					return "not_found"
-				}
-				return "capability_error:" + t.Capability
-			case "NotFound":
-				return "not_found"
-			case "Timeout":
-				return "timeout"
-			case "BadArgs":
-				return "bad_args:" + t.Capability
-			case "CmdFailed":
-				return "command_failed"
-			}
-			el := strings.ToLower(t.Error)
-			if strings.Contains(el, "target not found") {
-				return "edit_hunk_mismatch"
-			}
-			if strings.Contains(el, "approval_required") || strings.Contains(el, "policy_denied") {
-				return "policy_gate"
-			}
-			return "capability_error:" + t.Capability
-		}
-	}
+
 	if phase != "" {
 		return phase + "_error"
 	}
@@ -205,7 +313,7 @@ func PayloadKeyLengths(payloads map[string]string) map[string]int {
 	return out
 }
 
-// DiscoverLogDirs returns candidate AgyPTC log directories ordered by priority.
+// DiscoverLogDirs returns candidate AgyPTC / MCPlex log directories ordered by priority.
 // When explicitDataDir is non-empty, only that directory is inspected so tests and isolated runs never mix with global logs.
 func DiscoverLogDirs(explicitDataDir string) []string {
 	if strings.TrimSpace(explicitDataDir) != "" {
@@ -216,12 +324,24 @@ func DiscoverLogDirs(explicitDataDir string) []string {
 		return nil
 	}
 	var candidates []string
+	if envDir := strings.TrimSpace(os.Getenv("MCPLEX_DATA_DIR")); envDir != "" {
+		candidates = append(candidates, filepath.Join(envDir, "logs"))
+	}
 	h := homeDir()
 	if h != "" {
 		candidates = append(candidates,
 			filepath.Join(h, ".gemini", "antigravity-cli", "plugin_data", "agy-ptc", "logs"),
 			filepath.Join(h, ".gemini", "antigravity", "plugin_data", "agy-ptc", "logs"),
 			filepath.Join(h, ".gemini", "cache", "agy-ptc", "logs"),
+		)
+	}
+	if cfgDir, err := os.UserConfigDir(); err == nil && cfgDir != "" {
+		candidates = append(candidates, filepath.Join(cfgDir, "mcplex", "logs"))
+	}
+	if h != "" {
+		candidates = append(candidates,
+			filepath.Join(h, ".config", "mcplex", "logs"),
+			filepath.Join(h, ".mcplex", "logs"),
 		)
 	}
 	seen := map[string]bool{}

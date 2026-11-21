@@ -64,10 +64,47 @@ type modalCopyZone struct {
 	group  int // panGroup to copy (1=CODE, 2=OUTPUT)
 }
 
+type cardRenderCache struct {
+	valid     bool
+	feedW     int
+	isLast    bool
+	hoverCopy bool
+	hScroll   int
+	painted   []string
+	plains    []string
+	moreCount int
+	copyX1    int
+	copyX2    int
+}
+
+type groupOpsCache struct {
+	valid   bool
+	feedW   int
+	noChild bool
+	painted string
+	plain   string
+}
+
+type feedCacheKey struct {
+	width           int
+	activeTab       filterTab
+	activeSessionID string
+	multiSession    bool
+	feedFocused     bool
+	selectedID      string
+	hoverNodeID     string
+	hoverCopyNodeID string
+	spinnerFrame    int
+	feedRev         uint64
+	structureHash   uint64
+}
+
 type childItem struct {
 	id       string
 	ev       events.Event
 	expanded bool
+	hScroll  int
+	cache    cardRenderCache
 }
 
 type runGroup struct {
@@ -78,8 +115,11 @@ type runGroup struct {
 	endEv      *events.Event
 	children   []*childItem
 	expanded   bool
+	hScroll    int
 	addedSum   int
 	removedSum int
+	bodyCache  cardRenderCache
+	opsCache   groupOpsCache
 }
 
 type streamRef struct {
@@ -210,7 +250,11 @@ type Model struct {
 	feedMatches []string
 	feedMatchAt int
 
-	// Cached layout & mouse hit-testing / hover state
+	// Cached layout & mouse hit-testing / hover state + feed render cache
+	feedRows        []string
+	feedDirty       bool
+	feedRev         uint64
+	lastCacheKey    feedCacheKey
 	tabZones        []hitZone
 	rowTargets      []rowTarget
 	lastFeedPlain   []string
@@ -288,7 +332,8 @@ func NewModel(cfg Config, src EventSource) *Model {
 		sessionByID:  map[string]*sessionInfo{},
 		sessPicker:   sessionPickerState{hoverIdx: -1},
 		follow:       true,
-		connected:    true,
+		connected:    cfg.ModeLabel == "local",
+		feedDirty:    true,
 		bodyTopY:     3,
 		bodyHeight:   30,
 		hoverToolbar: -1,
@@ -843,14 +888,24 @@ func (m *Model) handleFeedSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.searchInput = string(r[:len(r)-1])
 		}
 		return m, nil
+	case tea.KeySpace:
+		m.searchInput += " "
+		return m, nil
 	case tea.KeyRunes:
-		m.searchInput += msg.String()
+		m.searchInput += sanitizeSearchPasteRunes(msg.Runes)
 		return m, nil
 	}
 	if msg.String() == " " {
 		m.searchInput += " "
 	}
 	return m, nil
+}
+
+func sanitizeSearchPasteRunes(runes []rune) string {
+	if len(runes) == 0 {
+		return ""
+	}
+	return strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(string(runes))
 }
 
 const modalActionCount = 7 // Search, Prev, Next, Wrap, Copy, Top, End
@@ -876,37 +931,55 @@ func (m *Model) triggerDetailAction(idx int) tea.Cmd {
 	return nil
 }
 
+func (m *Model) updateModalQueryFromInput() {
+	if strings.TrimSpace(m.detail.searchInput) == "" {
+		m.detail.query = ""
+	} else {
+		m.detail.query = m.detail.searchInput
+	}
+	m.recomputeDetailMatches()
+}
+
+func (m *Model) handleModalSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.detail.searchMode = false
+		return m, nil
+	case tea.KeyEnter:
+		m.detail.searchMode = false
+		m.updateModalQueryFromInput()
+		if len(m.detail.matches) > 0 {
+			m.detail.matchCursor = 0
+			m.jumpDetailToMatch(0)
+		}
+		m.detail.focus = modalFocusBody
+		return m, nil
+	case tea.KeyBackspace:
+		r := []rune(m.detail.searchInput)
+		if len(r) > 0 {
+			m.detail.searchInput = string(r[:len(r)-1])
+		}
+		m.updateModalQueryFromInput()
+		return m, nil
+	case tea.KeySpace:
+		m.detail.searchInput += " "
+		m.updateModalQueryFromInput()
+		return m, nil
+	case tea.KeyRunes:
+		m.detail.searchInput += sanitizeSearchPasteRunes(msg.Runes)
+		m.updateModalQueryFromInput()
+		return m, nil
+	}
+	if msg.String() == " " {
+		m.detail.searchInput += " "
+		m.updateModalQueryFromInput()
+	}
+	return m, nil
+}
+
 func (m *Model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.detail.searchMode {
-		switch msg.Type {
-		case tea.KeyEsc:
-			m.detail.searchMode = false
-			return m, nil
-		case tea.KeyEnter:
-			m.detail.searchMode = false
-			m.detail.query = strings.TrimSpace(m.detail.searchInput)
-			m.recomputeDetailMatches()
-			if len(m.detail.matches) > 0 {
-				m.detail.matchCursor = 0
-				m.jumpDetailToMatch(0)
-			}
-			m.detail.focus = modalFocusBody
-			return m, nil
-		case tea.KeyBackspace:
-			r := []rune(m.detail.searchInput)
-			if len(r) > 0 {
-				m.detail.searchInput = string(r[:len(r)-1])
-			}
-			m.detail.query = strings.TrimSpace(m.detail.searchInput)
-			m.recomputeDetailMatches()
-			return m, nil
-		case tea.KeyRunes:
-			m.detail.searchInput += msg.String()
-			m.detail.query = strings.TrimSpace(m.detail.searchInput)
-			m.recomputeDetailMatches()
-			return m, nil
-		}
-		return m, nil
+		return m.handleModalSearchKey(msg)
 	}
 
 	page := m.modalPageHeight()
@@ -1299,6 +1372,8 @@ func (m *Model) ingestEvent(ev events.Event) {
 		m.recordSessionEvent(ev)
 	}
 	hadNodes := len(m.nodeOrder) > 0
+	m.feedDirty = true
+	m.feedRev++
 
 	switch ev.Kind {
 	case events.KindExecStart:
@@ -1323,12 +1398,13 @@ func (m *Model) ingestEvent(ev events.Event) {
 		m.trimGroups()
 
 	case events.KindExecEnd:
-		if m.activeRuns > 0 {
-			m.activeRuns--
-		}
 		if g, ok := m.groupByRun[ev.RunID]; ok {
+			if g.endEv == nil && m.activeRuns > 0 {
+				m.activeRuns--
+			}
 			evCopy := ev
 			g.endEv = &evCopy
+			g.opsCache.valid = false
 			for _, ch := range g.children {
 				if ch.ev.Tool == "code" {
 					ch.ev.Ops = ev.Ops
@@ -1389,6 +1465,7 @@ func (m *Model) ingestEvent(ev events.Event) {
 			for _, ch := range g.children {
 				if ch.ev.TxID == ev.TxID && ev.TxID != "" {
 					ch.ev.TxPhase = ev.TxPhase
+					ch.cache.valid = false
 				}
 			}
 			ev.Cwd = g.startEv.Cwd
@@ -1413,6 +1490,11 @@ func (m *Model) ingestEvent(ev events.Event) {
 		if ev.Summary != "" {
 			target.Summary = ev.Summary
 		}
+		if sr.child != nil {
+			sr.child.cache.valid = false
+		} else if sr.group != nil {
+			sr.group.bodyCache.valid = false
+		}
 		m.refreshOpenDetailForStream(*target)
 		m.syncFeedLayout()
 		if m.feedQuery != "" {
@@ -1424,22 +1506,29 @@ func (m *Model) ingestEvent(ev events.Event) {
 		return
 
 	default:
-		// In-place update when a running shell/task stream transitions to its terminal state.
+		// In-place update when a running shell/task stream receives a replay update or transitions to its terminal state.
 		if ev.StreamID != "" {
 			if sr, exists := m.streamByID[ev.StreamID]; exists && sr != nil {
 				target := sr.eventPtr()
 				if ev.Cwd == "" {
 					ev.Cwd = target.Cwd
 				}
-				if ev.Detail == "" && ev.Status == "running" {
+				if ev.Detail == "" && target.Detail != "" {
 					ev.Detail = target.Detail
+					ev.Truncated = ev.Truncated || target.Truncated
 				}
 				*target = ev
-				if sr.countedActive && ev.Status != "running" {
-					sr.countedActive = false
-					if m.activeRuns > 0 {
+				if sr.child != nil {
+					sr.child.cache.valid = false
+				} else if sr.group != nil {
+					sr.group.bodyCache.valid = false
+				}
+				if ev.Status != "running" {
+					if sr.countedActive && m.activeRuns > 0 {
+						sr.countedActive = false
 						m.activeRuns--
 					}
+					delete(m.streamByID, ev.StreamID)
 				}
 				m.refreshOpenDetailForStream(*target)
 				break
@@ -1473,7 +1562,7 @@ func (m *Model) ingestEvent(ev events.Event) {
 				expanded: isWriteCRUD || ev.Status == "running" || ev.Status == "error" || ev.Status == "denied",
 			}
 			g.children = append(g.children, ch)
-			if ev.StreamID != "" {
+			if ev.StreamID != "" && ev.Status == "running" {
 				m.streamByID[ev.StreamID] = &streamRef{nodeID: ch.id, group: g, child: ch}
 			}
 		} else {
@@ -1489,12 +1578,9 @@ func (m *Model) ingestEvent(ev events.Event) {
 				g.removedSum = ev.Diff.Removed
 			}
 			m.groups = append(m.groups, g)
-			if ev.StreamID != "" {
-				sr := &streamRef{nodeID: g.id, group: g}
-				if ev.Status == "running" {
-					m.activeRuns++
-					sr.countedActive = true
-				}
+			if ev.StreamID != "" && ev.Status == "running" {
+				sr := &streamRef{nodeID: g.id, group: g, countedActive: true}
+				m.activeRuns++
 				m.streamByID[ev.StreamID] = sr
 			}
 			m.trimGroups()
@@ -1522,6 +1608,9 @@ func (m *Model) trimGroups() {
 	const maxGroups = 250
 	if len(m.groups) > maxGroups {
 		drop := m.groups[0]
+		if drop.isExec && drop.endEv == nil && m.activeRuns > 0 {
+			m.activeRuns--
+		}
 		delete(m.groupByRun, drop.runID)
 		for sid, sr := range m.streamByID {
 			if sr.group == drop {
@@ -1599,11 +1688,8 @@ func (m *Model) activeSessionFilter() string {
 }
 
 func (m *Model) clearFeed() {
-	for _, sr := range m.streamByID {
-		if sr.countedActive && m.activeRuns > 0 {
-			m.activeRuns--
-		}
-	}
+	m.clearSelection()
+	m.activeRuns = 0
 	m.groups = nil
 	m.groupByRun = map[string]*runGroup{}
 	m.streamByID = map[string]*streamRef{}
@@ -1612,6 +1698,10 @@ func (m *Model) clearFeed() {
 	m.activeSessionID = ""
 	m.nodeOrder = nil
 	m.rowTargets = nil
+	m.feedRows = nil
+	m.lastFeedPlain = nil
+	m.feedDirty = true
+	m.feedRev++
 	m.totalVisRows = 0
 	m.selectedID = ""
 	m.scroll = 0
@@ -1623,11 +1713,15 @@ func (m *Model) toggleNode(id string) {
 	for _, g := range m.groups {
 		if g.id == id {
 			g.expanded = !g.expanded
+			m.feedDirty = true
+			m.feedRev++
 			return
 		}
 		for _, ch := range g.children {
 			if ch.id == id {
 				ch.expanded = !ch.expanded
+				m.feedDirty = true
+				m.feedRev++
 				return
 			}
 		}
@@ -1641,10 +1735,12 @@ func (m *Model) setAllExpanded(on bool) {
 			ch.expanded = on
 		}
 	}
+	m.feedDirty = true
+	m.feedRev++
 }
 
 func (m *Model) syncFeedLayout() {
-	rows, targets := m.buildFeedRows()
+	rows, targets := m.ensureFeedRows()
 	m.rowTargets = targets
 	m.totalVisRows = len(rows)
 }
@@ -2138,27 +2234,30 @@ func renderDiffDetailLines(d *diff.Result, lang string) []detailLine {
 			out = append(out, detailLine{plain: sep, body: styleHunkSep.Render(sep)})
 		}
 		for _, dl := range h.Lines {
-			var gutter, body, bgHex string
+			var gutter, sign, body, bgHex string
 			switch dl.Kind {
 			case diff.LineAdd:
+				sign = "+ "
 				gutter = styleDiffAddNum.Render(fmt.Sprintf("%4d │ ", dl.NewLine))
-				body = renderSpannedLine("+ ", dl.Text, dl.Spans, styleDiffAddBg, styleDiffAddHi)
+				body = renderSpannedLine(sign, dl.Text, dl.Spans, styleDiffAddBg, styleDiffAddHi)
 				bgHex = colorDiffAddBg
 			case diff.LineDel:
+				sign = "- "
 				gutter = styleDiffDelNum.Render(fmt.Sprintf("%4d │ ", dl.OldLine))
-				body = renderSpannedLine("- ", dl.Text, dl.Spans, styleDiffDelBg, styleDiffDelHi)
+				body = renderSpannedLine(sign, dl.Text, dl.Spans, styleDiffDelBg, styleDiffDelHi)
 				bgHex = colorDiffDelBg
 			default:
+				sign = "  "
 				n := dl.NewLine
 				if n == 0 {
 					n = dl.OldLine
 				}
 				gutter = styleLineNum.Render(fmt.Sprintf("%4d │ ", n))
-				body = "  " + highlightLineByLang(dl.Text, lang)
+				body = sign + highlightLineByLang(dl.Text, lang)
 			}
 			out = append(out, detailLine{
 				gutter:   gutter,
-				plain:    sanitizePlainLine(dl.Text),
+				plain:    sign + sanitizePlainLine(dl.Text),
 				body:     body,
 				bgHex:    bgHex,
 				panGroup: 1,
@@ -2408,8 +2507,7 @@ func (m *Model) toggleDetailWrap() {
 }
 
 func compileSearchRegex(q string) *regexp.Regexp {
-	q = strings.TrimSpace(q)
-	if q == "" {
+	if strings.TrimSpace(q) == "" {
 		return nil
 	}
 	if re, err := regexp.Compile("(?i)" + q); err == nil {

@@ -157,29 +157,47 @@ func relDisplayPath(cwd, absPath string) string {
 }
 
 func writeFilePreserveMode(absPath string, data []byte) error {
-	return writeFileAtomic(absPath, data, 0, false)
+	return writeFileAtomic(absPath, data, 0, false, true)
 }
 
 // writeFileWithMode writes data atomically via temp file + rename in the target directory
 // so a crash or kill never leaves a half-truncated file, preserving existing or explicit file mode bits
 // while respecting existing read-only permissions on Unix.
 func writeFileWithMode(absPath string, data []byte, explicitMode os.FileMode) error {
-	return writeFileAtomic(absPath, data, explicitMode, false)
+	return writeFileAtomic(absPath, data, explicitMode, false, true)
 }
 
-// writeFileForRollback restores a transaction snapshot atomically, allowing restoration even if the
-// target currently has read-only mode bits on Unix.
+// writeFileForRollback restores a transaction snapshot atomically without EVER writing through symlinks
+// (if absPath was replaced with a symlink, the symlink is removed first before recreating the regular file)
+// and clears read-only attributes on Windows before restoring.
 func writeFileForRollback(absPath string, data []byte, explicitMode os.FileMode) error {
-	return writeFileAtomic(absPath, data, explicitMode, true)
+	if fi, err := os.Lstat(absPath); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			if rmErr := os.Remove(absPath); rmErr != nil {
+				return rmErr
+			}
+		} else if !fi.IsDir() && runtime.GOOS == "windows" && fi.Mode().Perm()&0o200 == 0 {
+			_ = os.Chmod(absPath, 0o666)
+		}
+	}
+	return writeFileAtomic(absPath, data, explicitMode, true, false)
 }
 
-func writeFileAtomic(absPath string, data []byte, explicitMode os.FileMode, allowOverwriteReadOnly bool) error {
+func snapshotKeyForPath(absPath string) string {
+	return normalizeLockKey(evalDeepestExisting(absPath))
+}
+
+func writeFileAtomic(absPath string, data []byte, explicitMode os.FileMode, allowOverwriteReadOnly, followSymlink bool) error {
 	mode := explicitMode
 	writeTarget := absPath
 	if info, err := os.Lstat(absPath); err == nil {
 		targetPerm := info.Mode().Perm()
 		if info.Mode()&os.ModeSymlink != 0 {
-			if resolved, rErr := filepath.EvalSymlinks(absPath); rErr == nil {
+			if !followSymlink {
+				if rmErr := os.Remove(absPath); rmErr != nil {
+					return rmErr
+				}
+			} else if resolved, rErr := filepath.EvalSymlinks(absPath); rErr == nil {
 				writeTarget = resolved
 				if tInfo, sErr := os.Stat(resolved); sErr == nil {
 					targetPerm = tInfo.Mode().Perm()
@@ -188,11 +206,16 @@ func writeFileAtomic(absPath string, data []byte, explicitMode os.FileMode, allo
 					}
 				}
 			}
-		} else if mode == 0 {
-			mode = targetPerm
+		} else {
+			if mode == 0 {
+				mode = targetPerm
+			}
+			// On Unix, os.Rename would silently clobber an existing read-only file where O_WRONLY would return EACCES.
+			if runtime.GOOS != "windows" && !allowOverwriteReadOnly && targetPerm&0o222 == 0 {
+				return &os.PathError{Op: "open", Path: writeTarget, Err: os.ErrPermission}
+			}
 		}
-		// On Unix, os.Rename would silently clobber an existing read-only file where O_WRONLY would return EACCES.
-		if runtime.GOOS != "windows" && !allowOverwriteReadOnly && targetPerm&0o222 == 0 {
+		if runtime.GOOS != "windows" && !allowOverwriteReadOnly && info.Mode()&os.ModeSymlink != 0 && targetPerm&0o222 == 0 {
 			return &os.PathError{Op: "open", Path: writeTarget, Err: os.ErrPermission}
 		}
 	}
@@ -205,7 +228,16 @@ func writeFileAtomic(absPath string, data []byte, explicitMode os.FileMode, allo
 	}
 	tmp, err := os.CreateTemp(dir, ".mcplex-write-*")
 	if err != nil {
-		return os.WriteFile(writeTarget, data, mode)
+		if allowOverwriteReadOnly {
+			_ = os.Chmod(writeTarget, 0o666)
+		}
+		if wErr := os.WriteFile(writeTarget, data, mode); wErr != nil {
+			return wErr
+		}
+		if explicitMode != 0 {
+			_ = os.Chmod(writeTarget, mode)
+		}
+		return nil
 	}
 	tmpPath := tmp.Name()
 	cleanupTmp := true
@@ -229,14 +261,23 @@ func writeFileAtomic(absPath string, data []byte, explicitMode os.FileMode, allo
 		if attempt > 0 {
 			time.Sleep(time.Duration(attempt*30) * time.Millisecond)
 		}
+		if allowOverwriteReadOnly && runtime.GOOS == "windows" {
+			_ = os.Chmod(writeTarget, 0o666)
+		}
 		renameErr = os.Rename(tmpPath, writeTarget)
 		if renameErr == nil {
 			cleanupTmp = false
 			return nil
 		}
 	}
+	if allowOverwriteReadOnly {
+		_ = os.Chmod(writeTarget, 0o666)
+	}
 	if err := os.WriteFile(writeTarget, data, mode); err != nil {
 		return renameErr
+	}
+	if explicitMode != 0 {
+		_ = os.Chmod(writeTarget, mode)
 	}
 	return nil
 }

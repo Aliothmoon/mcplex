@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -366,7 +368,12 @@ func MarshalResultForBudget(val any, budgetBytes int) string {
 	}
 	compact, cErr := marshalNoEscapeHTML(val, false)
 	if cErr != nil {
-		return fmt.Sprintf("%v", val)
+		scrubbed := sanitizeForJSON(val)
+		compact, cErr = marshalNoEscapeHTML(scrubbed, false)
+		if cErr != nil {
+			return marshalFallbackError(cErr)
+		}
+		val = scrubbed
 	}
 	// Only pretty-print if compact JSON is small enough that indentation won't push it over budgetBytes.
 	if len(compact) <= 4800 && (budgetBytes <= 0 || len(compact)*4/3 <= budgetBytes) {
@@ -375,6 +382,226 @@ func MarshalResultForBudget(val any, budgetBytes int) string {
 		}
 	}
 	return compact
+}
+
+const (
+	maxSanitizeDepth = 64
+	maxSanitizeNodes = 100_000
+)
+
+type sanitizeVisitKey struct {
+	kind reflect.Kind
+	ptr  uintptr
+	len  int
+}
+
+type sanitizeState struct {
+	visited map[sanitizeVisitKey]bool
+	nodes   int
+}
+
+// sanitizeForJSON normalizes cyclic Go maps/slices/pointers, NaN/Inf floats, non-string map keys,
+// and unsupported JSON types (funcs/chans) into valid bounded JSON-serializable values.
+func sanitizeForJSON(val any) any {
+	st := &sanitizeState{visited: make(map[sanitizeVisitKey]bool, 16)}
+	return sanitizeValue(reflect.ValueOf(val), 0, st)
+}
+
+func sanitizeValue(rv reflect.Value, depth int, st *sanitizeState) any {
+	for rv.IsValid() && rv.Kind() == reflect.Interface {
+		if rv.IsNil() {
+			return nil
+		}
+		rv = rv.Elem()
+	}
+	if !rv.IsValid() {
+		return nil
+	}
+	st.nodes++
+	if st.nodes > maxSanitizeNodes {
+		return "[MaxItems]"
+	}
+
+	switch rv.Kind() {
+	case reflect.Bool:
+		return rv.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return rv.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return rv.Uint()
+	case reflect.Float32, reflect.Float64:
+		f := rv.Float()
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil
+		}
+		return f
+	case reflect.String:
+		return strings.ToValidUTF8(rv.String(), "\uFFFD")
+	case reflect.Func, reflect.Chan, reflect.UnsafePointer, reflect.Complex64, reflect.Complex128:
+		return fmt.Sprintf("[%s]", rv.Type().String())
+	}
+
+	if depth >= maxSanitizeDepth {
+		return "[MaxDepth]"
+	}
+
+	switch rv.Kind() {
+	case reflect.Pointer:
+		if rv.IsNil() {
+			return nil
+		}
+		key := sanitizeVisitKey{kind: reflect.Pointer, ptr: rv.Pointer()}
+		if st.visited[key] {
+			return "[Circular]"
+		}
+		st.visited[key] = true
+		defer delete(st.visited, key)
+		return sanitizeValue(rv.Elem(), depth+1, st)
+
+	case reflect.Map:
+		if rv.IsNil() {
+			return nil
+		}
+		key := sanitizeVisitKey{kind: reflect.Map, ptr: rv.Pointer()}
+		if st.visited[key] {
+			return "[Circular]"
+		}
+		st.visited[key] = true
+		defer delete(st.visited, key)
+
+		out := make(map[string]any, minInt(rv.Len(), 1024))
+		iter := rv.MapRange()
+		for iter.Next() {
+			if st.nodes > maxSanitizeNodes {
+				out["__truncated__"] = "[MaxItems]"
+				break
+			}
+			kStr := formatSanitizedMapKey(iter.Key())
+			out[kStr] = sanitizeValue(iter.Value(), depth+1, st)
+		}
+		return out
+
+	case reflect.Slice:
+		if rv.IsNil() {
+			return nil
+		}
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			n := rv.Len()
+			if n > 1024*1024 {
+				n = 1024 * 1024
+			}
+			cp := make([]byte, n)
+			reflect.Copy(reflect.ValueOf(cp), rv.Slice(0, n))
+			return cp
+		}
+		if rv.Len() > 0 {
+			key := sanitizeVisitKey{kind: reflect.Slice, ptr: rv.Pointer(), len: rv.Len()}
+			if st.visited[key] {
+				return "[Circular]"
+			}
+			st.visited[key] = true
+			defer delete(st.visited, key)
+		}
+		limit := minInt(rv.Len(), maxSanitizeNodes)
+		out := make([]any, 0, minInt(limit, 1024))
+		for i := 0; i < rv.Len(); i++ {
+			if st.nodes > maxSanitizeNodes {
+				out = append(out, "[MaxItems]")
+				break
+			}
+			out = append(out, sanitizeValue(rv.Index(i), depth+1, st))
+		}
+		return out
+
+	case reflect.Array:
+		out := make([]any, 0, minInt(rv.Len(), 1024))
+		for i := 0; i < rv.Len(); i++ {
+			if st.nodes > maxSanitizeNodes {
+				out = append(out, "[MaxItems]")
+				break
+			}
+			out = append(out, sanitizeValue(rv.Index(i), depth+1, st))
+		}
+		return out
+
+	case reflect.Struct:
+		rt := rv.Type()
+		out := make(map[string]any, rt.NumField())
+		for i := 0; i < rt.NumField(); i++ {
+			sf := rt.Field(i)
+			if !sf.IsExported() {
+				continue
+			}
+			tag := sf.Tag.Get("json")
+			if tag == "-" {
+				continue
+			}
+			name := sf.Name
+			if comma := strings.IndexByte(tag, ','); comma >= 0 {
+				if tag[:comma] != "" {
+					name = tag[:comma]
+				}
+			} else if tag != "" {
+				name = tag
+			}
+			if st.nodes > maxSanitizeNodes {
+				out["__truncated__"] = "[MaxItems]"
+				break
+			}
+			out[name] = sanitizeValue(rv.Field(i), depth+1, st)
+		}
+		return out
+	}
+
+	return fmt.Sprintf("[%s]", rv.Type().String())
+}
+
+func formatSanitizedMapKey(kv reflect.Value) string {
+	for kv.IsValid() && kv.Kind() == reflect.Interface {
+		if kv.IsNil() {
+			return "null"
+		}
+		kv = kv.Elem()
+	}
+	if !kv.IsValid() {
+		return "null"
+	}
+	switch kv.Kind() {
+	case reflect.String:
+		return strings.ToValidUTF8(kv.String(), "\uFFFD")
+	case reflect.Bool:
+		return strconv.FormatBool(kv.Bool())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return strconv.FormatInt(kv.Int(), 10)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return strconv.FormatUint(kv.Uint(), 10)
+	case reflect.Float32, reflect.Float64:
+		f := kv.Float()
+		if math.IsNaN(f) {
+			return "NaN"
+		}
+		if math.IsInf(f, 1) {
+			return "Infinity"
+		}
+		if math.IsInf(f, -1) {
+			return "-Infinity"
+		}
+		return strconv.FormatFloat(f, 'g', -1, 64)
+	default:
+		return fmt.Sprintf("[%s]", kv.Type().String())
+	}
+}
+
+func marshalFallbackError(err error) string {
+	msg := "[unserializable value]"
+	if err != nil {
+		msg = "[unserializable value: " + SliceUTF8Bytes(err.Error(), 200) + "]"
+	}
+	b, jErr := json.Marshal(msg)
+	if jErr != nil {
+		return `"[unserializable value]"`
+	}
+	return string(b)
 }
 
 func marshalNoEscapeHTML(val any, indent bool) (string, error) {

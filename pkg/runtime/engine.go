@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	stdruntime "runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -52,11 +53,11 @@ type EngineOptions struct {
 	EventHistory          int  // ring buffer capacity for EventHub (default 500)
 }
 
-// Engine manages workspace-scoped capability instances, state stores, audit logs, and PTC program execution.
 type Engine struct {
 	dataDir               string
 	defaultCwd            string
-	clientWorkspace       string
+	explicitDefaultCwd    bool
+	sessionWorkspaces     map[string]string
 	defaultMaxOutputBytes int
 	strictWorkspace       bool
 	extraRoots            []string
@@ -72,6 +73,7 @@ type Engine struct {
 	lastStatusWrite       time.Time
 	stores                map[string]*capabilities.StateStore
 	bridges               map[string]*capabilities.MCPBridge
+	storeOrder            []string
 	fileLocks             *capabilities.FileLockTable
 	events                *events.Hub
 	runSeq                atomic.Int64
@@ -91,6 +93,7 @@ func NewEngine(dataDir, defaultCwd string) *Engine {
 
 // NewEngineWithOptions creates a runtime engine with explicit host profile options.
 func NewEngineWithOptions(opts EngineOptions) *Engine {
+	explicitDefaultCwd := strings.TrimSpace(opts.DefaultCwd) != "" && !isPluginInstallDir(opts.DefaultCwd)
 	defaultCwd := opts.DefaultCwd
 	if defaultCwd == "" {
 		defaultCwd, _ = os.Getwd()
@@ -111,6 +114,8 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 	return &Engine{
 		dataDir:               dataDir,
 		defaultCwd:            defaultCwd,
+		explicitDefaultCwd:    explicitDefaultCwd,
+		sessionWorkspaces:     map[string]string{},
 		defaultMaxOutputBytes: opts.DefaultMaxOutputBytes,
 		strictWorkspace:       opts.StrictWorkspace,
 		extraRoots:            append([]string(nil), opts.ExtraRoots...),
@@ -159,10 +164,17 @@ func (e *Engine) ensureTaskManager() *tasks.Manager {
 	return e.taskMgr
 }
 
-// CloseSession terminates any running background tasks started by sessionID.
+// CloseSession terminates any running background tasks started by sessionID and clears session-scoped workspaces/spills.
 func (e *Engine) CloseSession(sessionID string) int {
+	sid := strings.TrimSpace(sessionID)
 	e.mu.Lock()
 	tm := e.taskMgr
+	if sid != "" {
+		delete(e.sessionWorkspaces, sid)
+		for _, st := range e.stores {
+			st.ClearSessionSpills(sid)
+		}
+	}
 	e.mu.Unlock()
 	if tm == nil {
 		return 0
@@ -197,12 +209,32 @@ type ExecInput struct {
 	MaxOutputBytes int               `json:"maxOutputBytes,omitempty"`
 }
 
+func (e *Engine) isStrictMode() bool {
+	return e.strictWorkspace || os.Getenv("AGY_PTC_STRICT_WORKSPACE") == "1" || os.Getenv("MCPLEX_STRICT_WORKSPACE") == "1"
+}
+
 func (e *Engine) newPolicyForCwd(cwd string) *policy.Engine {
+	pFiles := append([]string(nil), e.policyFiles...)
+	if e.dataDir != "" {
+		dp := filepath.Join(e.dataDir, "policy.json")
+		if fi, err := os.Stat(dp); err == nil && !fi.IsDir() {
+			already := false
+			for _, existing := range pFiles {
+				if filepath.Clean(existing) == filepath.Clean(dp) {
+					already = true
+					break
+				}
+			}
+			if !already {
+				pFiles = append(pFiles, dp)
+			}
+		}
+	}
 	return policy.NewEngineWithOptions(cwd, policy.Options{
 		ExtraRoots:            e.extraRoots,
 		StrictWorkspace:       e.strictWorkspace,
 		TrustWorkspaceMCP:     e.trustWorkspaceMCP,
-		PolicyFiles:           e.policyFiles,
+		PolicyFiles:           pFiles,
 		ProtectedFiles:        e.mcpConfigPaths,
 		LoadAntigravityConfig: e.antigravityMode,
 		NativeEscalationHint:  e.antigravityMode,
@@ -222,11 +254,10 @@ func (e *Engine) RunReadTool(ctx context.Context, req capabilities.DirectReadReq
 	start := time.Now()
 	sid := SessionIDFromContext(ctx)
 	runID := fmt.Sprintf("read_%d", e.runSeq.Add(1))
-	cwd, err := e.resolveEffectiveCwd(req.Cwd)
+	cwd, pol, err := e.resolveCwdAndPolicy(ctx, req.Cwd)
 	if err != nil {
 		return nil, err
 	}
-	pol := e.newPolicyForCwd(cwd)
 	res, err := capabilities.ReadFileDirect(pol, cwd, req)
 	if e.events.Active() {
 		absTarget := req.Path
@@ -267,11 +298,10 @@ func (e *Engine) RunReadTool(ctx context.Context, req capabilities.DirectReadReq
 // RunTaskSpawn executes the standalone MCP `spawn` tool to run long commands or daemons.
 func (e *Engine) RunTaskSpawn(ctx context.Context, req tasks.StartRequest) (*tasks.StartResult, string, error) {
 	start := time.Now()
-	cwd, err := e.resolveEffectiveCwd(req.Cwd)
+	cwd, pol, err := e.resolveCwdAndPolicy(ctx, req.Cwd)
 	if err != nil {
 		return nil, "", err
 	}
-	pol := e.newPolicyForCwd(cwd)
 	req.Cwd = cwd
 	if req.SessionID == "" {
 		req.SessionID = SessionIDFromContext(ctx)
@@ -330,20 +360,36 @@ func (e *Engine) RunTaskManage(ctx context.Context, req tasks.ManageRequest) (*t
 	return res, formatted, nil
 }
 
-// SetClientWorkspace records a workspace root reported by the MCP client during `initialize`.
+// SetClientWorkspace records a workspace root reported by a default/stdio MCP client during `initialize`.
 func (e *Engine) SetClientWorkspace(ws string) {
+	e.SetSessionClientWorkspace("", ws)
+}
+
+// SetSessionClientWorkspace records a workspace root reported by a specific MCP session during `initialize`.
+func (e *Engine) SetSessionClientWorkspace(sessionID, ws string) {
 	ws = strings.TrimSpace(ws)
 	if ws == "" {
 		return
 	}
+	sid := strings.TrimSpace(sessionID)
 	e.mu.Lock()
-	e.clientWorkspace = ws
-	e.mu.Unlock()
+	defer e.mu.Unlock()
+	if len(e.sessionWorkspaces) >= 256 {
+		if _, exists := e.sessionWorkspaces[sid]; !exists {
+			for k := range e.sessionWorkspaces {
+				if k != "" {
+					delete(e.sessionWorkspaces, k)
+					break
+				}
+			}
+		}
+	}
+	e.sessionWorkspaces[sid] = ws
 }
 
 // RunMCPExec executes a PTC TypeScript program and returns an inline-safe (`<= 9,600 B` UTF-8 by default) formatted response.
 func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isError bool) {
-	cwd, cwdErr := e.resolveEffectiveCwd(in.Cwd)
+	cwd, pol, cwdErr := e.resolveCwdAndPolicy(ctx, in.Cwd)
 	if cwdErr != nil {
 		msg := "[ptc workspace error]\n" + cwdErr.Error()
 		e.auditor.Record(audit.Entry{
@@ -356,7 +402,6 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 		return msg, true
 	}
 
-	pol := e.newPolicyForCwd(cwd)
 	store, bridge := e.workspaceResources(cwd, pol)
 	defer store.Flush() // state writes (state.set, auto-spills) hit disk once per exec
 
@@ -386,7 +431,7 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 	astBinder := &capabilities.ASTBinder{Policy: pol}
 	shellGit := &capabilities.ShellGitBinder{Policy: pol, Events: e.events, SessionID: sid, RunID: runID}
 	editTx := &capabilities.EditTxBinder{Policy: pol, ShellRunner: shellGit, Locks: e.fileLocks, Events: e.events, SessionID: sid, RunID: runID}
-	stateBinder := &capabilities.StateBinder{Store: store}
+	stateBinder := &capabilities.StateBinder{Store: store, SessionID: sid}
 
 	timeout := sandbox.EffectiveDefaultTimeout()
 	if in.TimeoutMs > 0 {
@@ -534,7 +579,7 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 
 	ops := e.totalHostOps.Add(int64(len(res.Traces)))
 	failedOps := countFailedTraces(res.Traces)
-	formatted, autoSpilled := formatSuccessEnvelope(res, store, maxOutBytes)
+	formatted, autoSpilled := formatSuccessEnvelope(res, store, sid, maxOutBytes)
 
 	statusTag := "ok"
 	errCat := ""
@@ -620,36 +665,110 @@ func tracesToOpItems(traces []sandbox.OpTrace) []events.OpItem {
 	return out
 }
 
-// resolveEffectiveCwd ensures relative paths (`"go.mod"`, `"internal/..."`) NEVER accidentally resolve against
-// `~/.gemini/config/plugins/agy-ptc` (which is the OS working directory when Antigravity spawns a plugin MCP server).
-func (e *Engine) resolveEffectiveCwd(explicitCwd string) (string, error) {
-	if c := strings.TrimSpace(explicitCwd); c != "" {
-		if abs, err := filepath.Abs(c); err == nil {
-			return abs, nil
-		}
-		return c, nil
-	}
+const maxCachedWorkspaces = 32
 
+func (e *Engine) sessionClientWorkspace(sessionID string) string {
+	sid := strings.TrimSpace(sessionID)
 	e.mu.Lock()
-	clientWs := e.clientWorkspace
-	e.mu.Unlock()
-	if clientWs != "" {
-		if abs, err := filepath.Abs(clientWs); err == nil {
-			return abs, nil
-		}
-		return clientWs, nil
+	defer e.mu.Unlock()
+	if ws := e.sessionWorkspaces[sid]; ws != "" {
+		return ws
 	}
+	return ""
+}
 
-	// If defaultCwd is NOT the plugin installation directory (e.g. standalone `agy-ptc run` in a repo), use it directly.
+func (e *Engine) resolveAnchoredServerRoot(sessionID string) (string, error) {
 	if e.defaultCwd != "" && !isPluginInstallDir(e.defaultCwd) {
 		if abs, err := filepath.Abs(e.defaultCwd); err == nil {
 			return abs, nil
 		}
 		return e.defaultCwd, nil
 	}
-
 	if e.antigravityMode {
-		// Fallback to the active workspace recorded by the SessionStart hook (`active-workspace.json`).
+		if hinted := e.readWorkspaceHint(); hinted != "" {
+			if abs, err := filepath.Abs(hinted); err == nil {
+				return abs, nil
+			}
+			return hinted, nil
+		}
+	}
+	if ws := e.sessionClientWorkspace(sessionID); ws != "" {
+		if abs, err := filepath.Abs(ws); err == nil {
+			return abs, nil
+		}
+		return ws, nil
+	}
+	return "", errors.New("WorkspaceError: --strict-root is enabled, workspace root could not be anchored; start server with --cwd <dir>")
+}
+
+func (e *Engine) resolveCwdAndPolicy(ctx context.Context, explicitCwd string) (string, *policy.Engine, error) {
+	sid := SessionIDFromContext(ctx)
+	if e.isStrictMode() {
+		baseRoot, err := e.resolveAnchoredServerRoot(sid)
+		if err != nil {
+			return "", nil, err
+		}
+		pol := e.newPolicyForCwd(baseRoot)
+		target := baseRoot
+		if c := strings.TrimSpace(explicitCwd); c != "" {
+			if filepath.IsAbs(c) {
+				target = c
+			} else {
+				target = filepath.Join(baseRoot, c)
+			}
+		} else if !e.explicitDefaultCwd {
+			if clientWs := e.sessionClientWorkspace(sessionIDFromCtx(sid)); clientWs != "" {
+				if checked, cErr := pol.ResolveAndCheckStrictCwd(baseRoot, clientWs); cErr == nil {
+					target = checked
+				}
+			}
+		}
+		checkedCwd, pErr := pol.ResolveAndCheckStrictCwd(baseRoot, target)
+		if pErr != nil {
+			return "", nil, pErr
+		}
+		return checkedCwd, pol, nil
+	}
+
+	cwd, err := e.resolveEffectiveCwdForSession(sid, explicitCwd)
+	if err != nil {
+		return "", nil, err
+	}
+	return cwd, e.newPolicyForCwd(cwd), nil
+}
+
+func sessionIDFromCtx(sid string) string { return sid }
+
+func (e *Engine) resolveEffectiveCwd(explicitCwd string) (string, error) {
+	return e.resolveEffectiveCwdForSession("", explicitCwd)
+}
+
+func (e *Engine) resolveEffectiveCwdForSession(sessionID, explicitCwd string) (string, error) {
+	if c := strings.TrimSpace(explicitCwd); c != "" {
+		if abs, err := filepath.Abs(c); err == nil {
+			return abs, nil
+		}
+		return c, nil
+	}
+	if e.explicitDefaultCwd {
+		if abs, err := filepath.Abs(e.defaultCwd); err == nil {
+			return abs, nil
+		}
+		return e.defaultCwd, nil
+	}
+	if clientWs := e.sessionClientWorkspace(sessionID); clientWs != "" {
+		if abs, err := filepath.Abs(clientWs); err == nil {
+			return abs, nil
+		}
+		return clientWs, nil
+	}
+	if e.defaultCwd != "" && !isPluginInstallDir(e.defaultCwd) {
+		if abs, err := filepath.Abs(e.defaultCwd); err == nil {
+			return abs, nil
+		}
+		return e.defaultCwd, nil
+	}
+	if e.antigravityMode {
 		if hinted := e.readWorkspaceHint(); hinted != "" {
 			return hinted, nil
 		}
@@ -697,12 +816,43 @@ func isPluginInstallDir(p string) bool {
 	return strings.Contains(norm, "/.gemini/config/plugins/agy-ptc") || strings.Contains(norm, "/.agents/plugins/agy-ptc")
 }
 
+func workspaceCacheKey(cwd string) string {
+	cleaned := filepath.ToSlash(filepath.Clean(cwd))
+	if stdruntime.GOOS == "windows" || stdruntime.GOOS == "darwin" {
+		return strings.ToLower(cleaned)
+	}
+	return cleaned
+}
+
+func (e *Engine) touchWorkspaceOrderLocked(key string) {
+	for i, k := range e.storeOrder {
+		if k == key {
+			if i == len(e.storeOrder)-1 {
+				return
+			}
+			e.storeOrder = append(e.storeOrder[:i], e.storeOrder[i+1:]...)
+			break
+		}
+	}
+	e.storeOrder = append(e.storeOrder, key)
+}
+
 func (e *Engine) workspaceResources(cwd string, pol *policy.Engine) (*capabilities.StateStore, *capabilities.MCPBridge) {
-	key := strings.ToLower(filepath.ToSlash(filepath.Clean(cwd)))
+	key := workspaceCacheKey(cwd)
+	var evictedStore *capabilities.StateStore
+	var evictedBridge *capabilities.MCPBridge
+
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	st, ok := e.stores[key]
 	if !ok {
+		if len(e.storeOrder) >= maxCachedWorkspaces {
+			evictKey := e.storeOrder[0]
+			e.storeOrder = e.storeOrder[1:]
+			evictedStore = e.stores[evictKey]
+			evictedBridge = e.bridges[evictKey]
+			delete(e.stores, evictKey)
+			delete(e.bridges, evictKey)
+		}
 		st = capabilities.NewStateStore(e.dataDir, cwd)
 		e.stores[key] = st
 	}
@@ -720,6 +870,15 @@ func (e *Engine) workspaceResources(cwd string, pol *policy.Engine) (*capabiliti
 		e.bridges[key] = br
 	} else {
 		br.SetPolicy(pol)
+	}
+	e.touchWorkspaceOrderLocked(key)
+	e.mu.Unlock()
+
+	if evictedStore != nil {
+		evictedStore.Flush()
+	}
+	if evictedBridge != nil {
+		evictedBridge.Close()
 	}
 	return st, br
 }
@@ -759,24 +918,21 @@ func (e *Engine) writeLiveStatusInternal(st LiveStatus, force bool) {
 	}
 }
 
-func formatSuccessEnvelope(res *sandbox.ExecResult, store *capabilities.StateStore, maxOutBytes int) (string, bool) {
+func formatSuccessEnvelope(res *sandbox.ExecResult, store *capabilities.StateStore, sessionID string, maxOutBytes int) (string, bool) {
 	if maxOutBytes <= 0 {
 		maxOutBytes = output.DefaultInlineMaxBytes
 	}
 	warn := formatWarnings(res.Warnings)
 	if warn == "" {
-		return formatSuccessBody(res, store, maxOutBytes)
+		return formatSuccessBody(res, store, sessionID, maxOutBytes)
 	}
-	// Host warnings (auto-rolled-back / un-restorable tx files) must never be truncated away:
-	// reserve their bytes first, then place them right under the header line.
-	body, spilled := formatSuccessBody(res, store, max(1600, maxOutBytes-len(warn)-2))
+	body, spilled := formatSuccessBody(res, store, sessionID, max(1600, maxOutBytes-len(warn)-2))
 	if i := strings.Index(body, "\n\n"); i >= 0 {
 		return body[:i] + "\n\n" + warn + body[i:], spilled
 	}
 	return body + "\n\n" + warn, spilled
 }
 
-// formatWarnings renders host warnings as a compact section, capped so it can never crowd out the result.
 func formatWarnings(ws []string) string {
 	if len(ws) == 0 {
 		return ""
@@ -784,13 +940,11 @@ func formatWarnings(ws []string) string {
 	return output.TruncateWithByteNotice("Warnings:\n  - "+strings.Join(ws, "\n  - "), 1600)
 }
 
-func formatSuccessBody(res *sandbox.ExecResult, store *capabilities.StateStore, maxOutBytes int) (string, bool) {
+func formatSuccessBody(res *sandbox.ExecResult, store *capabilities.StateStore, sessionID string, maxOutBytes int) (string, bool) {
 	header := fmt.Sprintf("[ptc ok | %d host ops | %dms]", len(res.Traces), res.DurationMs)
 	var sections []string
 	sections = append(sections, header)
 
-	// Stdout-first mode: when the script prints via `print()` / `console.log()` without returning a value,
-	// stream raw unescaped stdout directly under the full inline budget (no `Logs:` shell, no `Result:\nnull`, no JSON escaping).
 	if !res.HasValue && len(res.Logs) > 0 {
 		stdout := strings.Join(res.Logs, "\n")
 		avail := maxOutBytes - len(header) - 24
@@ -802,11 +956,10 @@ func formatSuccessBody(res *sandbox.ExecResult, store *capabilities.StateStore, 
 			sections = append(sections, stdout)
 		} else {
 			autoSpilled = true
-			spillKey := store.SaveAutoSpill(stdout)
+			spillKey := store.SaveAutoSpillForSession(sessionID, stdout)
 			if spillKey == "" {
 				sections = append(sections, output.TruncateHeadTailBytes(stdout, avail, ""))
 			} else {
-				// Long text is shown page by page (line-aligned) instead of cut in the middle.
 				sections[0], _ = spillHeader(res, spillKey, stdout)
 				avail = maxOutBytes - len(sections[0]) - 24
 				sections = append(sections, pagedPreview(stdout, avail, spillKey))
@@ -839,7 +992,7 @@ func formatSuccessBody(res *sandbox.ExecResult, store *capabilities.StateStore, 
 			sections = append(sections, resSection)
 		} else {
 			autoSpilled = true
-			spillKey := store.SaveAutoSpill(res.Value)
+			spillKey := store.SaveAutoSpillForSession(sessionID, res.Value)
 			hint := ""
 			avail := totalAvail
 			if spillKey != "" {
@@ -856,10 +1009,8 @@ func formatSuccessBody(res *sandbox.ExecResult, store *capabilities.StateStore, 
 			}
 		}
 	} else if len(logSection)+2+len(resSection) <= totalAvail {
-		// Both stdout logs and return value fit completely inline — never artificially clip logs at 2400B!
 		sections = append(sections, logSection, resSection)
 	} else {
-		// Dynamically split the inline budget between Logs and Result so a tiny Result lets Logs use the rest (and vice versa).
 		autoSpilled = true
 		var spillPayload any
 		if len(resSection) > totalAvail/2 && len(logSection) > totalAvail/2 {
@@ -869,7 +1020,7 @@ func formatSuccessBody(res *sandbox.ExecResult, store *capabilities.StateStore, 
 		} else {
 			spillPayload = rawLogs
 		}
-		spillKey := store.SaveAutoSpill(spillPayload)
+		spillKey := store.SaveAutoSpillForSession(sessionID, spillPayload)
 		hint := ""
 		avail := totalAvail
 		if spillKey != "" {

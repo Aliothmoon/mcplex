@@ -15,6 +15,14 @@ import (
 	"github.com/aliothmoon/mcplex/pkg/events"
 )
 
+const maxSSELineBytes = 16 * 1024 * 1024
+
+var (
+	sseIdleTimeout    = 60 * time.Second
+	sseInitialBackoff = 400 * time.Millisecond
+	sseMaxBackoff     = 3 * time.Second
+)
+
 type eventMsg struct {
 	Event events.Event
 }
@@ -106,14 +114,24 @@ func normalizeEventsURL(rawURL, sessionFilter string) string {
 	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
 		u = "http://" + u
 	}
-	u = strings.TrimRight(u, "/")
-	if !strings.HasSuffix(u, "/events") {
-		u += "/events"
-	}
 	parsed, err := url.Parse(u)
 	if err != nil {
+		u = strings.TrimRight(u, "/")
+		u = strings.TrimSuffix(u, "/mcp")
+		if !strings.HasSuffix(u, "/events") {
+			u += "/events"
+		}
 		return u
 	}
+	p := strings.TrimRight(parsed.Path, "/")
+	if strings.HasSuffix(p, "/mcp") {
+		p = strings.TrimSuffix(p, "/mcp")
+	}
+	if !strings.HasSuffix(p, "/events") {
+		p += "/events"
+	}
+	parsed.Path = p
+
 	q := parsed.Query()
 	if q.Get("replay") == "" {
 		q.Set("replay", "200")
@@ -125,18 +143,85 @@ func normalizeEventsURL(rawURL, sessionFilter string) string {
 	return parsed.String()
 }
 
+// readSSELine reads one newline-delimited SSE line up to maxBytes using bufio.Reader.
+// Oversized lines (> maxBytes) are drained up to '\n' and discarded with tooLong=true and err=nil
+// so a huge payload never traps the client in an ErrTooLong disconnect/replay loop.
+func readSSELine(r *bufio.Reader, maxBytes int) (line string, tooLong bool, err error) {
+	slice, err := r.ReadSlice('\n')
+	if err == nil {
+		return trimSSECRLF(slice), false, nil
+	}
+	if err != bufio.ErrBufferFull {
+		if len(slice) > 0 {
+			return trimSSECRLF(slice), false, nil
+		}
+		return "", false, err
+	}
+
+	var buf []byte
+	overflowed := false
+	if len(slice) <= maxBytes {
+		buf = append(buf, slice...)
+	} else {
+		overflowed = true
+	}
+
+	for {
+		part, rErr := r.ReadSlice('\n')
+		if !overflowed {
+			if len(buf)+len(part) <= maxBytes {
+				buf = append(buf, part...)
+			} else {
+				overflowed = true
+				buf = nil
+			}
+		}
+		if rErr == nil {
+			if overflowed {
+				return "", true, nil
+			}
+			return trimSSECRLF(buf), false, nil
+		}
+		if rErr != bufio.ErrBufferFull {
+			if overflowed {
+				if len(part) > 0 {
+					return "", true, nil
+				}
+				return "", true, rErr
+			}
+			if len(buf) > 0 {
+				return trimSSECRLF(buf), false, nil
+			}
+			return "", false, rErr
+		}
+	}
+}
+
+func trimSSECRLF(b []byte) string {
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		b = b[:len(b)-1]
+	}
+	if len(b) > 0 && b[len(b)-1] == '\r' {
+		b = b[:len(b)-1]
+	}
+	return string(b)
+}
+
 func runSSELoop(ctx context.Context, endpoint, token string, out chan<- tea.Msg) {
 	defer close(out)
-	client := &http.Client{Timeout: 0} // SSE stream has no overall request timeout
+	client := &http.Client{Timeout: 0} // SSE stream has no overall request timeout; guarded by idle watchdog
 	var lastSeq int64
-	backoff := 400 * time.Millisecond
+	var lastInstance string
+	backoff := sseInitialBackoff
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		attemptCtx, attemptCancel := context.WithCancel(ctx)
+		req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, endpoint, nil)
 		if err != nil {
+			attemptCancel()
 			out <- connStatusMsg{Connected: false, Note: err.Error()}
 			return
 		}
@@ -147,9 +232,13 @@ func runSSELoop(ctx context.Context, endpoint, token string, out chan<- tea.Msg)
 		if lastSeq > 0 {
 			req.Header.Set("Last-Event-ID", fmt.Sprintf("%d", lastSeq))
 		}
+		if lastInstance != "" {
+			req.Header.Set("X-MCPlex-Instance", lastInstance)
+		}
 
 		resp, err := client.Do(req)
 		if err != nil {
+			attemptCancel()
 			select {
 			case out <- connStatusMsg{Connected: false, Note: "reconnecting..."}:
 			case <-ctx.Done():
@@ -157,23 +246,48 @@ func runSSELoop(ctx context.Context, endpoint, token string, out chan<- tea.Msg)
 			}
 		} else if resp.StatusCode != http.StatusOK {
 			_ = resp.Body.Close()
+			attemptCancel()
 			select {
 			case out <- connStatusMsg{Connected: false, Note: fmt.Sprintf("HTTP %d", resp.StatusCode)}:
 			case <-ctx.Done():
 				return
 			}
 		} else {
-			backoff = 400 * time.Millisecond
+			backoff = sseInitialBackoff
+			inst := strings.TrimSpace(resp.Header.Get("X-MCPlex-Instance"))
+			if inst != "" {
+				if lastInstance != "" && inst != lastInstance {
+					lastSeq = 0
+				}
+				lastInstance = inst
+			}
 			select {
 			case out <- connStatusMsg{Connected: true, Note: ""}:
 			case <-ctx.Done():
 				_ = resp.Body.Close()
+				attemptCancel()
 				return
 			}
-			scanner := bufio.NewScanner(resp.Body)
-			scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-			for scanner.Scan() {
-				line := scanner.Text()
+
+			idleDur := sseIdleTimeout
+			if idleDur <= 0 {
+				idleDur = 60 * time.Second
+			}
+			idleTimer := time.AfterFunc(idleDur, func() {
+				attemptCancel()
+				_ = resp.Body.Close()
+			})
+
+			reader := bufio.NewReaderSize(resp.Body, 64*1024)
+			for {
+				line, tooLong, rErr := readSSELine(reader, maxSSELineBytes)
+				if rErr != nil {
+					break
+				}
+				idleTimer.Reset(idleDur)
+				if tooLong {
+					continue
+				}
 				if !strings.HasPrefix(line, "data:") {
 					continue
 				}
@@ -185,16 +299,22 @@ func runSSELoop(ctx context.Context, endpoint, token string, out chan<- tea.Msg)
 				if json.Unmarshal([]byte(payload), &ev) == nil {
 					if ev.Seq > lastSeq {
 						lastSeq = ev.Seq
+					} else if ev.Seq > 0 && ev.Seq < lastSeq && lastInstance == "" {
+						lastSeq = ev.Seq
 					}
 					select {
 					case out <- eventMsg{Event: ev}:
 					case <-ctx.Done():
+						idleTimer.Stop()
 						_ = resp.Body.Close()
+						attemptCancel()
 						return
 					}
 				}
 			}
+			idleTimer.Stop()
 			_ = resp.Body.Close()
+			attemptCancel()
 			select {
 			case out <- connStatusMsg{Connected: false, Note: "reconnecting..."}:
 			case <-ctx.Done():
@@ -206,7 +326,7 @@ func runSSELoop(ctx context.Context, endpoint, token string, out chan<- tea.Msg)
 		case <-ctx.Done():
 			return
 		case <-time.After(backoff):
-			if backoff < 3*time.Second {
+			if backoff < sseMaxBackoff {
 				backoff *= 2
 			}
 		}
