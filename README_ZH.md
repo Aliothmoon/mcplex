@@ -4,7 +4,7 @@
 
 **MCPlex** 是一个单二进制、宿主无关的 **Code Mode MCP Tool Proxy** 与可嵌入 Go 核心库（`pkg/`），底层基于本地 TypeScript 沙箱（Go + esbuild + Goja）。
 
-它可以让**任意只支持 MCP 的运行环境**（Claude Desktop/Code、Cursor、Codex、Windsurf、Cline、Dify、n8n、OpenWebUI、容器或自研 Agent）通过**一个自描述的 `exec` 工具**，经由 **stdio** 或 **Streamable HTTP** 安全地组合调用本地工具与下游 MCP 服务器。
+它可以让**任意只支持 MCP 的运行环境**（Claude Desktop/Code、Cursor、Codex、Windsurf、Cline、Dify、n8n、OpenWebUI、容器或自研 Agent）经由 **stdio** 或 **Streamable HTTP** 安全地获得本地 Code Mode 编排、多模态文件直读、后台长任务/常驻服务管控与下游 MCP 代理能力。
 
 ---
 
@@ -59,7 +59,20 @@ mcplex serve \
 
 ---
 
-## 内置沙箱能力一览
+## 对外暴露的 MCP 工具集（`--tools`）
+
+`mcplex serve` 默认启用 `--tools all`，暴露 **4 个正交工具**（若宿主已自带文件与终端工具，可传 `--tools exec` 切换为单工具纯 Code Mode）：
+
+| MCP 工具 | 职责 |
+| :--- | :--- |
+| `exec` | `<15s` 短平快多步 TypeScript 沙箱，一轮完成搜索、AST、事务改码、只读 git、并发校验、`tasks.*` 与下游 `mcp.*` 编排 |
+| `read` | 独立大预算并发文件直读（单次最高 800 行 / 48 KB，支持 `startLine`/`endLine`/`tail`/`byteOffset`）及 `.png`/`.jpg`/`.webp`/`.gif` 原生 MCP 多模态图片返回 |
+| `spawn` | 启动 `>15s` 重构建、全量测试、交互式命令或常驻服务（`daemon: true`）；支持 `waitMs` 同步等待窗口，超时自动转后台并配备进程树/Windows Job Object 兜底清理 |
+| `task` | 后台任务统一管理：`list`、`status`、按字节 `offset`/`tail` 增量拉取 `logs`、带正则 `expect` 毫秒级唤醒的 `wait`、交互式 `input`、`kill` 与 `kill_all` |
+
+---
+
+## 内置沙箱能力一览（`exec`）
 
 | 命名空间 | 核心能力 |
 | :--- | :--- |
@@ -69,6 +82,7 @@ mcplex serve \
 | `edit` & `tx` | 原子多文件替换（`symbol` 作用域自动兼容前置 doc comment 与属性/装饰器）+ 内存快照事务 `tx.begin()`（`edit`/`write`/`rm`/`rename`/`verify`/`diff`/`commit`/自动回滚） |
 | `git` | 只读 `status`、`diff`、`log`、`show`、`blame`、`query` |
 | `sh` | 策略受控的 `exec`、`run`（无 shell 引号问题）、`checks`（并发校验池，返回 `{ ok, summary, results: [{ name, command, ok, exitCode, timedOut, durationMs, output }], failures? }`） |
+| `tasks` | 沙箱内后台任务与常驻进程联动：`spawn`、`list`、`status`、`logs`、`wait`（支持 `expect` 正则）、`input`、`kill`、`killAll` |
 | `state` | 同步 `get`/`set`/`delete`/`keys`/`clear` 及键绑定分页 `page(key, n, size?)` |
 | `tools` & `mcp` | 内置能力目录 + 下游 MCP 服务器主动 `tools/list` 发现与 stdio/HTTP 代理调用（`mcp.<server>.<tool>(args)`） |
 

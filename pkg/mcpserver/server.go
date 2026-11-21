@@ -13,15 +13,18 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/aliothmoon/mcplex/pkg/capabilities"
 	ptcruntime "github.com/aliothmoon/mcplex/pkg/runtime"
+	"github.com/aliothmoon/mcplex/pkg/tasks"
 	"github.com/aliothmoon/mcplex/pkg/version"
 )
 
 const (
-	ServerName             = "agy-ptc"
+	ServerName             = "mcplex"
 	ServerVersion          = version.Version
-	DefaultProtocolVersion = "2025-03-26"
+	DefaultProtocolVersion = "2025-11-25"
 )
 
 var supportedProtocols = map[string]bool{
@@ -50,26 +53,36 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
-// ServerOptions customizes server identity, initialize instructions, exec description, and skill resources.
+// ToolSet controls which optional MCP tools are exposed alongside the core `exec` tool.
+// Zero value exposes only `exec` (used by host plugins like agy-ptc that already have native read/task tools).
+type ToolSet struct {
+	Read  bool // expose standalone `read` tool (text ranges, tail, byteOffset, multimodal images)
+	Tasks bool // expose `spawn` + `task` background process & daemon toolset
+}
+
+// ServerOptions customizes server identity, toolset, initialize instructions, exec description, and skill resources.
 type ServerOptions struct {
 	ServerName         string
-	ServerVersion      string // defaults to version.Version
-	Instructions       string // returned in initialize.result.instructions (MCP 2025-03-26+)
-	ExecDescription    string // custom description for the exec tool
-	DefaultMaxOutBytes int    // advertised default inline output cap (0 -> 9600)
-	SkillResourceURI   string // optional MCP resource URI, e.g. "mcplex://skill"
+	ServerVersion      string  // defaults to version.Version
+	Tools              ToolSet // optional standalone tools alongside `exec`
+	Instructions       string  // returned in initialize.result.instructions (MCP 2025-03-26+)
+	ExecDescription    string  // custom description for the exec tool
+	DefaultMaxOutBytes int     // advertised default inline output cap (0 -> 9600)
+	SkillResourceURI   string  // optional MCP resource URI, e.g. "mcplex://skill"
 	SkillResourceName  string
 	SkillResourceText  string
 }
 
 // Server speaks MCP JSON-RPC 2.0 over stdio (NDJSON & Content-Length) and Streamable HTTP.
 type Server struct {
-	Engine *ptcruntime.Engine
-	opts   ServerOptions
-	wMu    sync.Mutex
+	Engine     *ptcruntime.Engine
+	opts       ServerOptions
+	wMu        sync.Mutex
+	inFlightMu sync.Mutex
+	inFlight   map[string]context.CancelFunc
 }
 
-// NewServer wraps an Engine in an MCP server with default agy-ptc options.
+// NewServer wraps an Engine in an MCP server with default options.
 func NewServer(engine *ptcruntime.Engine) *Server {
 	return NewServerWithOptions(engine, ServerOptions{ServerName: ServerName})
 }
@@ -79,7 +92,11 @@ func NewServerWithOptions(engine *ptcruntime.Engine, opts ServerOptions) *Server
 	if strings.TrimSpace(opts.ServerName) == "" {
 		opts.ServerName = ServerName
 	}
-	return &Server{Engine: engine, opts: opts}
+	return &Server{
+		Engine:   engine,
+		opts:     opts,
+		inFlight: map[string]context.CancelFunc{},
+	}
 }
 
 func (s *Server) serverName() string {
@@ -216,33 +233,158 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 		}
 	}
 
-	for {
-		n, err := in.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			drain()
-		}
-		if err != nil {
-			if rem := bytes.TrimSpace(buf); len(rem) > 0 {
-				low := strings.ToLower(string(rem[:min(len(rem), 16)]))
-				if !strings.HasPrefix(low, "content-length:") && !strings.HasPrefix(low, "content-type:") {
-					dispatch(rem, false)
-				}
+	type readChunk struct {
+		data []byte
+		err  error
+	}
+	readCh := make(chan readChunk, 4)
+	go func() {
+		defer close(readCh)
+		for {
+			n, err := in.Read(tmp)
+			var cp []byte
+			if n > 0 {
+				cp = append([]byte(nil), tmp[:n]...)
 			}
-			inFlight.Wait()
-			if err == io.EOF {
+			select {
+			case readCh <- readChunk{data: cp, err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.cancelAllInFlight()
+			waitDone := make(chan struct{})
+			go func() {
+				inFlight.Wait()
+				close(waitDone)
+			}()
+			select {
+			case <-waitDone:
+			case <-time.After(2 * time.Second):
+			}
+			return ctx.Err()
+		case chunk, ok := <-readCh:
+			if !ok {
+				inFlight.Wait()
 				return nil
 			}
-			return err
+			if len(chunk.data) > 0 {
+				buf = append(buf, chunk.data...)
+				drain()
+			}
+			if chunk.err != nil {
+				if rem := bytes.TrimSpace(buf); len(rem) > 0 {
+					low := strings.ToLower(string(rem[:min(len(rem), 16)]))
+					if !strings.HasPrefix(low, "content-length:") && !strings.HasPrefix(low, "content-type:") {
+						dispatch(rem, false)
+					}
+				}
+				inFlight.Wait()
+				if chunk.err == io.EOF {
+					return nil
+				}
+				return chunk.err
+			}
 		}
 	}
 }
 
+func (s *Server) registerInFlight(id json.RawMessage, cancel context.CancelFunc) string {
+	key := canonicalIDKey(id)
+	if key == "" {
+		return ""
+	}
+	s.inFlightMu.Lock()
+	if s.inFlight == nil {
+		s.inFlight = map[string]context.CancelFunc{}
+	}
+	s.inFlight[key] = cancel
+	s.inFlightMu.Unlock()
+	return key
+}
+
+func (s *Server) unregisterInFlight(key string) {
+	if key == "" {
+		return
+	}
+	s.inFlightMu.Lock()
+	delete(s.inFlight, key)
+	s.inFlightMu.Unlock()
+}
+
+func (s *Server) cancelInFlight(id json.RawMessage) bool {
+	key := canonicalIDKey(id)
+	if key == "" {
+		return false
+	}
+	s.inFlightMu.Lock()
+	cancel, ok := s.inFlight[key]
+	s.inFlightMu.Unlock()
+	if ok && cancel != nil {
+		cancel()
+		return true
+	}
+	return false
+}
+
+func (s *Server) cancelAllInFlight() {
+	s.inFlightMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(s.inFlight))
+	for _, c := range s.inFlight {
+		cancels = append(cancels, c)
+	}
+	s.inFlightMu.Unlock()
+	for _, c := range cancels {
+		c()
+	}
+}
+
+func canonicalIDKey(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(trimmed, &s) == nil {
+		return "s:" + s
+	}
+	var n json.Number
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
+	if dec.Decode(&n) == nil {
+		return "n:" + n.String()
+	}
+	return string(trimmed)
+}
+
 func (s *Server) handleSingle(ctx context.Context, req jsonRPCRequest) *jsonRPCResponse {
-	// Notifications (missing ID) must not emit a response.
+	// Notifications (missing ID) must not emit a response, but notifications/cancelled aborts in-flight calls (#12).
 	if len(req.ID) == 0 {
+		if req.Method == "notifications/cancelled" {
+			var cancelParams struct {
+				RequestID json.RawMessage `json:"requestId"`
+			}
+			if json.Unmarshal(req.Params, &cancelParams) == nil && len(cancelParams.RequestID) > 0 {
+				s.cancelInFlight(cancelParams.RequestID)
+			}
+		}
 		return nil
 	}
+	reqCtx, reqCancel := context.WithCancel(ctx)
+	key := s.registerInFlight(req.ID, reqCancel)
+	defer func() {
+		s.unregisterInFlight(key)
+		reqCancel()
+	}()
+	ctx = reqCtx
 	if req.Method == "" {
 		return &jsonRPCResponse{
 			JSONRPC: "2.0",
@@ -297,11 +439,18 @@ func (s *Server) handleSingle(ctx context.Context, req jsonRPCRequest) *jsonRPCR
 		return &jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
 
 	case "tools/list":
+		tools := []any{s.execToolDefinition()}
+		if s.opts.Tools.Read {
+			tools = append(tools, s.readToolDefinition())
+		}
+		if s.opts.Tools.Tasks {
+			tools = append(tools, s.spawnToolDefinition(), s.taskToolDefinition())
+		}
 		return &jsonRPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
 			Result: map[string]any{
-				"tools": []any{s.execToolDefinition()},
+				"tools": tools,
 			},
 		}
 
@@ -371,36 +520,7 @@ func (s *Server) handleSingle(ctx context.Context, req jsonRPCRequest) *jsonRPCR
 				Error:   &rpcError{Code: -32602, Message: "Invalid params"},
 			}
 		}
-		if callParams.Name != "exec" {
-			return &jsonRPCResponse{
-				JSONRPC: "2.0",
-				ID:      req.ID,
-				Error:   &rpcError{Code: -32602, Message: "Unknown tool: " + callParams.Name},
-			}
-		}
-		var in ptcruntime.ExecInput
-		if len(callParams.Arguments) > 0 {
-			// Accept either flat object `{ code, payloads, cwd, title, timeoutMs }` or bare string fallback
-			if callParams.Arguments[0] == '"' {
-				var rawCode string
-				if json.Unmarshal(callParams.Arguments, &rawCode) == nil {
-					in.Code = rawCode
-				}
-			} else {
-				_ = json.Unmarshal(callParams.Arguments, &in)
-			}
-		}
-		outText, isErr := s.Engine.RunMCPExec(ctx, in)
-		return &jsonRPCResponse{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Result: map[string]any{
-				"content": []map[string]any{
-					{"type": "text", "text": outText},
-				},
-				"isError": isErr,
-			},
-		}
+		return s.dispatchToolCall(ctx, req.ID, callParams.Name, callParams.Arguments)
 
 	default:
 		return &jsonRPCResponse{
@@ -434,7 +554,7 @@ func (s *Server) execToolDefinition() map[string]any {
 			"properties": map[string]any{
 				"code": map[string]any{
 					"type":        "string",
-					"description": "TypeScript async function body (top-level `await`, `print()`/`console.log()` stdout, and `return` supported; do not wrap in `async function`). Globals: `fs`, `search`, `ast`, `edit`, `tx`, `git`, `sh`, `state`, `tools`, `mcp`, `P`/`payloads`, plus `Buffer`, `TextEncoder`/`TextDecoder`, `btoa`/`atob`, `path`, `crypto`, `URL`/`URLSearchParams`, `process`/`os`, `setTimeout`, `structuredClone`.",
+					"description": s.execCodeArgDescription(),
 				},
 				"payloads": map[string]any{
 					"type":                 "object",
@@ -463,6 +583,280 @@ func (s *Server) execToolDefinition() map[string]any {
 				},
 			},
 			"required": required,
+		},
+	}
+}
+
+func (s *Server) execCodeArgDescription() string {
+	globals := "`fs`, `search`, `ast`, `edit`, `tx`, `git`, `sh`, `state`, `tools`, `mcp`, `P`/`payloads`"
+	if s.opts.Tools.Tasks {
+		globals = "`fs`, `search`, `ast`, `edit`, `tx`, `git`, `sh`, `tasks`, `state`, `tools`, `mcp`, `P`/`payloads`"
+	}
+	return "TypeScript async function body (top-level `await`, `print()`/`console.log()` stdout, and `return` supported; do not wrap in `async function`). Globals: " + globals + ", plus `Buffer`, `TextEncoder`/`TextDecoder`, `btoa`/`atob`, `path`, `crypto`, `URL`/`URLSearchParams`, `process`/`os`, `setTimeout`, `structuredClone`."
+}
+
+func (s *Server) dispatchToolCall(ctx context.Context, id json.RawMessage, name string, rawArgs json.RawMessage) *jsonRPCResponse {
+	switch name {
+	case "exec":
+		var in ptcruntime.ExecInput
+		if trimmed := bytes.TrimSpace(rawArgs); len(trimmed) > 0 {
+			// Accept either flat object `{ code, payloads, cwd, title, timeoutMs }` or bare string fallback
+			if trimmed[0] == '"' {
+				var rawCode string
+				if err := json.Unmarshal(trimmed, &rawCode); err != nil {
+					return toolTextResponse(id, "BadArgs: invalid exec code string: "+err.Error(), true)
+				}
+				in.Code = rawCode
+			} else {
+				if err := json.Unmarshal(trimmed, &in); err != nil {
+					return toolTextResponse(id, "BadArgs: invalid exec arguments (check field types, e.g. timeoutMs must be integer and payloads values must be strings): "+err.Error(), true)
+				}
+			}
+		}
+		if in.TimeoutMs > 0 && in.TimeoutMs < 500 {
+			in.TimeoutMs = 500
+		}
+		outText, isErr := s.Engine.RunMCPExec(ctx, in)
+		return toolTextResponse(id, outText, isErr)
+
+	case "read":
+		if !s.opts.Tools.Read {
+			return unknownToolResponse(id, name)
+		}
+		var req capabilities.DirectReadRequest
+		if len(rawArgs) > 0 {
+			if err := json.Unmarshal(rawArgs, &req); err != nil {
+				return toolTextResponse(id, "BadArgs: invalid read arguments: "+err.Error(), true)
+			}
+		}
+		res, err := s.Engine.RunReadTool(ctx, req)
+		if err != nil {
+			return toolTextResponse(id, err.Error(), true)
+		}
+		if res.IsImage {
+			return &jsonRPCResponse{
+				JSONRPC: "2.0",
+				ID:      id,
+				Result: map[string]any{
+					"content": []map[string]any{
+						{"type": "text", "text": res.Text},
+						{"type": "image", "data": res.ImageData, "mimeType": res.ImageMIME},
+					},
+					"isError": false,
+				},
+			}
+		}
+		return toolTextResponse(id, res.Text, false)
+
+	case "spawn":
+		if !s.opts.Tools.Tasks {
+			return unknownToolResponse(id, name)
+		}
+		var req tasks.StartRequest
+		if len(rawArgs) > 0 {
+			if err := json.Unmarshal(rawArgs, &req); err != nil {
+				return toolTextResponse(id, "BadArgs: invalid spawn arguments: "+err.Error(), true)
+			}
+		}
+		_, formatted, err := s.Engine.RunTaskSpawn(ctx, req)
+		if err != nil {
+			return toolTextResponse(id, err.Error(), true)
+		}
+		return toolTextResponse(id, formatted, false)
+
+	case "task":
+		if !s.opts.Tools.Tasks {
+			return unknownToolResponse(id, name)
+		}
+		var req tasks.ManageRequest
+		if len(rawArgs) > 0 {
+			if err := json.Unmarshal(rawArgs, &req); err != nil {
+				return toolTextResponse(id, "BadArgs: invalid task arguments: "+err.Error(), true)
+			}
+		}
+		_, formatted, err := s.Engine.RunTaskManage(ctx, req)
+		if err != nil {
+			return toolTextResponse(id, err.Error(), true)
+		}
+		return toolTextResponse(id, formatted, false)
+
+	default:
+		return unknownToolResponse(id, name)
+	}
+}
+
+func toolTextResponse(id json.RawMessage, text string, isErr bool) *jsonRPCResponse {
+	return &jsonRPCResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Result: map[string]any{
+			"content": []map[string]any{
+				{"type": "text", "text": text},
+			},
+			"isError": isErr,
+		},
+	}
+}
+
+func unknownToolResponse(id json.RawMessage, name string) *jsonRPCResponse {
+	return &jsonRPCResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error:   &rpcError{Code: -32602, Message: "Unknown tool: " + name},
+	}
+}
+
+func (s *Server) readToolDefinition() map[string]any {
+	return map[string]any{
+		"name":        "read",
+		"description": "Read a text file (up to 800 lines / 48 KB per call with line numbers, range, tail, or byteOffset pagination) or an image (.png/.jpg/.webp/.gif returned as a native MCP image block). Prefer parallel `read` calls for whole files or screenshots; use `exec` for multi-step search/AST/editing.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{
+					"type":        "string",
+					"description": "File path (relative to cwd or absolute).",
+				},
+				"cwd": map[string]any{
+					"type":        "string",
+					"description": "Optional workspace root directory override.",
+				},
+				"startLine": map[string]any{
+					"type":        "integer",
+					"minimum":     1,
+					"description": "1-based start line (inclusive). Omit to read from line 1.",
+				},
+				"endLine": map[string]any{
+					"type":        "integer",
+					"minimum":     1,
+					"description": "1-based end line (inclusive). Defaults to startLine + 799.",
+				},
+				"tail": map[string]any{
+					"type":        "integer",
+					"minimum":     1,
+					"description": "Read the last N lines of any size file (mutually exclusive with startLine/endLine).",
+				},
+				"byteOffset": map[string]any{
+					"type":        "integer",
+					"minimum":     0,
+					"description": "UTF-8 byte offset within the selected line range to continue after truncation.",
+				},
+				"lineNumbers": map[string]any{
+					"type":        "boolean",
+					"description": "Prefix lines with 1-based line numbers (default true).",
+				},
+				"maxBytes": map[string]any{
+					"type":        "integer",
+					"minimum":     1024,
+					"maximum":     262144,
+					"description": "Optional max UTF-8 bytes returned (default 49152, max 262144).",
+				},
+			},
+			"required": []string{"path"},
+		},
+	}
+}
+
+func (s *Server) spawnToolDefinition() map[string]any {
+	return map[string]any{
+		"name":        "spawn",
+		"description": "Start a long-running shell command (>15s builds, full test suites, interactive commands) or persistent daemon (daemon: true for dev servers, watchers, tunnels). Waits up to waitMs for fast completion, then hands off to background and returns a taskId managed via `task`.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command": map[string]any{
+					"type":        "string",
+					"description": "Shell command line to execute.",
+				},
+				"cwd": map[string]any{
+					"type":        "string",
+					"description": "Optional working directory (defaults to server --cwd or client root).",
+				},
+				"shell": map[string]any{
+					"type":        "string",
+					"enum":        []string{"pwsh", "powershell", "cmd", "bash", "sh"},
+					"description": "Optional shell dialect override.",
+				},
+				"env": map[string]any{
+					"type":                 "object",
+					"additionalProperties": map[string]any{"type": "string"},
+					"description":          "Optional extra environment variables.",
+				},
+				"daemon": map[string]any{
+					"type":        "boolean",
+					"description": "Set true for persistent support processes (dev servers, watchers, tunnels) that are not expected to exit on their own.",
+				},
+				"waitMs": map[string]any{
+					"type":        "integer",
+					"minimum":     0,
+					"maximum":     30000,
+					"description": "Milliseconds to wait synchronously before backgrounding (default 5000, or 1500 when daemon is true).",
+				},
+				"timeoutSec": map[string]any{
+					"type":        "integer",
+					"minimum":     0,
+					"description": "Background wall-clock timeout in seconds (default 1800 for normal commands, 0 = unlimited for daemons).",
+				},
+				"name": map[string]any{
+					"type":        "string",
+					"description": "Optional short label used in taskId (e.g. 'vite-dev', 'cargo-build').",
+				},
+			},
+			"required": []string{"command"},
+		},
+	}
+}
+
+func (s *Server) taskToolDefinition() map[string]any {
+	return map[string]any{
+		"name":        "task",
+		"description": "Manage background tasks and daemons started by `spawn`: list all tasks, inspect status or incremental logs, wait until exit or a regex `expect` pattern appears in output, send stdin input, or kill process trees.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"action": map[string]any{
+					"type":        "string",
+					"enum":        []string{"list", "status", "logs", "wait", "input", "kill", "kill_all"},
+					"description": "Operation to perform.",
+				},
+				"taskId": map[string]any{
+					"type":        "string",
+					"description": "Target task ID returned by `spawn` or `list` (required except for list and kill_all).",
+				},
+				"tail": map[string]any{
+					"type":        "integer",
+					"minimum":     1,
+					"description": "Number of recent log lines to return (for status/logs/wait; default 80).",
+				},
+				"offset": map[string]any{
+					"type":        "integer",
+					"minimum":     0,
+					"description": "Byte offset for incremental log reads (action='logs'); pass previous nextOffset to read only new output.",
+				},
+				"waitMs": map[string]any{
+					"type":        "integer",
+					"minimum":     100,
+					"maximum":     60000,
+					"description": "Max milliseconds to wait (action='wait'; default 15000, max 60000).",
+				},
+				"expect": map[string]any{
+					"type":        "string",
+					"description": "Optional Go/RE2 regex (action='wait'): returns immediately when a matching log line appears (e.g. 'listening on|ready in').",
+				},
+				"input": map[string]any{
+					"type":        "string",
+					"description": "Text to write to process stdin (action='input').",
+				},
+				"appendNewline": map[string]any{
+					"type":        "boolean",
+					"description": "Append trailing newline when sending stdin input (default true).",
+				},
+				"closeStdin": map[string]any{
+					"type":        "boolean",
+					"description": "Close stdin pipe (EOF) after writing input (action='input').",
+				},
+			},
+			"required": []string{"action"},
 		},
 	}
 }

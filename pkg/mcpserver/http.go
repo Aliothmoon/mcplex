@@ -10,9 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+
+	ptcruntime "github.com/aliothmoon/mcplex/pkg/runtime"
 )
 
 const maxHTTPBodyBytes = 16 * 1024 * 1024 // 16 MB
@@ -47,6 +52,12 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 	})
 
 	mux.HandleFunc(mcpPath, func(w http.ResponseWriter, r *http.Request) {
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin != "" && !isAllowedOrigin(origin, r.Host, opts.AllowOrigin) {
+			w.Header().Set("Content-Type", "application/json")
+			http.Error(w, `{"error":"forbidden origin"}`, http.StatusForbidden)
+			return
+		}
 		if opts.AllowOrigin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", opts.AllowOrigin)
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, MCP-Protocol-Version")
@@ -63,12 +74,20 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 			return
 		}
 		if r.Method == http.MethodDelete {
+			if sid := strings.TrimSpace(r.Header.Get("Mcp-Session-Id")); sid != "" && s.Engine != nil {
+				s.Engine.CloseSession(sid)
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", "POST, DELETE, OPTIONS")
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !isJSONContentType(r.Header.Get("Content-Type")) {
+			w.Header().Set("Content-Type", "application/json")
+			http.Error(w, `{"error":"Content-Type must be application/json"}`, http.StatusUnsupportedMediaType)
 			return
 		}
 
@@ -102,11 +121,14 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 				return
 			}
 			var replies []jsonRPCResponse
+			sid := strings.TrimSpace(r.Header.Get("Mcp-Session-Id"))
 			for _, req := range batch {
-				if req.Method == "initialize" && r.Header.Get("Mcp-Session-Id") == "" {
-					w.Header().Set("Mcp-Session-Id", newSessionID())
+				if req.Method == "initialize" && sid == "" {
+					sid = newSessionID()
+					w.Header().Set("Mcp-Session-Id", sid)
 				}
-				if resp := s.handleSingle(r.Context(), req); resp != nil {
+				reqCtx := ptcruntime.WithSessionID(r.Context(), sid)
+				if resp := s.handleSingle(reqCtx, req); resp != nil {
 					replies = append(replies, *resp)
 				}
 			}
@@ -130,14 +152,14 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 			})
 			return
 		}
+		sid := strings.TrimSpace(r.Header.Get("Mcp-Session-Id"))
 		if req.Method == "initialize" {
-			sid := strings.TrimSpace(r.Header.Get("Mcp-Session-Id"))
 			if sid == "" {
 				sid = newSessionID()
 			}
 			w.Header().Set("Mcp-Session-Id", sid)
 		}
-		resp := s.handleSingle(r.Context(), req)
+		resp := s.handleSingle(ptcruntime.WithSessionID(r.Context(), sid), req)
 		if resp == nil {
 			w.WriteHeader(http.StatusAccepted)
 			return
@@ -177,6 +199,48 @@ func (s *Server) ServeHTTP(ctx context.Context, opts HTTPOptions) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+func isJSONContentType(header string) bool {
+	if strings.TrimSpace(header) == "" {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(header)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(mediaType, "application/json")
+}
+
+// isAllowedOrigin enforces MCP Streamable HTTP Origin checks to prevent DNS-rebinding & browser CSRF attacks.
+func isAllowedOrigin(origin, reqHost, allowOrigin string) bool {
+	ao := strings.TrimSpace(allowOrigin)
+	if ao == "*" {
+		return true
+	}
+	if ao != "" && strings.EqualFold(origin, ao) {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return false
+	}
+	// Same-origin loopback requests (e.g. local inspector UI on the exact same host:port) are permitted.
+	if strings.EqualFold(u.Host, reqHost) && isLoopbackHost(u.Hostname()) {
+		return true
+	}
+	return false
+}
+
+func isLoopbackHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 func validBearerToken(header, expected string) bool {

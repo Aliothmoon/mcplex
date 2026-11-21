@@ -105,6 +105,7 @@ type Options struct {
 	StrictWorkspace       bool     // force allowNonWorkspaceAccess = false (confine to workspaceRoots)
 	TrustWorkspaceMCP     bool     // allow <workspace>/.agents/mcp_config.json
 	PolicyFiles           []string // explicit JSON policy files to load in order
+	ProtectedFiles        []string // additional config files (e.g. --mcp-config) protected against sandbox writes
 	LoadAntigravityConfig bool     // load ~/.gemini/antigravity-cli/settings.json & ~/.gemini/config/agy-ptc/policy.json & PLUGIN_DATA/policy.json
 	NativeEscalationHint  bool     // include "; run it via native run_command" in DecisionAsk messages
 }
@@ -118,6 +119,7 @@ type Engine struct {
 	askRules                []parsedRule
 	allowRules              []parsedRule
 	sensitiveDirs           []string
+	protectedFiles          []string
 }
 
 // NewEngine creates a policy engine rooted at workspaceDir and aligned with ~/.gemini/antigravity-cli/settings.json.
@@ -189,10 +191,26 @@ func NewEngineWithOptions(workspaceDir string, opts Options) *Engine {
 			e.loadSettingsFile(filepath.Join(pd, "policy.json"))
 		}
 	}
+	addProtected := func(p string) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			if real, rerr := evalSymlinksExisting(abs); rerr == nil {
+				abs = real
+			}
+			e.protectedFiles = append(e.protectedFiles, abs)
+		}
+	}
 	for _, pf := range opts.PolicyFiles {
 		if strings.TrimSpace(pf) != "" {
 			e.loadSettingsFile(pf)
+			addProtected(pf)
 		}
+	}
+	for _, pf := range opts.ProtectedFiles {
+		addProtected(pf)
 	}
 	if opts.StrictWorkspace || strictEnv {
 		e.allowNonWorkspaceAccess = false
@@ -257,7 +275,7 @@ func (e *Engine) ResolveAndCheckRead(baseDir, targetPath string) (string, error)
 	if err != nil {
 		return "", err
 	}
-	if e.isSensitivePath(realPath) {
+	if e.isSensitivePath(realPath) || e.isSensitivePath(abs) {
 		return "", &PolicyError{
 			Decision: DecisionDeny,
 			Action:   "read_file",
@@ -287,7 +305,7 @@ func (e *Engine) ResolveAndCheckWrite(baseDir, targetPath string) (string, error
 	if err != nil {
 		return "", err
 	}
-	if e.isSensitivePath(realPath) || isProtectedGitInternal(realPath) || isProtectedSystemRoot(realPath) {
+	if e.isSensitivePath(realPath) || e.isSensitivePath(abs) || isProtectedGitInternal(realPath) || isProtectedGitInternal(abs) || e.isProtectedSystemRoot(realPath) {
 		return "", &PolicyError{
 			Decision: DecisionDeny,
 			Action:   "write_file",
@@ -299,10 +317,10 @@ func (e *Engine) ResolveAndCheckWrite(baseDir, targetPath string) (string, error
 	if dec, matched := e.evalRules("read_file", realPath); matched && dec == DecisionDeny {
 		return "", &PolicyError{Decision: DecisionDeny, Action: "write_file", Target: targetPath, Reason: "read deny rule"}
 	}
-	// Self-escalation guard: agent permission/MCP/hook configs, the plugin itself, shell startup files and
-	// global git config are never rewritten from inside the sandbox (user allow rules cannot override this).
-	if isProtectedConfigPath(realPath) || isProtectedConfigPath(abs) {
-		return "", e.policyErr(DecisionAsk, "write_file", targetPath, "protected agent/plugin/shell/git config")
+	// Self-escalation guard: agent permission/MCP/hook configs, explicit --policy-file/--mcp-config,
+	// the plugin itself, shell startup files and global git config are never rewritten from inside the sandbox.
+	if isProtectedConfigPath(realPath) || isProtectedConfigPath(abs) || e.isProtectedExplicitFile(realPath) || e.isProtectedExplicitFile(abs) {
+		return "", e.policyErr(DecisionAsk, "write_file", targetPath, "protected agent/plugin/policy/shell/git config")
 	}
 	if dec, matched := e.evalRules("write_file", realPath); matched {
 		if dec != DecisionAllow {
@@ -718,18 +736,25 @@ func (e *Engine) isTempOrScratch(realPath string) bool {
 	}
 	home := userHomeDir()
 	if home != "" {
-		brain := strings.TrimSuffix(normalizeComparePath(filepath.Join(home, ".gemini")), "/")
-		if norm == brain || strings.HasPrefix(norm, brain+"/") {
-			return true
+		// Only allow Antigravity artifact/scratch brain directories, NOT all of ~/.gemini (which holds .env and oauth_creds.json).
+		for _, sub := range []string{
+			filepath.Join(home, ".gemini", "antigravity-cli", "brain"),
+			filepath.Join(home, ".gemini", "antigravity", "brain"),
+		} {
+			brain := strings.TrimSuffix(normalizeComparePath(sub), "/")
+			if norm == brain || strings.HasPrefix(norm, brain+"/") {
+				return true
+			}
 		}
 	}
 	return false
 }
 
 func (e *Engine) isSensitivePath(realPath string) bool {
-	norm := normalizeComparePath(realPath)
+	// Always compare case-insensitively so APFS (macOS) and NTFS/FAT never bypass credential guards.
+	norm := strings.ToLower(filepath.ToSlash(filepath.Clean(realPath)))
 	for _, s := range e.sensitiveDirs {
-		ns := strings.TrimSuffix(normalizeComparePath(s), "/")
+		ns := strings.TrimSuffix(strings.ToLower(filepath.ToSlash(filepath.Clean(s))), "/")
 		if norm == ns || strings.HasPrefix(norm, ns+"/") {
 			return true
 		}
@@ -737,17 +762,38 @@ func (e *Engine) isSensitivePath(realPath string) bool {
 	return false
 }
 
+func (e *Engine) isProtectedExplicitFile(realPath string) bool {
+	if len(e.protectedFiles) == 0 {
+		return false
+	}
+	norm := strings.ToLower(filepath.ToSlash(filepath.Clean(realPath)))
+	for _, pf := range e.protectedFiles {
+		npf := strings.ToLower(filepath.ToSlash(filepath.Clean(pf)))
+		if norm == npf {
+			return true
+		}
+	}
+	return false
+}
+
 func isProtectedGitInternal(realPath string) bool {
-	norm := "/" + strings.Trim(normalizeRulePath(realPath), "/") + "/"
+	norm := "/" + strings.Trim(strings.ToLower(normalizeRulePath(realPath)), "/") + "/"
 	if strings.Contains(norm, "/.git/hooks/") || strings.HasSuffix(norm, "/.git/config/") || strings.Contains(norm, "/.git/objects/") {
 		return true
 	}
 	return false
 }
 
-func isProtectedSystemRoot(realPath string) bool {
-	norm := strings.TrimSuffix(normalizeRulePath(realPath), "/")
-	for _, sys := range []string{"/windows", "/program files", "/program files (x86)", "/etc", "/usr", "/bin", "/sbin", "/boot", "/system"} {
+func (e *Engine) isProtectedSystemRoot(realPath string) bool {
+	if runtime.GOOS == "windows" {
+		return isProtectedWindowsSystemRoot(realPath)
+	}
+	// On Unix/macOS, allow explicitly configured workspace roots (e.g. Docker WORKDIR /usr/src/app).
+	if e.isInsideWorkspace(realPath) {
+		return false
+	}
+	norm := strings.TrimSuffix(strings.ToLower(filepath.ToSlash(filepath.Clean(realPath))), "/")
+	for _, sys := range []string{"/etc", "/usr", "/bin", "/sbin", "/boot", "/system", "/lib", "/lib64"} {
 		if norm == sys || strings.HasPrefix(norm, sys+"/") {
 			return true
 		}
@@ -755,10 +801,53 @@ func isProtectedSystemRoot(realPath string) bool {
 	return false
 }
 
+func isProtectedWindowsSystemRoot(realPath string) bool {
+	norm := strings.TrimSuffix(strings.ToLower(filepath.ToSlash(filepath.Clean(realPath))), "/")
+	sysDrive := strings.ToLower(strings.TrimSpace(os.Getenv("SystemDrive")))
+	if sysDrive == "" {
+		sysDrive = "c:"
+	}
+	for _, sub := range []string{"/windows", "/program files", "/program files (x86)", "/programdata"} {
+		root := sysDrive + sub
+		if norm == root || strings.HasPrefix(norm, root+"/") {
+			return true
+		}
+	}
+	if sr := strings.TrimSpace(os.Getenv("SystemRoot")); sr != "" {
+		srNorm := strings.TrimSuffix(strings.ToLower(filepath.ToSlash(filepath.Clean(sr))), "/")
+		if norm == srNorm || strings.HasPrefix(norm, srNorm+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasWindowsAlternateDataStream detects NTFS Alternate Data Stream suffixes (e.g. ".git/config::$DATA",
+// "file.txt:stream") or raw device namespaces ("\\.\", "\\?\") that can bypass suffix/name checks on Windows.
+func hasWindowsAlternateDataStream(p string) bool {
+	s := strings.ReplaceAll(strings.TrimSpace(p), "\\", "/")
+	if strings.HasPrefix(s, "//./") || strings.HasPrefix(s, "//?/") {
+		return true
+	}
+	// Skip valid leading drive prefix "C:" (ASCII letter + ':').
+	if len(s) >= 2 && ((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z')) && s[1] == ':' {
+		s = s[2:]
+	}
+	return strings.Contains(s, ":")
+}
+
 func resolveWithSymlinks(baseDir, p string) (absPath string, realPath string, err error) {
 	p = strings.TrimSpace(p)
 	if p == "" {
 		return "", "", errors.New("path cannot be empty")
+	}
+	if runtime.GOOS == "windows" && hasWindowsAlternateDataStream(p) {
+		return "", "", &PolicyError{
+			Decision: DecisionDeny,
+			Action:   "path",
+			Target:   p,
+			Reason:   "Windows alternate data stream or device path is not allowed",
+		}
 	}
 	if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) || p == "~" {
 		if h := userHomeDir(); h != "" {
@@ -807,7 +896,7 @@ func evalSymlinksExisting(absPath string) (string, error) {
 
 func normalizeComparePath(p string) string {
 	s := filepath.ToSlash(filepath.Clean(p))
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
 		s = strings.ToLower(s)
 	}
 	return s
@@ -819,7 +908,7 @@ func normalizeRulePath(p string) string {
 	if len(s) >= 2 && s[1] == ':' {
 		s = s[2:]
 	}
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
 		s = strings.ToLower(s)
 	}
 	if !strings.HasPrefix(s, "/") {

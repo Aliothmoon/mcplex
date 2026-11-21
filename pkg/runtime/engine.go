@@ -20,6 +20,7 @@ import (
 	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/policy"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
+	"github.com/aliothmoon/mcplex/pkg/tasks"
 )
 
 // LiveStatus is written atomically to `${PLUGIN_DATA}/live-status.json` for `agy-ptc statusline`.
@@ -45,6 +46,7 @@ type EngineOptions struct {
 	MCPConfigPaths        []string
 	TrustWorkspaceMCP     bool
 	AntigravityMode       bool // true for agy-ptc plugin; false for standalone generic mcplex
+	EnableTasks           bool // enable background tasks manager & sandbox tasks.* namespace
 }
 
 // Engine manages workspace-scoped capability instances, state stores, audit logs, and PTC program execution.
@@ -59,11 +61,15 @@ type Engine struct {
 	mcpConfigPaths        []string
 	trustWorkspaceMCP     bool
 	antigravityMode       bool
+	enableTasks           bool
+	taskMgr               *tasks.Manager
 	auditor               *audit.Logger
 	mu                    sync.Mutex
 	statusMu              sync.Mutex
+	lastStatusWrite       time.Time
 	stores                map[string]*capabilities.StateStore
 	bridges               map[string]*capabilities.MCPBridge
+	fileLocks             *capabilities.FileLockTable
 	totalRuns             atomic.Int64
 	totalHostOps          atomic.Int64
 	statusSeq             atomic.Int64
@@ -103,21 +109,69 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 		mcpConfigPaths:        append([]string(nil), opts.MCPConfigPaths...),
 		trustWorkspaceMCP:     opts.TrustWorkspaceMCP,
 		antigravityMode:       opts.AntigravityMode,
+		enableTasks:           opts.EnableTasks,
 		auditor:               audit.NewLogger(dataDir),
 		stores:                map[string]*capabilities.StateStore{},
 		bridges:               map[string]*capabilities.MCPBridge{},
+		fileLocks:             capabilities.NewFileLockTable(),
 	}
 }
 
-// Close shuts down pooled external MCP processes.
-func (e *Engine) Close() {
+type sessionCtxKey struct{}
+
+// WithSessionID attaches an MCP session identifier (e.g. HTTP Mcp-Session-Id) to ctx for task isolation.
+func WithSessionID(ctx context.Context, sessionID string) context.Context {
+	sid := strings.TrimSpace(sessionID)
+	if sid == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, sessionCtxKey{}, sid)
+}
+
+// SessionIDFromContext extracts the MCP session identifier from ctx, or "" for stdio/default sessions.
+func SessionIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(sessionCtxKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+func (e *Engine) ensureTaskManager() *tasks.Manager {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.taskMgr == nil {
+		e.taskMgr = tasks.NewManager(e.dataDir)
+	}
+	return e.taskMgr
+}
+
+// CloseSession terminates any running background tasks started by sessionID.
+func (e *Engine) CloseSession(sessionID string) int {
+	e.mu.Lock()
+	tm := e.taskMgr
+	e.mu.Unlock()
+	if tm == nil {
+		return 0
+	}
+	return tm.CloseSession(sessionID)
+}
+
+// Close shuts down pooled external MCP processes and terminates all running background tasks.
+func (e *Engine) Close() {
+	e.mu.Lock()
+	tm := e.taskMgr
 	for _, br := range e.bridges {
 		br.Close()
 	}
 	for _, st := range e.stores {
 		st.Flush()
+	}
+	e.mu.Unlock()
+	if tm != nil {
+		tm.Close()
 	}
 }
 
@@ -130,6 +184,58 @@ type ExecInput struct {
 	TimeoutMs      int               `json:"timeoutMs,omitempty"`
 	TimeoutSec     int               `json:"timeoutSec,omitempty"`
 	MaxOutputBytes int               `json:"maxOutputBytes,omitempty"`
+}
+
+func (e *Engine) newPolicyForCwd(cwd string) *policy.Engine {
+	return policy.NewEngineWithOptions(cwd, policy.Options{
+		ExtraRoots:            e.extraRoots,
+		StrictWorkspace:       e.strictWorkspace,
+		TrustWorkspaceMCP:     e.trustWorkspaceMCP,
+		PolicyFiles:           e.policyFiles,
+		ProtectedFiles:        e.mcpConfigPaths,
+		LoadAntigravityConfig: e.antigravityMode,
+		NativeEscalationHint:  e.antigravityMode,
+	})
+}
+
+// RunReadTool executes the standalone MCP `read` tool (line-range/tail/byteOffset text + native images).
+func (e *Engine) RunReadTool(_ context.Context, req capabilities.DirectReadRequest) (*capabilities.DirectReadResult, error) {
+	cwd, err := e.resolveEffectiveCwd(req.Cwd)
+	if err != nil {
+		return nil, err
+	}
+	pol := e.newPolicyForCwd(cwd)
+	return capabilities.ReadFileDirect(pol, cwd, req)
+}
+
+// RunTaskSpawn executes the standalone MCP `spawn` tool to run long commands or daemons.
+func (e *Engine) RunTaskSpawn(ctx context.Context, req tasks.StartRequest) (*tasks.StartResult, string, error) {
+	cwd, err := e.resolveEffectiveCwd(req.Cwd)
+	if err != nil {
+		return nil, "", err
+	}
+	pol := e.newPolicyForCwd(cwd)
+	req.Cwd = cwd
+	if req.SessionID == "" {
+		req.SessionID = SessionIDFromContext(ctx)
+	}
+	res, err := e.ensureTaskManager().Start(ctx, pol, req)
+	if err != nil {
+		return nil, "", err
+	}
+	return res, tasks.FormatStartResult(res), nil
+}
+
+// RunTaskManage executes the standalone MCP `task` tool (list, status, logs, wait, input, kill, kill_all).
+func (e *Engine) RunTaskManage(ctx context.Context, req tasks.ManageRequest) (*tasks.ManageResult, string, error) {
+	if req.SessionID == "" {
+		req.SessionID = SessionIDFromContext(ctx)
+	}
+	res, err := e.ensureTaskManager().Manage(ctx, req)
+	if err != nil {
+		return nil, "", err
+	}
+	return res, tasks.FormatManageResult(res), nil
 }
 
 // SetClientWorkspace records a workspace root reported by the MCP client during `initialize`.
@@ -158,21 +264,14 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 		return msg, true
 	}
 
-	pol := policy.NewEngineWithOptions(cwd, policy.Options{
-		ExtraRoots:            e.extraRoots,
-		StrictWorkspace:       e.strictWorkspace,
-		TrustWorkspaceMCP:     e.trustWorkspaceMCP,
-		PolicyFiles:           e.policyFiles,
-		LoadAntigravityConfig: e.antigravityMode,
-		NativeEscalationHint:  e.antigravityMode,
-	})
+	pol := e.newPolicyForCwd(cwd)
 	store, bridge := e.workspaceResources(cwd, pol)
 	defer store.Flush() // state writes (state.set, auto-spills) hit disk once per exec
 
-	fsSearch := &capabilities.FSSearchBinder{Policy: pol}
+	fsSearch := &capabilities.FSSearchBinder{Policy: pol, Locks: e.fileLocks}
 	astBinder := &capabilities.ASTBinder{Policy: pol}
 	shellGit := &capabilities.ShellGitBinder{Policy: pol}
-	editTx := &capabilities.EditTxBinder{Policy: pol, ShellRunner: shellGit}
+	editTx := &capabilities.EditTxBinder{Policy: pol, ShellRunner: shellGit, Locks: e.fileLocks}
 	stateBinder := &capabilities.StateBinder{Store: store}
 
 	title := strings.TrimSpace(in.Title)
@@ -207,7 +306,7 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 			if target != "" {
 				cur += "(" + target + ")"
 			}
-			e.writeLiveStatus(LiveStatus{
+			e.writeLiveStatusThrottled(LiveStatus{
 				Active:       true,
 				Title:        title,
 				CurrentOp:    fmt.Sprintf("#%d %s", seq, cur),
@@ -223,7 +322,15 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 		reqMaxOut = e.defaultMaxOutputBytes
 	}
 	maxOutBytes := output.EffectiveInlineMaxBytes(reqMaxOut)
-	res, execErr := sandbox.Execute(ctx, req, fsSearch, astBinder, shellGit, editTx, stateBinder, bridge)
+	binders := []sandbox.Binder{fsSearch, astBinder, shellGit, editTx, stateBinder, bridge}
+	if e.enableTasks {
+		binders = append(binders, &capabilities.TasksBinder{
+			Manager:   e.ensureTaskManager(),
+			Policy:    pol,
+			SessionID: SessionIDFromContext(ctx),
+		})
+	}
+	res, execErr := sandbox.Execute(ctx, req, binders...)
 	runs := e.totalRuns.Add(1)
 
 	if execErr != nil {
@@ -233,8 +340,8 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 			failedOps := countFailedTraces(ee.Traces)
 			formatted := formatErrorEnvelope(ee, maxOutBytes, e.antigravityMode)
 			statusTag := ee.Phase + "_error"
-			if ee.Phase == "timeout" {
-				statusTag = "timeout"
+			if ee.Phase == "timeout" || ee.Phase == "canceled" {
+				statusTag = ee.Phase
 			}
 			e.auditor.Record(audit.Entry{
 				Cwd:           cwd,
@@ -438,17 +545,32 @@ func (e *Engine) workspaceResources(cwd string, pol *policy.Engine) (*capabiliti
 	return st, br
 }
 
+const liveStatusMinInterval = 120 * time.Millisecond
+
 func (e *Engine) writeLiveStatus(st LiveStatus) {
+	e.writeLiveStatusInternal(st, true)
+}
+
+func (e *Engine) writeLiveStatusThrottled(st LiveStatus) {
+	e.writeLiveStatusInternal(st, false)
+}
+
+func (e *Engine) writeLiveStatusInternal(st LiveStatus, force bool) {
 	if e.dataDir == "" {
-		return
-	}
-	st.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-	raw, err := json.Marshal(st)
-	if err != nil {
 		return
 	}
 	e.statusMu.Lock()
 	defer e.statusMu.Unlock()
+	now := time.Now()
+	if !force && !e.lastStatusWrite.IsZero() && now.Sub(e.lastStatusWrite) < liveStatusMinInterval {
+		return
+	}
+	e.lastStatusWrite = now
+	st.UpdatedAt = now.UTC().Format(time.RFC3339)
+	raw, err := json.Marshal(st)
+	if err != nil {
+		return
+	}
 	p := filepath.Join(e.dataDir, "live-status.json")
 	tmp := fmt.Sprintf("%s.tmp.%d.%d", p, os.Getpid(), e.statusSeq.Add(1))
 	if os.WriteFile(tmp, raw, 0o600) == nil {

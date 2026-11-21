@@ -185,6 +185,9 @@ var homeCredentialPaths = []string{
 	filepath.Join(".cargo", "credentials"),
 	filepath.Join(".cargo", "credentials.toml"),
 	filepath.Join(".gemini", "oauth_creds.json"),
+	filepath.Join(".gemini", ".env"),
+	filepath.Join(".claude", ".credentials.json"),
+	filepath.Join(".codex", "auth.json"),
 	filepath.Join("AppData", "Roaming", "GitHub CLI"),
 	filepath.Join("AppData", "Roaming", "gcloud"),
 }

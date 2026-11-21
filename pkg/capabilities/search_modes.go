@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aliothmoon/mcplex/pkg/policy"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
 )
 
@@ -28,7 +29,7 @@ func (b *FSSearchBinder) runListSearch(ctx context.Context, env *sandbox.Executi
 	var err error
 	if rgBin := b.resolveRg(); rgBin != "" {
 		var overflow bool
-		counts, overflow, err = runRgCounts(ctx, rgBin, env.Cwd, searchRoot, q)
+		counts, overflow, err = runRgCounts(ctx, b.Policy, rgBin, env.Cwd, searchRoot, q)
 		if overflow {
 			env.AddWarning("search.rg: count output exceeded 8MB, some files are missing; narrow path/glob")
 		}
@@ -41,7 +42,7 @@ func (b *FSSearchBinder) runListSearch(ctx context.Context, env *sandbox.Executi
 		fq := q
 		fq.contextLines = 0
 		fq.maxResults = 200000
-		hits, ferr := runGoFallbackSearch(ctx, env.Cwd, searchRoot, fq)
+		hits, ferr := runGoFallbackSearch(ctx, b.Policy, env.Cwd, searchRoot, fq)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -89,7 +90,7 @@ func (b *FSSearchBinder) runListSearch(ctx context.Context, env *sandbox.Executi
 }
 
 // runRgCounts runs `rg --count` (matching lines per file); files mode reuses it since rg -l is just count > 0.
-func runRgCounts(ctx context.Context, rgBin, workspaceCwd, searchRoot string, q searchQuery) ([]fileCount, bool, error) {
+func runRgCounts(ctx context.Context, pol *policy.Engine, rgBin, workspaceCwd, searchRoot string, q searchQuery) ([]fileCount, bool, error) {
 	args := []string{"--count", "--with-filename", "--no-heading", "--color=never"}
 	if q.literal {
 		args = append(args, "--fixed-strings")
@@ -131,6 +132,7 @@ func runRgCounts(ctx context.Context, rgBin, workspaceCwd, searchRoot string, q 
 		return nil, false, err
 	}
 	var out []fileCount
+	permCache := map[string]bool{}
 	sc := bufio.NewScanner(strings.NewReader(stdout.String()))
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -143,7 +145,11 @@ func runRgCounts(ctx context.Context, rgBin, workspaceCwd, searchRoot string, q 
 		if err != nil {
 			continue
 		}
-		out = append(out, fileCount{relDisplayPath(workspaceCwd, line[:i]), n})
+		fp := line[:i]
+		if !canSearchPath(pol, workspaceCwd, fp, permCache) {
+			continue
+		}
+		out = append(out, fileCount{relDisplayPath(workspaceCwd, fp), n})
 	}
 	if out == nil {
 		out = []fileCount{}

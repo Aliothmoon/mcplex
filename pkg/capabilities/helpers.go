@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func requireStringArg(args []any, idx int, name string) (string, error) {
@@ -155,24 +156,71 @@ func relDisplayPath(cwd, absPath string) string {
 }
 
 func writeFilePreserveMode(absPath string, data []byte) error {
-	mode := os.FileMode(0o644)
+	return writeFileWithMode(absPath, data, 0)
+}
+
+// writeFileWithMode writes data atomically via temp file + rename in the target directory
+// so a crash or kill never leaves a half-truncated file, preserving existing or explicit file mode bits.
+func writeFileWithMode(absPath string, data []byte, explicitMode os.FileMode) error {
+	mode := explicitMode
 	writeTarget := absPath
 	if info, err := os.Lstat(absPath); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			if resolved, rErr := filepath.EvalSymlinks(absPath); rErr == nil {
 				writeTarget = resolved
-				if tInfo, sErr := os.Stat(resolved); sErr == nil {
-					mode = tInfo.Mode().Perm()
+				if mode == 0 {
+					if tInfo, sErr := os.Stat(resolved); sErr == nil {
+						mode = tInfo.Mode().Perm()
+					}
 				}
 			}
-		} else {
+		} else if mode == 0 {
 			mode = info.Mode().Perm()
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(writeTarget), 0o755); err != nil {
+	if mode == 0 {
+		mode = 0o644
+	}
+	dir := filepath.Dir(writeTarget)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(writeTarget, data, mode)
+	tmp, err := os.CreateTemp(dir, ".mcplex-write-*")
+	if err != nil {
+		return os.WriteFile(writeTarget, data, mode)
+	}
+	tmpPath := tmp.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	var renameErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt*30) * time.Millisecond)
+		}
+		renameErr = os.Rename(tmpPath, writeTarget)
+		if renameErr == nil {
+			cleanupTmp = false
+			return nil
+		}
+	}
+	if err := os.WriteFile(writeTarget, data, mode); err != nil {
+		return renameErr
+	}
+	return nil
 }
 
 func minInt(a, b int) int {

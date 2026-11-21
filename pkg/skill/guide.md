@@ -1,8 +1,13 @@
 # MCPlex — Code Mode Local Tool & MCP Proxy Guide
 
-Use the `exec` tool to compose multi-step file search, AST inspection, atomic transactional edits, git queries, shell checks, and downstream MCP calls inside **ONE TypeScript program turn**. Intermediate data stays in sandbox memory; return only the compact answer you need.
+Use `exec` to compose multi-step file search, AST inspection, atomic transactional edits, read-only git queries, fast shell checks (`<15s`), and downstream MCP calls inside **ONE TypeScript program turn**. Intermediate data stays in sandbox memory; return only the compact answer you need.
 
-## Core Rules
+## When to Use Which Tool
+- **`read`** *(when enabled)*: Read whole files, large line ranges, tail logs, or images (`.png`/`.jpg`/`.webp`/`.gif`, returned natively as multimodal image blocks). Parallel `read` calls each get their own 48 KB / 800-line budget.
+- **`exec`**: Any `>=2`-step or data-dependent chain (search -> outline -> read -> filter -> transactional edit -> fast verify), loops over files, downstream MCP calls, and `<15s` checks (`go vet`, `tsc --noEmit`, lint, scoped unit tests).
+- **`spawn` + `task`** *(when enabled)*: Long-running builds/tests (`>15s`), full E2E suites, interactive stdin commands, and persistent **daemons** (`daemon: true` for dev servers, file watchers, tunnels). Use `task({ action: "wait", taskId, expect: "regex" })` to wake up immediately on readiness banners instead of polling blindly.
+
+## Core Rules for `exec`
 - Write a **top-level `async` TypeScript body** (`await`, `print()`/`console.log()`, and `return` work directly; do **not** wrap in `async function main() {}`).
 - Pass multiline replacement code or templates in `payloads: { key: "..." }` and read via `P.key` / `payloads.key` to avoid JSON/template escaping issues.
 - Parallelize independent host calls with `await Promise.all([...])`.
@@ -10,7 +15,7 @@ Use the `exec` tool to compose multi-step file search, AST inspection, atomic tr
 - For multiline text/diffs/logs, prefer `print(...)` without `return` (streams raw unescaped text); use `return { ... }` for compact structured data.
 - Oversized output auto-spills in memory to `state.get('__result_N')` (with `'__last_result'` aliasing the latest spill). Continue reading long text with `print(state.page('__result_N', 2))` (`-1` = last page; prefer the explicit `__result_N` key under concurrency).
 
-## Built-in Namespaces
+## Built-in Namespaces Inside `exec`
 
 ### `fs` — Files, Binary Slices & Streaming Hash
 - `await fs.read(path, { startLine?, endLine?, limit?, tail?, lineNumbers? }) -> string` (up to 2 MB; `tail: N` reads last N lines of any size file)
@@ -40,11 +45,17 @@ Use the `exec` tool to compose multi-step file search, AST inspection, atomic tr
 - `await edit.replace(path, target, replacement, { symbol?, nth?, replaceAll? })`
 - `const t = await tx.begin();` -> `t.edit(pathOrSpecs, hunks?)`, `t.write(path, content, opts?)`, `t.rm(path)`, `t.rename(from, to)`, `t.diff()`, `t.status()`, `t.verify(commands, opts?)`, `t.commit()`, `t.rollback()`.
 
-### `git` (Read-Only) & `sh` (Policy-Checked Shell)
+### `git` (Read-Only) & `sh` (Fast Policy-Checked Shell)
 - `await git.status(dir?)` · `git.diff({ staged?, stat?, nameOnly?, ref?, path? })` · `git.log({ n?, grep?, since?, author?, path? })` · `git.show({ ref?, stat?, nameOnly? })` · `git.blame(path, { startLine?, endLine? })` · `git.query("rev-parse HEAD")`
 - `await sh.exec(cmd, { cwd?, env?, shell?, timeoutMs?, timeoutSec?, compact?, throwOnError? }) -> { ok, exitCode, timedOut, durationMs, output, truncated? }` (`sh.shell` = default shell dialect; 15s default timeout + process-tree kill)
 - `await sh.run(file, args?, { cwd?, env?, stdin?, timeoutMs? }) -> { ok, exitCode, timedOut, stdout, stderr, durationMs }` (no shell quoting)
 - `await sh.checks(commands, { concurrency?, timeoutSec?, compact? }) -> { ok, summary, results: [{ name, command, ok, exitCode, timedOut, durationMs, output }], failures? }` (same shape for `t.verify`)
+
+### `tasks` — Background Tasks & Daemons *(when tasks toolset is enabled)*
+- `await tasks.spawn(cmd, { cwd?, shell?, env?, daemon?, waitMs?, timeoutSec?, name? })` -> `{ taskId, pid, status, daemon, backgrounded, exitCode?, durationMs, output, logFile, nextOffset }`
+- `await tasks.list()` · `await tasks.status(taskId, { tail? })` · `await tasks.logs(taskId, { tail?, offset? })`
+- `await tasks.wait(taskId, { waitMs?, expect?, tail? })` -> `{ task, matched, matchLine?, timedOut, output, nextOffset }`
+- `await tasks.input(taskId, text, { appendNewline?, closeStdin? })` · `await tasks.kill(taskId)` · `await tasks.killAll()`
 
 ### `state` (Sync) & `tools` / `mcp` (Downstream MCP Proxy)
 - `state.set(k, v)` / `state.get(k)` / `state.delete(k)` / `state.keys()` / `state.clear()` / `state.page(key, n, size?)`

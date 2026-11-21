@@ -4,7 +4,7 @@
 
 **MCPlex** is a single-binary, client-agnostic **Code Mode MCP Tool Proxy** and embeddable Go runtime (`pkg/`) powered by a local TypeScript sandbox (Go + esbuild + Goja).
 
-Give **any MCP-only runtime** (Claude Desktop/Code, Cursor, Codex, Windsurf, Cline, Dify, n8n, OpenWebUI, containers, or custom agents) safe, composable access to local tools and downstream MCP servers — all through **one self-describing `exec` tool** over **stdio** or **Streamable HTTP**.
+Give **any MCP-only runtime** (Claude Desktop/Code, Cursor, Codex, Windsurf, Cline, Dify, n8n, OpenWebUI, containers, or custom agents) safe, composable access to local tools, multimodal file reads, background tasks/daemons, and downstream MCP servers — over **stdio** or **Streamable HTTP**.
 
 ---
 
@@ -59,7 +59,20 @@ mcplex serve \
 
 ---
 
-## Built-in Sandbox Capabilities
+## Exposed MCP Tools (`--tools`)
+
+By default, `mcplex serve` runs with `--tools all` and exposes **4 orthogonal tools** (pass `--tools exec` for single-tool Code Mode inside hosts that already provide native file/terminal tools):
+
+| MCP Tool | Purpose |
+| :--- | :--- |
+| `exec` | Fast (`<15s`) multi-step TypeScript Code Mode sandbox composing search, AST, atomic transactions, git, shell checks, `tasks.*`, and downstream `mcp.*` in one turn |
+| `read` | Direct parallel file reader (up to 800 lines / 48 KB per call with `startLine`/`endLine`/`tail`/`byteOffset`) + native MCP `image` blocks for `.png`/`.jpg`/`.webp`/`.gif` |
+| `spawn` | Start `>15s` builds, full test suites, interactive commands, or persistent `daemon: true` processes (sync `waitMs` window -> automatic background handoff with process-tree / Job Object cleanup) |
+| `task` | Manage spawned tasks: `list`, `status`, incremental `logs` (`offset`/`tail`), `wait` (with instant `expect` regex readiness wakeup), stdin `input`, `kill`, `kill_all` |
+
+---
+
+## Built-in Sandbox Capabilities (`exec`)
 
 | Namespace | Capabilities |
 | :--- | :--- |
@@ -69,6 +82,7 @@ mcplex serve \
 | `edit` & `tx` | Atomic multi-file/multi-hunk edits (doc-comment-aware `symbol` scoping, CRLF preservation) + in-memory snapshot `tx.begin()` (`edit`, `write`, `rm`, `rename`, `verify`, `diff`, `commit`, auto-rollback) |
 | `git` | Read-only `status`, `diff`, `log`, `show`, `blame`, `query` |
 | `sh` | Policy-checked `exec`, `run` (no shell quoting), `checks` (concurrent check pool returning `{ ok, summary, results: [{ name, command, ok, exitCode, timedOut, durationMs, output }], failures? }`) |
+| `tasks` | Background task & daemon orchestration from inside scripts: `spawn`, `list`, `status`, `logs`, `wait` (`expect` regex), `input`, `kill`, `killAll` |
 | `state` | Sync `get`, `set`, `delete`, `keys`, `clear`, and key-bound `page(key, n, size?)` |
 | `tools` & `mcp` | Built-in + active live `tools/list` discovery and pooled stdio/HTTP proxy for downstream MCP servers (`mcp.<server>.<tool>(args)`) |
 

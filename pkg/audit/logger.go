@@ -49,9 +49,19 @@ type Logger struct {
 	seq     atomic.Uint64
 }
 
+func isAuditDisabled() bool {
+	for _, k := range []string{"MCPLEX_DISABLE_AUDIT", "AGY_PTC_DISABLE_AUDIT"} {
+		v := strings.TrimSpace(os.Getenv(k))
+		if v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes") {
+			return true
+		}
+	}
+	return false
+}
+
 // NewLogger initializes an audit logger inside `<dataDir>/logs`.
 func NewLogger(dataDir string) *Logger {
-	if strings.TrimSpace(dataDir) == "" {
+	if strings.TrimSpace(dataDir) == "" || isAuditDisabled() {
 		return &Logger{}
 	}
 	dir := filepath.Join(dataDir, "logs")
@@ -120,6 +130,8 @@ func (l *Logger) appendJSONL(filePath string, item any) {
 func ClassifyError(phase, msg string, traces []sandbox.OpTrace) string {
 	low := strings.ToLower(msg)
 	switch {
+	case phase == "canceled" || strings.HasPrefix(low, "canceled:") || strings.Contains(low, "execution canceled"):
+		return "canceled"
 	case phase == "timeout" || strings.Contains(low, "timeouterror") || strings.Contains(low, "deadline exceeded"):
 		return "timeout"
 	case strings.Contains(low, "payloaderror") || strings.Contains(low, "missing payload key"):
@@ -131,9 +143,11 @@ func ClassifyError(phase, msg string, traces []sandbox.OpTrace) string {
 	case strings.HasPrefix(low, "needsapproval:") || strings.HasPrefix(low, "denied:") ||
 		strings.Contains(low, "approval_required") || strings.Contains(low, "policy_denied"):
 		return "policy_gate"
-	case strings.Contains(low, "target not found") || strings.Contains(low, "matched multiple locations") || strings.Contains(low, "overlapping hunks"):
+	case strings.Contains(low, "target not found") || strings.Contains(low, "matched multiple locations") ||
+		strings.Contains(low, "overlapping hunks") || strings.Contains(low, "overlap") ||
+		(strings.Contains(low, "matches ") && strings.Contains(low, " places")):
 		return "edit_hunk_mismatch"
-	case strings.Contains(low, "opbudgeterror"):
+	case strings.Contains(low, "opbudgeterror") || strings.Contains(low, "operation budget") || strings.Contains(low, "op budget"):
 		return "op_budget_exceeded"
 	}
 	for _, t := range traces {

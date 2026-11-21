@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -42,6 +43,7 @@ type plannedFileWrite struct {
 	absPath      string
 	relPath      string
 	existed      bool
+	mode         os.FileMode
 	origBytes    []byte
 	newBytes     []byte
 	hunksApplied int
@@ -52,11 +54,13 @@ type fileSnapshot struct {
 	absPath   string
 	relPath   string
 	existed   bool
+	mode      os.FileMode
 	origBytes []byte
 }
 
 type activeTx struct {
 	id         string
+	lockOwner  string
 	snapshots  map[string]fileSnapshot
 	touched    []string
 	committed  bool
@@ -64,10 +68,13 @@ type activeTx struct {
 	lastVerify map[string]any
 }
 
+var txOwnerSeq atomic.Int64
+
 // EditTxBinder exposes `edit.*` (`apply`, `replace`) and `tx.*` (`begin` -> atomic transactions with rollback).
 type EditTxBinder struct {
 	Policy      *policy.Engine
 	ShellRunner *ShellGitBinder
+	Locks       *FileLockTable
 }
 
 func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
@@ -88,9 +95,11 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 		for _, id := range ids {
 			tx := txMap[id]
 			if tx.committed || tx.rolledBack {
+				b.Locks.ReleaseOwner(tx.lockOwner)
 				continue
 			}
 			restored, failed := rollbackSnapshots(tx)
+			b.Locks.ReleaseOwner(tx.lockOwner)
 			if len(restored) > 0 {
 				env.AddWarning(fmt.Sprintf("%s was never committed — auto-rolled back %d file(s): %s (call `await t.commit()` to keep tx edits)", id, len(restored), joinLimited(restored, 10)))
 			}
@@ -109,7 +118,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
-			res, err := b.applyFileSpecs(env.Cwd, specs, dryRun, bestEffort, nil)
+			res, err := b.applyFileSpecs(ctx, env.Cwd, specs, dryRun, bestEffort, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -122,7 +131,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			return res, nil
 		},
-		"replace": func(_ context.Context, args []any) (any, error) {
+		"replace": func(ctx context.Context, args []any) (any, error) {
 			if len(args) < 3 {
 				return nil, errors.New("edit.replace requires (path, target, replacement, opts?)")
 			}
@@ -145,7 +154,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 					Symbol:      firstString(opts, "symbol", "in"),
 				}},
 			}
-			return b.applyFileSpecs(env.Cwd, []FileEditSpec{spec}, false, false, nil)
+			return b.applyFileSpecs(ctx, env.Cwd, []FileEditSpec{spec}, false, false, nil)
 		},
 	}
 
@@ -159,14 +168,16 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			defer txMu.Unlock()
 			txSeq++
 			id := fmt.Sprintf("tx_%d", txSeq)
+			owner := fmt.Sprintf("tx:%d:%s", txOwnerSeq.Add(1), id)
 			txMap[id] = &activeTx{
 				id:        id,
+				lockOwner: owner,
 				snapshots: map[string]fileSnapshot{},
 				touched:   []string{},
 			}
 			return map[string]any{"id": id, "status": "open"}, nil
 		},
-		"_edit": func(_ context.Context, args []any) (any, error) {
+		"_edit": func(ctx context.Context, args []any) (any, error) {
 			id, _ := requireStringArg(args, 0, "id")
 			txMu.Lock()
 			tx, ok := txMap[id]
@@ -180,9 +191,9 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			txMu.Lock()
 			defer txMu.Unlock()
-			return b.applyFileSpecs(env.Cwd, specs, false, false, tx)
+			return b.applyFileSpecs(ctx, env.Cwd, specs, false, false, tx)
 		},
-		"_write": func(_ context.Context, args []any) (any, error) {
+		"_write": func(ctx context.Context, args []any) (any, error) {
 			id, _ := requireStringArg(args, 0, "id")
 			if len(args) < 3 {
 				return nil, errors.New("tx.write requires (path, content)")
@@ -198,7 +209,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			defer txMu.Unlock()
 			spec := FileEditSpec{Path: p, Create: &content, Overwrite: true, EOL: eol}
-			return b.applyFileSpecs(env.Cwd, []FileEditSpec{spec}, false, false, tx)
+			return b.applyFileSpecs(ctx, env.Cwd, []FileEditSpec{spec}, false, false, tx)
 		},
 		"_verify": func(ctx context.Context, args []any) (any, error) {
 			id, _ := requireStringArg(args, 0, "id")
@@ -240,6 +251,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 				return nil, fmt.Errorf("transaction '%s' cannot be committed (not open)", id)
 			}
 			tx.committed = true
+			b.Locks.ReleaseOwner(tx.lockOwner)
 			return map[string]any{
 				"ok":           true,
 				"id":           id,
@@ -259,6 +271,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 				return map[string]any{"ok": true, "id": id, "status": "already_rolled_back"}, nil
 			}
 			restored, failed := rollbackSnapshots(tx)
+			b.Locks.ReleaseOwner(tx.lockOwner)
 			res := map[string]any{
 				"ok":            len(failed) == 0,
 				"id":            id,
@@ -273,7 +286,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			return res, nil
 		},
 		// t.rm(path): deletes a file inside the tx; rollback restores it.
-		"_rm": func(_ context.Context, args []any) (any, error) {
+		"_rm": func(ctx context.Context, args []any) (any, error) {
 			id, _ := requireStringArg(args, 0, "id")
 			p, err := requireStringArg(args, 1, "path")
 			if err != nil {
@@ -289,6 +302,9 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
+			if err := b.Locks.Acquire(ctx, tx.lockOwner, abs); err != nil {
+				return nil, err
+			}
 			info, err := os.Stat(abs)
 			if err != nil {
 				return nil, err
@@ -302,13 +318,13 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			rel := relDisplayPath(env.Cwd, abs)
 			if _, seen := tx.snapshots[abs]; !seen {
-				tx.snapshots[abs] = fileSnapshot{absPath: abs, relPath: rel, existed: true, origBytes: orig}
+				tx.snapshots[abs] = fileSnapshot{absPath: abs, relPath: rel, existed: true, mode: info.Mode().Perm(), origBytes: orig}
 				tx.touched = append(tx.touched, rel)
 			}
 			return nil, os.Remove(abs)
 		},
 		// t.rename(from, to) / t.mv: moves a file inside the tx; rollback restores both paths.
-		"_rename": func(_ context.Context, args []any) (any, error) {
+		"_rename": func(ctx context.Context, args []any) (any, error) {
 			id, _ := requireStringArg(args, 0, "id")
 			from, err := requireStringArg(args, 1, "from")
 			if err != nil {
@@ -332,6 +348,9 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
+			if err := b.Locks.Acquire(ctx, tx.lockOwner, absFrom, absTo); err != nil {
+				return nil, err
+			}
 			info, err := os.Stat(absFrom)
 			if err != nil {
 				return nil, err
@@ -344,10 +363,14 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 				return nil, err
 			}
 			for _, snap := range []fileSnapshot{
-				{absPath: absFrom, relPath: relDisplayPath(env.Cwd, absFrom), existed: true, origBytes: src},
+				{absPath: absFrom, relPath: relDisplayPath(env.Cwd, absFrom), existed: true, mode: info.Mode().Perm(), origBytes: src},
 				func() fileSnapshot {
+					var toMode os.FileMode
+					if ti, sErr := os.Stat(absTo); sErr == nil {
+						toMode = ti.Mode().Perm()
+					}
 					orig, rErr := os.ReadFile(absTo)
-					return fileSnapshot{absPath: absTo, relPath: relDisplayPath(env.Cwd, absTo), existed: rErr == nil, origBytes: orig}
+					return fileSnapshot{absPath: absTo, relPath: relDisplayPath(env.Cwd, absTo), existed: rErr == nil, mode: toMode, origBytes: orig}
 				}(),
 			} {
 				if _, seen := tx.snapshots[snap.absPath]; !seen {
@@ -430,7 +453,7 @@ func restoreSnapshot(snap fileSnapshot) error {
 			time.Sleep(time.Duration(attempt*75) * time.Millisecond)
 		}
 		if snap.existed {
-			err = writeFilePreserveMode(snap.absPath, snap.origBytes)
+			err = writeFileWithMode(snap.absPath, snap.origBytes, snap.mode)
 		} else {
 			err = os.Remove(snap.absPath)
 			if errors.Is(err, os.ErrNotExist) {
@@ -521,11 +544,20 @@ func joinLimited(items []string, limit int) string {
 	return strings.Join(items[:limit], ", ") + fmt.Sprintf(", ...+%d more", len(items)-limit)
 }
 
-func (b *EditTxBinder) applyFileSpecs(cwd string, specs []FileEditSpec, dryRun, bestEffort bool, tx *activeTx) (map[string]any, error) {
+func (b *EditTxBinder) applyFileSpecs(ctx context.Context, cwd string, specs []FileEditSpec, dryRun, bestEffort bool, tx *activeTx) (map[string]any, error) {
 	if len(specs) == 0 {
 		return nil, errors.New("edits list cannot be empty")
 	}
-	var planned []plannedFileWrite
+
+	// Resolve paths up front and coalesce duplicate paths in one edit.apply/t.edit call
+	// so earlier hunks on the same file are NEVER silently overwritten by a later spec (#6).
+	type resolvedSpec struct {
+		absPath string
+		rel     string
+		spec    FileEditSpec
+	}
+	var merged []resolvedSpec
+	idxByKey := map[string]int{}
 	failures := []map[string]any{}
 
 	for _, spec := range specs {
@@ -538,10 +570,52 @@ func (b *EditTxBinder) applyFileSpecs(cwd string, specs []FileEditSpec, dryRun, 
 			return nil, err
 		}
 		rel := relDisplayPath(cwd, absPath)
-		pw, planErr := planSingleFile(absPath, rel, spec)
+		key := normalizeLockKey(absPath)
+		if prevIdx, dup := idxByKey[key]; dup {
+			prev := &merged[prevIdx]
+			if prev.spec.Create != nil || spec.Create != nil {
+				err := sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s appears multiple times in one edit call with create/overwrite", rel)
+				if bestEffort {
+					failures = append(failures, map[string]any{"path": rel, "error": err.Error()})
+					continue
+				}
+				return nil, err
+			}
+			prev.spec.Hunks = append(prev.spec.Hunks, spec.Hunks...)
+			continue
+		}
+		idxByKey[key] = len(merged)
+		merged = append(merged, resolvedSpec{absPath: absPath, rel: rel, spec: spec})
+	}
+
+	// Acquire per-file locks BEFORE reading/planning so concurrent exec calls never interleave dirty reads or clobber rollbacks (#8).
+	var lockOwner string
+	releaseOnReturn := false
+	if !dryRun && b.Locks != nil && len(merged) > 0 {
+		paths := make([]string, len(merged))
+		for i, m := range merged {
+			paths[i] = m.absPath
+		}
+		if tx != nil {
+			lockOwner = tx.lockOwner
+		} else {
+			lockOwner = fmt.Sprintf("edit:%d", txOwnerSeq.Add(1))
+			releaseOnReturn = true
+		}
+		if err := b.Locks.Acquire(ctx, lockOwner, paths...); err != nil {
+			return nil, err
+		}
+		if releaseOnReturn {
+			defer b.Locks.ReleaseOwner(lockOwner)
+		}
+	}
+
+	var planned []plannedFileWrite
+	for _, m := range merged {
+		pw, planErr := planSingleFile(m.absPath, m.rel, m.spec)
 		if planErr != nil {
 			if bestEffort {
-				failures = append(failures, map[string]any{"path": rel, "error": planErr.Error()})
+				failures = append(failures, map[string]any{"path": m.rel, "error": planErr.Error()})
 				continue
 			}
 			return nil, planErr
@@ -558,18 +632,19 @@ func (b *EditTxBinder) applyFileSpecs(cwd string, specs []FileEditSpec, dryRun, 
 						absPath:   pw.absPath,
 						relPath:   pw.relPath,
 						existed:   pw.existed,
+						mode:      pw.mode,
 						origBytes: pw.origBytes,
 					}
 					tx.touched = append(tx.touched, pw.relPath)
 				}
 			}
-			if err := writeFilePreserveMode(pw.absPath, pw.newBytes); err != nil {
+			if err := writeFileWithMode(pw.absPath, pw.newBytes, pw.mode); err != nil {
 				if tx == nil && len(written) > 0 {
 					// Outside a tx, keep multi-file edit.apply all-or-nothing: undo files already written in this call.
 					var undoFailed []map[string]any
 					for i := len(written) - 1; i >= 0; i-- {
 						w := written[i]
-						if uErr := restoreSnapshot(fileSnapshot{absPath: w.absPath, relPath: w.relPath, existed: w.existed, origBytes: w.origBytes}); uErr != nil {
+						if uErr := restoreSnapshot(fileSnapshot{absPath: w.absPath, relPath: w.relPath, existed: w.existed, mode: w.mode, origBytes: w.origBytes}); uErr != nil {
 							undoFailed = append(undoFailed, map[string]any{"path": w.relPath, "error": uErr.Error()})
 						}
 					}
@@ -615,6 +690,10 @@ func (b *EditTxBinder) applyFileSpecs(cwd string, specs []FileEditSpec, dryRun, 
 }
 
 func planSingleFile(absPath, relPath string, spec FileEditSpec) (plannedFileWrite, error) {
+	var origMode os.FileMode
+	if info, sErr := os.Stat(absPath); sErr == nil {
+		origMode = info.Mode().Perm()
+	}
 	origBytes, readErr := os.ReadFile(absPath)
 	existed := readErr == nil
 
@@ -635,6 +714,7 @@ func planSingleFile(absPath, relPath string, spec FileEditSpec) (plannedFileWrit
 			absPath:      absPath,
 			relPath:      relPath,
 			existed:      existed,
+			mode:         origMode,
 			origBytes:    origBytes,
 			newBytes:     newBytes,
 			hunksApplied: 1,
@@ -650,7 +730,9 @@ func planSingleFile(absPath, relPath string, spec FileEditSpec) (plannedFileWrit
 	}
 
 	rawStr := string(origBytes)
-	useCRLF := strings.Contains(rawStr, "\r\n")
+	crlfCount := strings.Count(rawStr, "\r\n")
+	lfCount := strings.Count(rawStr, "\n")
+	useCRLF := crlfCount > 0 && crlfCount*2 >= lfCount
 	normText := strings.ReplaceAll(rawStr, "\r\n", "\n")
 	lineStarts := computeLineOffsets(normText)
 
@@ -782,6 +864,7 @@ func planSingleFile(absPath, relPath string, spec FileEditSpec) (plannedFileWrit
 		absPath:      absPath,
 		relPath:      relPath,
 		existed:      true,
+		mode:         origMode,
 		origBytes:    origBytes,
 		newBytes:     []byte(finalOut),
 		hunksApplied: len(spans),
@@ -1100,16 +1183,28 @@ func decodeHunks(arr []any) ([]EditHunk, error) {
 func decodeSingleHunk(m map[string]any) (EditHunk, error) {
 	target := firstString(m, "target", "oldText", "old_string", "old", "from")
 	var repl string
+	foundRepl := false
 	for _, k := range []string{"replacement", "newText", "new_string", "new", "to"} {
 		if v, exists := m[k]; exists {
-			if s, ok := v.(string); ok {
-				repl = s
-				break
+			s, ok := v.(string)
+			if !ok {
+				return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "hunk field %q must be a string (pass %q: \"\" to delete)", k, k)
 			}
+			repl = s
+			foundRepl = true
+			break
 		}
 	}
 	if target == "" {
-		return EditHunk{}, errors.New("hunk requires non-empty 'target' (or 'oldText')")
+		return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "hunk requires non-empty 'target' (or 'oldText')")
+	}
+	if !foundRepl {
+		for _, typo := range []string{"replace", "replaceWith", "replacementText", "text", "value", "content", "body"} {
+			if _, exists := m[typo]; exists {
+				return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "hunk missing required 'replacement' field (found %q instead — rename it to 'replacement', or pass replacement: \"\" explicitly to delete)", typo)
+			}
+		}
+		return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "hunk missing required 'replacement' field (pass replacement: \"\" explicitly to delete target)")
 	}
 	return EditHunk{
 		Target:      target,

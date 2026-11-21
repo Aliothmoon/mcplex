@@ -325,7 +325,11 @@ func (b *ShellGitBinder) runShell(parentCtx context.Context, cwd, cmdLine string
 		Compact:  compact,
 	})
 	if timedOut {
-		formatted = fmt.Sprintf("TIMED OUT after %dms (process tree terminated; for >15s long tasks use built-in run_command + manage_task)\n%s", durMs, strings.TrimPrefix(strings.TrimPrefix(formatted, "TIMED OUT\n"), "TIMED OUT (no output)"))
+		longHint := "for >15s long tasks or daemons use the spawn + task tools"
+		if b.Policy != nil && b.Policy.NativeEscalationHint() {
+			longHint = "for >15s long tasks use built-in run_command + manage_task"
+		}
+		formatted = fmt.Sprintf("TIMED OUT after %dms (process tree terminated; %s)\n%s", durMs, longHint, strings.TrimPrefix(strings.TrimPrefix(formatted, "TIMED OUT\n"), "TIMED OUT (no output)"))
 		formatted = strings.TrimSpace(formatted)
 	} else if parentAborted {
 		msg := strings.TrimSpace(formatted)

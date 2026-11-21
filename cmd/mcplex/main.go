@@ -54,7 +54,7 @@ func main() {
 	case "run":
 		runStandalone(args)
 	case "skill":
-		fmt.Print(skill.FullGuide())
+		runSkill(args)
 	case "logs":
 		runLogs(args, false)
 	case "errors":
@@ -82,13 +82,14 @@ Commands:
   serve [flags]                          Start the MCP proxy server (stdio default, or --http addr)
   mcp [flags]                            Alias for 'serve'
   run [--cwd <dir>] [--code <ts> | file] Execute a TypeScript Code Mode script directly from CLI
-  skill                                  Print the embedded Code Mode Skill guide (Markdown)
+  skill [--tools all|exec]               Print the embedded Code Mode Skill guide (Markdown)
   logs [-e] [--tail N] [--full]          Inspect recorded execution/error JSONL logs
   errors [--tail N]                      Shortcut for 'logs --errors'
   stats                                  Summarize execution success rates and error hotspots
   version                                Print version
 
 Common serve flags:
+  --tools <spec>           Exposed MCP tools: all (default: exec,read,spawn,task), exec, or comma list
   --cwd <dir>              Default workspace root directory (defaults to current working dir)
   --strict-root            Confine all file and shell access strictly to --cwd (+ --allow-root)
   --allow-root <dir>       Additional allowed root directory (repeatable)
@@ -102,6 +103,46 @@ Common serve flags:
   --http-path <path>       HTTP endpoint path (default: /mcp)
   --token <secret>         Require Authorization: Bearer <secret> on HTTP requests (or MCPLEX_TOKEN env)
   --cors-origin <origin>   Optional Access-Control-Allow-Origin header for HTTP mode`)
+}
+
+func parseToolSet(spec string) (mcpserver.ToolSet, error) {
+	raw := strings.ToLower(strings.TrimSpace(spec))
+	if raw == "" || raw == "all" {
+		return mcpserver.ToolSet{Read: true, Tasks: true}, nil
+	}
+	if raw == "exec" || raw == "minimal" {
+		return mcpserver.ToolSet{}, nil
+	}
+	var ts mcpserver.ToolSet
+	for _, part := range strings.Split(raw, ",") {
+		p := strings.TrimSpace(part)
+		switch p {
+		case "", "exec":
+			// exec is always enabled
+		case "all":
+			ts.Read = true
+			ts.Tasks = true
+		case "read":
+			ts.Read = true
+		case "tasks", "task", "spawn":
+			ts.Tasks = true
+		default:
+			return mcpserver.ToolSet{}, fmt.Errorf("unknown tool %q (allowed: all, exec, read, tasks, spawn, task)", p)
+		}
+	}
+	return ts, nil
+}
+
+func runSkill(args []string) {
+	fs := flag.NewFlagSet("skill", flag.ExitOnError)
+	toolsFlag := fs.String("tools", "all", "Tool profile to render guide for (all, exec, or comma-separated list)")
+	_ = fs.Parse(args)
+	ts, err := parseToolSet(*toolsFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid --tools value: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Print(skill.FullGuideForTools(ts.Read, ts.Tasks))
 }
 
 func defaultDataDir() string {
@@ -119,6 +160,7 @@ func defaultDataDir() string {
 
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	toolsFlag := fs.String("tools", "all", "Exposed MCP tools: all (exec,read,spawn,task), exec, or comma-separated list")
 	dataDir := fs.String("data-dir", defaultDataDir(), "Persistent state and audit log directory")
 	cwd := fs.String("cwd", "", "Default workspace directory")
 	strictRoot := fs.Bool("strict-root", false, "Confine all file/shell access strictly to workspace roots")
@@ -139,6 +181,12 @@ func runServe(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	toolSet, err := parseToolSet(*toolsFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid --tools value: %v\n", err)
+		os.Exit(1)
+	}
+
 	eng := ptcruntime.NewEngineWithOptions(ptcruntime.EngineOptions{
 		DataDir:               *dataDir,
 		DefaultCwd:            *cwd,
@@ -149,22 +197,24 @@ func runServe(args []string) {
 		MCPConfigPaths:        mcpConfigs,
 		TrustWorkspaceMCP:     *trustWsMCP,
 		AntigravityMode:       false,
+		EnableTasks:           toolSet.Tasks,
 	})
 	defer eng.Close()
 
-	execDesc := skill.CompactExecDescription(*maxOut)
+	execDesc := skill.CompactExecDescriptionForTools(*maxOut, toolSet.Read, toolSet.Tasks)
 	if *compactSchema {
 		execDesc = "Execute a TypeScript async body in a local Code Mode sandbox composing fs, search, ast, edit, tx, git, sh, state, tools, and downstream mcp servers in ONE turn. Read mcplex://skill for the full API reference."
 	}
 
 	srv := mcpserver.NewServerWithOptions(eng, mcpserver.ServerOptions{
 		ServerName:         "mcplex",
-		Instructions:       skill.Instructions(),
+		Tools:              toolSet,
+		Instructions:       skill.InstructionsForTools(toolSet.Read, toolSet.Tasks),
 		ExecDescription:    execDesc,
 		DefaultMaxOutBytes: *maxOut,
 		SkillResourceURI:   skillResourceURI,
 		SkillResourceName:  "MCPlex Code Mode Skill",
-		SkillResourceText:  skill.FullGuide(),
+		SkillResourceText:  skill.FullGuideForTools(toolSet.Read, toolSet.Tasks),
 	})
 
 	if strings.TrimSpace(*httpAddr) != "" {
@@ -228,6 +278,7 @@ func runStandalone(args []string) {
 		PolicyFiles:           policyFiles,
 		MCPConfigPaths:        mcpConfigs,
 		AntigravityMode:       false,
+		EnableTasks:           true,
 	})
 	defer eng.Close()
 

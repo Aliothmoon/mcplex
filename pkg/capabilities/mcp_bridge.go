@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/policy"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
 	"github.com/aliothmoon/mcplex/pkg/version"
@@ -66,12 +67,14 @@ type MCPBridge struct {
 	CacheDirs               []string
 	IncludeAntigravityPaths bool
 
-	mu          sync.Mutex
-	policyPtr   atomic.Pointer[policy.Engine]
-	stdioPool   map[string]*stdioClient
-	liveSchemas map[string][]ToolDescriptor // cached live tools/list per server name
-	httpClient  *http.Client
-	reqSeq      atomic.Int64
+	mu           sync.Mutex
+	policyPtr    atomic.Pointer[policy.Engine]
+	stdioPool    map[string]*stdioClient
+	liveSchemas  map[string][]ToolDescriptor // cached live tools/list per server name
+	httpSessions map[string]string           // endpoint -> Mcp-Session-Id ("" when stateless)
+	httpInited   map[string]bool             // endpoint -> initialize attempted
+	httpClient   *http.Client
+	reqSeq       atomic.Int64
 }
 
 // NewMCPBridge constructs an external MCP multiplexer with Antigravity default paths.
@@ -97,6 +100,8 @@ func NewMCPBridgeWithOptions(pol *policy.Engine, workspaceDir string, opts MCPBr
 		IncludeAntigravityPaths: opts.IncludeAntigravityPaths,
 		stdioPool:               map[string]*stdioClient{},
 		liveSchemas:             map[string][]ToolDescriptor{},
+		httpSessions:            map[string]string{},
+		httpInited:              map[string]bool{},
 		httpClient:              &http.Client{Timeout: 60 * time.Second},
 	}
 	b.policyPtr.Store(pol)
@@ -617,40 +622,91 @@ func (m *MCPBridge) isSelfServer(name string) bool {
 	return low == "ptc" || low == "mcplex" || strings.HasPrefix(low, "mcplex_") || low == "agy-ptc" || strings.HasPrefix(low, "agy-ptc_")
 }
 
-func (m *MCPBridge) httpRPC(ctx context.Context, serverName, endpoint string, headers map[string]string, method string, params map[string]any) ([]byte, error) {
-	id := m.reqSeq.Add(1)
+func (m *MCPBridge) ensureHTTPSession(ctx context.Context, serverName, endpoint string, headers map[string]string) string {
+	m.mu.Lock()
+	if m.httpInited[endpoint] {
+		sid := m.httpSessions[endpoint]
+		m.mu.Unlock()
+		return sid
+	}
+	m.mu.Unlock()
+
+	initCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, sid, err := m.httpRPCRaw(initCtx, serverName, endpoint, headers, "", "initialize", map[string]any{
+		"protocolVersion": "2025-03-26",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "mcplex-bridge", "version": version.Version},
+	}, false)
+
+	m.mu.Lock()
+	m.httpInited[endpoint] = true
+	if err == nil && sid != "" {
+		m.httpSessions[endpoint] = sid
+	}
+	stored := m.httpSessions[endpoint]
+	m.mu.Unlock()
+
+	if err == nil {
+		notifCtx, nCancel := context.WithTimeout(ctx, 3*time.Second)
+		_, _, _ = m.httpRPCRaw(notifCtx, serverName, endpoint, headers, stored, "notifications/initialized", nil, true)
+		nCancel()
+	}
+	return stored
+}
+
+func (m *MCPBridge) httpRPCRaw(ctx context.Context, serverName, endpoint string, headers map[string]string, sessionID, method string, params map[string]any, isNotification bool) ([]byte, string, error) {
 	payload := map[string]any{
 		"jsonrpc": "2.0",
-		"id":      id,
 		"method":  method,
-		"params":  params,
+	}
+	if !isNotification {
+		payload["id"] = m.reqSeq.Add(1)
+	}
+	if params != nil {
+		payload["params"] = params
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	if sessionID != "" {
+		req.Header.Set("Mcp-Session-Id", sessionID)
+	}
 	for k, v := range headers {
 		req.Header.Set(k, os.ExpandEnv(v))
 	}
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("MCP HTTP %s %s failed: %w", serverName, method, err)
+		return nil, "", fmt.Errorf("MCP HTTP %s %s failed: %w", serverName, method, err)
 	}
 	defer resp.Body.Close()
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	gotSID := strings.TrimSpace(resp.Header.Get("Mcp-Session-Id"))
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("MCP HTTP %s %s returned status %d", serverName, method, resp.StatusCode)
+		return nil, gotSID, fmt.Errorf("MCP HTTP %s %s returned status %d", serverName, method, resp.StatusCode)
 	}
-	return respBytes, nil
+	return respBytes, gotSID, nil
+}
+
+func (m *MCPBridge) httpRPC(ctx context.Context, serverName, endpoint string, headers map[string]string, method string, params map[string]any) ([]byte, error) {
+	sid := m.ensureHTTPSession(ctx, serverName, endpoint, headers)
+	respBytes, gotSID, err := m.httpRPCRaw(ctx, serverName, endpoint, headers, sid, method, params, false)
+	if gotSID != "" && gotSID != sid {
+		m.mu.Lock()
+		m.httpSessions[endpoint] = gotSID
+		m.mu.Unlock()
+	}
+	return respBytes, err
 }
 
 func (m *MCPBridge) callStreamableHTTP(ctx context.Context, serverName, endpoint string, headers map[string]string, toolName string, callArgs map[string]any) (any, error) {
@@ -690,6 +746,7 @@ func (m *MCPBridge) callStdioServer(ctx context.Context, serverName string, cfg 
 type stdioClient struct {
 	cmd       *exec.Cmd
 	stdin     io.WriteCloser
+	stderrBuf *limitedSyncBuffer
 	mu        sync.Mutex
 	pending   map[int64]chan []byte
 	pendingMu sync.Mutex
@@ -710,6 +767,8 @@ func startStdioClient(cfg externalServerCfg) (*stdioClient, error) {
 		cmd.Env = env
 	}
 	setSysProcAttrHide(cmd)
+	stderrBuf := newLimitedSyncBuffer(16 * 1024)
+	cmd.Stderr = stderrBuf
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -722,11 +781,16 @@ func startStdioClient(cfg externalServerCfg) (*stdioClient, error) {
 		return nil, err
 	}
 	c := &stdioClient{
-		cmd:     cmd,
-		stdin:   stdin,
-		pending: map[int64]chan []byte{},
+		cmd:       cmd,
+		stdin:     stdin,
+		stderrBuf: stderrBuf,
+		pending:   map[int64]chan []byte{},
 	}
 	go c.readLoop(stdout)
+	go func() {
+		_ = cmd.Wait()
+		c.closed.Store(true)
+	}()
 
 	initCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -737,6 +801,9 @@ func startStdioClient(cfg externalServerCfg) (*stdioClient, error) {
 	})
 	if err != nil {
 		c.close()
+		if detail := strings.TrimSpace(stderrBuf.String()); detail != "" {
+			return nil, fmt.Errorf("%w (stderr: %s)", err, output.TruncateWithByteNotice(detail, 500))
+		}
 		return nil, err
 	}
 	_ = c.sendNotification("notifications/initialized")
@@ -761,9 +828,10 @@ func (c *stdioClient) readLoop(r io.Reader) {
 			continue
 		}
 		var env struct {
-			ID *int64 `json:"id"`
+			ID     *int64 `json:"id"`
+			Method string `json:"method"`
 		}
-		if json.Unmarshal(line, &env) == nil && env.ID != nil {
+		if json.Unmarshal(line, &env) == nil && env.ID != nil && env.Method == "" {
 			cp := make([]byte, len(line))
 			copy(cp, line)
 			c.pendingMu.Lock()
@@ -777,12 +845,36 @@ func (c *stdioClient) readLoop(r io.Reader) {
 	}
 }
 
+func (c *stdioClient) writeLineWithTimeout(ctx context.Context, data []byte) error {
+	line := append(append([]byte(nil), data...), '\n')
+	done := make(chan error, 1)
+	go func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.closed.Load() {
+			done <- errors.New("MCP server connection closed")
+			return
+		}
+		_, err := c.stdin.Write(line)
+		done <- err
+	}()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		c.close()
+		return ctx.Err()
+	case <-timer.C:
+		c.close()
+		return errors.New("MCP server stdin write timed out (server unresponsive)")
+	}
+}
+
 func (c *stdioClient) sendNotification(method string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	raw, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "method": method})
-	_, err := c.stdin.Write(append(raw, '\n'))
-	return err
+	return c.writeLineWithTimeout(context.Background(), raw)
 }
 
 func (c *stdioClient) sendRPC(ctx context.Context, method string, params map[string]any) ([]byte, error) {
@@ -805,10 +897,7 @@ func (c *stdioClient) sendRPC(ctx context.Context, method string, params map[str
 		return nil, err
 	}
 
-	c.mu.Lock()
-	_, wErr := c.stdin.Write(append(msg, '\n'))
-	c.mu.Unlock()
-	if wErr != nil {
+	if wErr := c.writeLineWithTimeout(ctx, msg); wErr != nil {
 		c.pendingMu.Lock()
 		delete(c.pending, id)
 		c.pendingMu.Unlock()
@@ -818,6 +907,11 @@ func (c *stdioClient) sendRPC(ctx context.Context, method string, params map[str
 	select {
 	case resp, ok := <-ch:
 		if !ok || len(resp) == 0 {
+			if c.stderrBuf != nil {
+				if detail := strings.TrimSpace(c.stderrBuf.String()); detail != "" {
+					return nil, fmt.Errorf("MCP server closed stream before replying (stderr: %s)", output.TruncateWithByteNotice(detail, 500))
+				}
+			}
 			return nil, errors.New("MCP server closed stream before replying")
 		}
 		return resp, nil

@@ -528,7 +528,11 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 	go func() {
 		select {
 		case <-ctx.Done():
-			vm.Interrupt("execution deadline exceeded")
+			if parentCtx.Err() != nil && !errors.Is(parentCtx.Err(), context.DeadlineExceeded) {
+				vm.Interrupt("execution canceled")
+			} else {
+				vm.Interrupt("execution deadline exceeded")
+			}
 		case <-doneWatch:
 		}
 	}()
@@ -674,6 +678,16 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 					culprits = snapInFlight
 				}
 			}
+			if parentCtx.Err() != nil && !errors.Is(parentCtx.Err(), context.DeadlineExceeded) {
+				return nil, &ExecutionError{
+					Phase:       "canceled",
+					Message:     "Canceled: execution canceled by client",
+					TimedOutOps: culprits,
+					Logs:        env.getLogs(),
+					Traces:      env.getTraces(),
+					DurationMs:  time.Since(start).Milliseconds(),
+				}
+			}
 			return nil, &ExecutionError{
 				Phase:       "timeout",
 				Message:     fmt.Sprintf("Timeout: program exceeded %s (timeoutMs=%d, max %d)", timeout, timeout.Milliseconds(), EffectiveMaxTimeout().Milliseconds()),
@@ -730,7 +744,15 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 func (env *ExecutionEnv) wrapRuntimeErr(err error, cr *compiler.CompileResult, start time.Time) error {
 	phase := "runtime"
 	var interrupted *goja.InterruptedError
-	if errors.As(err, &interrupted) || errors.Is(env.Ctx.Err(), context.DeadlineExceeded) {
+	if errors.As(err, &interrupted) {
+		if strings.Contains(strings.ToLower(interrupted.String()), "canceled") {
+			phase = "canceled"
+		} else {
+			phase = "timeout"
+		}
+	} else if errors.Is(env.Ctx.Err(), context.Canceled) {
+		phase = "canceled"
+	} else if errors.Is(env.Ctx.Err(), context.DeadlineExceeded) {
 		phase = "timeout"
 	}
 	formattedMsg := compiler.FormatRuntimeError(err.Error(), cr)
@@ -1047,14 +1069,14 @@ func summarizeTarget(args []any) string {
 	switch v := args[0].(type) {
 	case string:
 		if len(v) > 80 {
-			return v[:80] + "..."
+			return output.SliceUTF8Bytes(v, 80) + "..."
 		}
 		return v
 	case map[string]any:
 		for _, k := range []string{"path", "pattern", "command", "query", "ref", "name"} {
 			if s, ok := v[k].(string); ok && s != "" {
 				if len(s) > 80 {
-					return s[:80] + "..."
+					return output.SliceUTF8Bytes(s, 80) + "..."
 				}
 				return s
 			}

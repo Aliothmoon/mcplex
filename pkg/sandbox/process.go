@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -17,6 +18,8 @@ func installProcessOS(env *ExecutionEnv) error {
 		if k, v, ok := strings.Cut(kv, "="); ok && k != "" {
 			if isSecretEnvName(k) {
 				v = redacted
+			} else if strings.Contains(v, "://") && strings.Contains(v, "@") {
+				v = redactURLCredentials(v)
 			}
 			vars[k] = v
 		}
@@ -82,6 +85,18 @@ func isSecretEnvName(name string) bool {
 		}
 	}
 	return false
+}
+
+func redactURLCredentials(val string) string {
+	u, err := url.Parse(val)
+	if err != nil || u.User == nil {
+		return val
+	}
+	if _, hasPass := u.User.Password(); !hasPass {
+		return val
+	}
+	u.User = url.UserPassword(u.User.Username(), "redacted")
+	return u.String()
 }
 
 func nodePlatform() string {

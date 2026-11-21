@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	MaxStateEntryBytes = 512 * 1024      // 512 KB per key
+	MaxStateEntryBytes = 512 * 1024      // 512 KB per persisted user key
 	MaxStateTotalBytes = 4 * 1024 * 1024 // 4 MB per workspace session (persisted user entries)
+	MaxSpillEntryBytes = 4 * 1024 * 1024 // 4 MB per in-memory auto-spill entry
 	MaxSpillTotalBytes = 4 * 1024 * 1024 // 4 MB in-memory cap for process-local auto-spills
 	lastResultKey      = "__last_result"
 	spillKeyPrefix     = "__result_"
@@ -209,7 +210,7 @@ func (s *StateStore) Set(key string, val any) error {
 // under a unique `__result_N` key and updates the `__last_result` alias in the same lock.
 func (s *StateStore) SaveAutoSpill(val any) string {
 	raw, err := json.Marshal(val)
-	if err != nil || len(raw) > MaxStateEntryBytes {
+	if err != nil || len(raw) > MaxSpillEntryBytes {
 		return ""
 	}
 	detached := detachValue(val, raw)

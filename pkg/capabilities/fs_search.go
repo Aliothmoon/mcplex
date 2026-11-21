@@ -57,6 +57,7 @@ type SearchHit struct {
 // FSSearchBinder exposes `fs.*` and `search.*` to guest programs.
 type FSSearchBinder struct {
 	Policy *policy.Engine
+	Locks  *FileLockTable
 	hasRg  sync.Once
 	rgBin  string
 }
@@ -193,7 +194,7 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			return out, nil
 		},
-		"write": func(_ context.Context, args []any) (any, error) {
+		"write": func(ctx context.Context, args []any) (any, error) {
 			var targetPath, content, eol string
 			if len(args) >= 1 {
 				if m, ok := args[0].(map[string]any); ok {
@@ -216,6 +217,13 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 			absPath, err := b.Policy.ResolveAndCheckWrite(env.Cwd, targetPath)
 			if err != nil {
 				return nil, err
+			}
+			if b.Locks != nil {
+				owner := fmt.Sprintf("fswrite:%d", txOwnerSeq.Add(1))
+				if err := b.Locks.Acquire(ctx, owner, absPath); err != nil {
+					return nil, err
+				}
+				defer b.Locks.ReleaseOwner(owner)
 			}
 			orig, rErr := os.ReadFile(absPath)
 			data, err := applyEOL(targetPath, orig, rErr == nil, []byte(content), eol)
@@ -520,7 +528,7 @@ func invalidRegexError(pattern, detail string) error {
 // runTextOrRegexSearch returns hits and the total number of matches (-1 when unknown, e.g. Go fallback).
 func (b *FSSearchBinder) runTextOrRegexSearch(ctx context.Context, workspaceCwd, searchRoot string, q searchQuery) ([]SearchHit, int, error) {
 	if rgBin := b.resolveRg(); rgBin != "" {
-		hits, total, err := runRgJSON(ctx, rgBin, workspaceCwd, searchRoot, q)
+		hits, total, err := runRgJSON(ctx, b.Policy, rgBin, workspaceCwd, searchRoot, q)
 		if err == nil {
 			return hits, total, nil
 		}
@@ -532,11 +540,28 @@ func (b *FSSearchBinder) runTextOrRegexSearch(ctx context.Context, workspaceCwd,
 			return nil, -1, err
 		}
 	}
-	hits, err := runGoFallbackSearch(ctx, workspaceCwd, searchRoot, q)
+	hits, err := runGoFallbackSearch(ctx, b.Policy, workspaceCwd, searchRoot, q)
 	return hits, -1, err
 }
 
-func runRgJSON(ctx context.Context, rgBin, workspaceCwd, searchRoot string, q searchQuery) ([]SearchHit, int, error) {
+func canSearchPath(pol *policy.Engine, workspaceCwd, p string, cache map[string]bool) bool {
+	if pol == nil {
+		return true
+	}
+	if cache != nil {
+		if allowed, ok := cache[p]; ok {
+			return allowed
+		}
+	}
+	_, err := pol.ResolveAndCheckRead(workspaceCwd, p)
+	allowed := err == nil
+	if cache != nil {
+		cache[p] = allowed
+	}
+	return allowed
+}
+
+func runRgJSON(ctx context.Context, pol *policy.Engine, rgBin, workspaceCwd, searchRoot string, q searchQuery) ([]SearchHit, int, error) {
 	rgArgs := []string{"--json", "--line-number", "--column", "--no-heading", "--color=never"}
 	if q.literal {
 		rgArgs = append(rgArgs, "--fixed-strings")
@@ -615,6 +640,8 @@ func runRgJSON(ctx context.Context, rgBin, workspaceCwd, searchRoot string, q se
 	var window []seenLine
 	fileStart := 0 // index in hits of the first hit of the current file
 	full := false
+	skipFile := false
+	permCache := map[string]bool{}
 	scanner := bufio.NewScanner(strings.NewReader(stdout.String()))
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -626,8 +653,12 @@ func runRgJSON(ctx context.Context, rgBin, workspaceCwd, searchRoot string, q se
 		case "begin":
 			window = window[:0]
 			fileStart = len(hits)
+			skipFile = !canSearchPath(pol, workspaceCwd, ev.Data.Path.Text, permCache)
 			continue
 		case "match", "context":
+			if skipFile || !canSearchPath(pol, workspaceCwd, ev.Data.Path.Text, permCache) {
+				continue
+			}
 		default:
 			continue
 		}
@@ -681,7 +712,7 @@ func runRgJSON(ctx context.Context, rgBin, workspaceCwd, searchRoot string, q se
 	return hits, total, nil
 }
 
-func runGoFallbackSearch(ctx context.Context, workspaceCwd, searchRoot string, q searchQuery) ([]SearchHit, error) {
+func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, searchRoot string, q searchQuery) ([]SearchHit, error) {
 	var re *regexp.Regexp
 	var err error
 	pat := q.pattern
@@ -701,17 +732,23 @@ func runGoFallbackSearch(ctx context.Context, workspaceCwd, searchRoot string, q
 	if err != nil {
 		return nil, err
 	}
+	permCache := map[string]bool{}
 	if !info.IsDir() {
-		files = []string{searchRoot}
+		if canSearchPath(pol, workspaceCwd, searchRoot, permCache) {
+			files = []string{searchRoot}
+		}
 	} else {
 		_ = filepath.WalkDir(searchRoot, func(p string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return nil
 			}
 			if d.IsDir() {
-				if p != searchRoot && skippedWalkDirs[d.Name()] {
+				if p != searchRoot && (skippedWalkDirs[d.Name()] || !canSearchPath(pol, workspaceCwd, p, permCache)) {
 					return filepath.SkipDir
 				}
+				return nil
+			}
+			if !canSearchPath(pol, workspaceCwd, p, permCache) {
 				return nil
 			}
 			if q.glob != "" && !matchSimpleGlob(q.glob, filepath.ToSlash(p), d.Name()) {
@@ -777,7 +814,7 @@ func (b *FSSearchBinder) runGlobSearch(ctx context.Context, workspaceCwd, search
 	if maxResults <= 0 {
 		maxResults = 200
 	}
-	allFiles := collectWorkspaceFiles(ctx, searchRoot)
+	allFiles := collectWorkspaceFiles(ctx, b.Policy, workspaceCwd, searchRoot)
 	total := 0
 	matchFiles := func(pat string) []string {
 		var matched []string
@@ -836,16 +873,20 @@ func (b *FSSearchBinder) runGlobSearch(ctx context.Context, workspaceCwd, search
 	return []string{}, 0, "", nil
 }
 
-func collectWorkspaceFiles(ctx context.Context, root string) []string {
+func collectWorkspaceFiles(ctx context.Context, pol *policy.Engine, workspaceCwd, root string) []string {
 	var out []string
+	permCache := map[string]bool{}
 	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || ctx.Err() != nil {
 			return nil
 		}
 		if d.IsDir() {
-			if p != root && skippedWalkDirs[d.Name()] {
+			if p != root && (skippedWalkDirs[d.Name()] || !canSearchPath(pol, workspaceCwd, p, permCache)) {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if !canSearchPath(pol, workspaceCwd, p, permCache) {
 			return nil
 		}
 		out = append(out, p)
