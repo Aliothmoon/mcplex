@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/aliothmoon/mcplex/pkg/events"
 	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/policy"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
@@ -56,10 +57,13 @@ type SearchHit struct {
 
 // FSSearchBinder exposes `fs.*` and `search.*` to guest programs.
 type FSSearchBinder struct {
-	Policy *policy.Engine
-	Locks  *FileLockTable
-	hasRg  sync.Once
-	rgBin  string
+	Policy    *policy.Engine
+	Locks     *FileLockTable
+	Events    *events.Hub
+	SessionID string
+	RunID     string
+	hasRg     sync.Once
+	rgBin     string
 }
 
 func (b *FSSearchBinder) resolveRg() string {
@@ -148,7 +152,15 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
-			return b.readText(env.Cwd, targetPath, opts)
+			text, err := b.readText(env.Cwd, targetPath, opts)
+			if err == nil && b.Events.Active() {
+				absRead := targetPath
+				if !filepath.IsAbs(absRead) {
+					absRead = filepath.Join(env.Cwd, absRead)
+				}
+				emitFileRead(b.Events, b.SessionID, b.RunID, "fs.read", env.Cwd, relDisplayPath(env.Cwd, absRead), filepath.Clean(absRead), formatReadOptsSummary(opts, len(text)), text)
+			}
+			return text, err
 		},
 		// fs.cat(paths, opts?) reads many files in parallel like `cat a b c`: unreadable files don't abort the call;
 		// they map to null and are listed once under Warnings. Returns { [path]: text | null } in input order.
@@ -237,6 +249,7 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err := writeFilePreserveMode(absPath, data); err != nil {
 				return nil, err
 			}
+			emitFileDiff(b.Events, b.SessionID, b.RunID, "", "", "fs.write", env.Cwd, relDisplayPath(env.Cwd, absPath), absPath, orig, data, rErr == nil, true)
 			return map[string]any{
 				"ok":    true,
 				"path":  relDisplayPath(env.Cwd, absPath),
@@ -393,6 +406,9 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if cut := countCutLines(hits); cut > 0 {
 				env.AddWarning(fmt.Sprintf("search.rg: %d long line(s) cut at %dB; fs.read the line range for full text", cut, MaxSearchLineBytes))
 			}
+			if err == nil && b.Events.Active() {
+				emitSearchHits(b.Events, b.SessionID, b.RunID, "search.rg", searchRoot, q.pattern, hits, total)
+			}
 			return hits, err
 		},
 		"glob": func(ctx context.Context, args []any) (any, error) {
@@ -418,6 +434,9 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			if total > len(files) {
 				env.AddWarning(fmt.Sprintf("search.glob: capped at %d of %d files; narrow path or pass { maxResults }", len(files), total))
+			}
+			if b.Events.Active() {
+				emitSearchFiles(b.Events, b.SessionID, b.RunID, "search.glob", searchRoot, pat, files, total)
 			}
 			if optBool(opts, "withMeta", false) {
 				return map[string]any{"files": files, "note": note}, nil

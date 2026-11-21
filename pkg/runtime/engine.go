@@ -17,6 +17,7 @@ import (
 
 	"github.com/aliothmoon/mcplex/pkg/audit"
 	"github.com/aliothmoon/mcplex/pkg/capabilities"
+	"github.com/aliothmoon/mcplex/pkg/events"
 	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/policy"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
@@ -47,6 +48,8 @@ type EngineOptions struct {
 	TrustWorkspaceMCP     bool
 	AntigravityMode       bool // true for agy-ptc plugin; false for standalone generic mcplex
 	EnableTasks           bool // enable background tasks manager & sandbox tasks.* namespace
+	EnableEvents          bool // record live CRUD & execution events for TUI / HTTP SSE
+	EventHistory          int  // ring buffer capacity for EventHub (default 500)
 }
 
 // Engine manages workspace-scoped capability instances, state stores, audit logs, and PTC program execution.
@@ -70,6 +73,8 @@ type Engine struct {
 	stores                map[string]*capabilities.StateStore
 	bridges               map[string]*capabilities.MCPBridge
 	fileLocks             *capabilities.FileLockTable
+	events                *events.Hub
+	runSeq                atomic.Int64
 	totalRuns             atomic.Int64
 	totalHostOps          atomic.Int64
 	statusSeq             atomic.Int64
@@ -99,6 +104,10 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 	if dataDir != "" {
 		_ = os.MkdirAll(dataDir, 0o755)
 	}
+	hub := events.NewHub(opts.EventHistory)
+	if opts.EnableEvents {
+		hub.SetAlwaysRecord(true)
+	}
 	return &Engine{
 		dataDir:               dataDir,
 		defaultCwd:            defaultCwd,
@@ -114,6 +123,7 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 		stores:                map[string]*capabilities.StateStore{},
 		bridges:               map[string]*capabilities.MCPBridge{},
 		fileLocks:             capabilities.NewFileLockTable(),
+		events:                hub,
 	}
 }
 
@@ -144,6 +154,7 @@ func (e *Engine) ensureTaskManager() *tasks.Manager {
 	defer e.mu.Unlock()
 	if e.taskMgr == nil {
 		e.taskMgr = tasks.NewManager(e.dataDir)
+		e.taskMgr.SetEventHub(e.events)
 	}
 	return e.taskMgr
 }
@@ -198,18 +209,64 @@ func (e *Engine) newPolicyForCwd(cwd string) *policy.Engine {
 	})
 }
 
+// EventHub returns the real-time event hub for TUI and HTTP SSE consumers.
+func (e *Engine) EventHub() *events.Hub {
+	if e == nil {
+		return nil
+	}
+	return e.events
+}
+
 // RunReadTool executes the standalone MCP `read` tool (line-range/tail/byteOffset text + native images).
-func (e *Engine) RunReadTool(_ context.Context, req capabilities.DirectReadRequest) (*capabilities.DirectReadResult, error) {
+func (e *Engine) RunReadTool(ctx context.Context, req capabilities.DirectReadRequest) (*capabilities.DirectReadResult, error) {
+	start := time.Now()
+	sid := SessionIDFromContext(ctx)
+	runID := fmt.Sprintf("read_%d", e.runSeq.Add(1))
 	cwd, err := e.resolveEffectiveCwd(req.Cwd)
 	if err != nil {
 		return nil, err
 	}
 	pol := e.newPolicyForCwd(cwd)
-	return capabilities.ReadFileDirect(pol, cwd, req)
+	res, err := capabilities.ReadFileDirect(pol, cwd, req)
+	if e.events.Active() {
+		absTarget := req.Path
+		if !filepath.IsAbs(absTarget) {
+			absTarget = filepath.Join(cwd, absTarget)
+		}
+		ev := events.Event{
+			Kind:       events.KindFileRead,
+			SessionID:  sid,
+			RunID:      runID,
+			Tool:       "read",
+			Cwd:        filepath.ToSlash(filepath.Clean(cwd)),
+			Path:       req.Path,
+			AbsPath:    filepath.ToSlash(filepath.Clean(absTarget)),
+			DurationMs: time.Since(start).Milliseconds(),
+		}
+		if err != nil {
+			ev.Status = "error"
+			ev.Error = err.Error()
+		} else {
+			ev.Status = "ok"
+			if res.IsImage {
+				ev.Summary = res.Text
+				ev.Detail = res.Text
+				ev.DetailKind = "image"
+			} else {
+				firstLine, _, _ := strings.Cut(res.Text, "\n")
+				ev.Summary = strings.TrimSpace(firstLine)
+				ev.Detail, ev.Truncated = events.CapPreview(res.Text, events.DefaultReadPreview)
+				ev.DetailKind = "text"
+			}
+		}
+		e.events.Emit(ev)
+	}
+	return res, err
 }
 
 // RunTaskSpawn executes the standalone MCP `spawn` tool to run long commands or daemons.
 func (e *Engine) RunTaskSpawn(ctx context.Context, req tasks.StartRequest) (*tasks.StartResult, string, error) {
+	start := time.Now()
 	cwd, err := e.resolveEffectiveCwd(req.Cwd)
 	if err != nil {
 		return nil, "", err
@@ -221,13 +278,28 @@ func (e *Engine) RunTaskSpawn(ctx context.Context, req tasks.StartRequest) (*tas
 	}
 	res, err := e.ensureTaskManager().Start(ctx, pol, req)
 	if err != nil {
+		if e.events.Active() {
+			e.events.Emit(events.Event{
+				Kind:       events.KindTask,
+				SessionID:  req.SessionID,
+				RunID:      fmt.Sprintf("spawn_%d", e.runSeq.Add(1)),
+				Tool:       "spawn",
+				Title:      req.Command,
+				Status:     "error",
+				DurationMs: time.Since(start).Milliseconds(),
+				Error:      err.Error(),
+			})
+		}
 		return nil, "", err
 	}
-	return res, tasks.FormatStartResult(res), nil
+	formatted := tasks.FormatStartResult(res)
+	// Lifecycle + live streaming chunks are emitted directly by tasks.Manager via e.events.
+	return res, formatted, nil
 }
 
 // RunTaskManage executes the standalone MCP `task` tool (list, status, logs, wait, input, kill, kill_all).
 func (e *Engine) RunTaskManage(ctx context.Context, req tasks.ManageRequest) (*tasks.ManageResult, string, error) {
+	start := time.Now()
 	if req.SessionID == "" {
 		req.SessionID = SessionIDFromContext(ctx)
 	}
@@ -235,7 +307,27 @@ func (e *Engine) RunTaskManage(ctx context.Context, req tasks.ManageRequest) (*t
 	if err != nil {
 		return nil, "", err
 	}
-	return res, tasks.FormatManageResult(res), nil
+	formatted := tasks.FormatManageResult(res)
+	if e.events.Active() {
+		det, trunc := events.CapPreview(formatted, events.DefaultShellPreview)
+		title := req.Action
+		if req.TaskID != "" {
+			title += " " + req.TaskID
+		}
+		e.events.Emit(events.Event{
+			Kind:       events.KindTask,
+			SessionID:  req.SessionID,
+			RunID:      fmt.Sprintf("task_%d", e.runSeq.Add(1)),
+			Tool:       "task",
+			Title:      title,
+			Status:     "ok",
+			DurationMs: time.Since(start).Milliseconds(),
+			Detail:     det,
+			DetailKind: "shell",
+			Truncated:  trunc,
+		})
+	}
+	return res, formatted, nil
 }
 
 // SetClientWorkspace records a workspace root reported by the MCP client during `initialize`.
@@ -268,16 +360,33 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 	store, bridge := e.workspaceResources(cwd, pol)
 	defer store.Flush() // state writes (state.set, auto-spills) hit disk once per exec
 
-	fsSearch := &capabilities.FSSearchBinder{Policy: pol, Locks: e.fileLocks}
-	astBinder := &capabilities.ASTBinder{Policy: pol}
-	shellGit := &capabilities.ShellGitBinder{Policy: pol}
-	editTx := &capabilities.EditTxBinder{Policy: pol, ShellRunner: shellGit, Locks: e.fileLocks}
-	stateBinder := &capabilities.StateBinder{Store: store}
-
 	title := strings.TrimSpace(in.Title)
 	if title == "" {
 		title = "vm_exec"
 	}
+	sid := SessionIDFromContext(ctx)
+	runID := fmt.Sprintf("run_%d", e.runSeq.Add(1))
+	if e.events.Active() {
+		codePrev, codeTrunc := events.CapPreview(in.Code, events.DefaultCodePreview)
+		e.events.Emit(events.Event{
+			Kind:       events.KindExecStart,
+			SessionID:  sid,
+			RunID:      runID,
+			Tool:       "exec",
+			Cwd:        filepath.ToSlash(filepath.Clean(cwd)),
+			Title:      title,
+			Status:     "running",
+			Detail:     codePrev,
+			DetailKind: "code",
+			Truncated:  codeTrunc,
+		})
+	}
+
+	fsSearch := &capabilities.FSSearchBinder{Policy: pol, Locks: e.fileLocks, Events: e.events, SessionID: sid, RunID: runID}
+	astBinder := &capabilities.ASTBinder{Policy: pol}
+	shellGit := &capabilities.ShellGitBinder{Policy: pol, Events: e.events, SessionID: sid, RunID: runID}
+	editTx := &capabilities.EditTxBinder{Policy: pol, ShellRunner: shellGit, Locks: e.fileLocks, Events: e.events, SessionID: sid, RunID: runID}
+	stateBinder := &capabilities.StateBinder{Store: store}
 
 	timeout := sandbox.EffectiveDefaultTimeout()
 	if in.TimeoutMs > 0 {
@@ -359,6 +468,23 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 				Warnings:      ee.Warnings,
 				Code:          in.Code,
 			})
+			if e.events.Active() {
+				det, trunc := events.CapPreview(formatted, events.DefaultReadPreview)
+				e.events.Emit(events.Event{
+					Kind:       events.KindExecEnd,
+					SessionID:  sid,
+					RunID:      runID,
+					Tool:       "exec",
+					Title:      title,
+					Status:     statusTag,
+					DurationMs: ee.DurationMs,
+					HostOps:    len(ee.Traces),
+					Error:      ee.Message,
+					Detail:     det,
+					DetailKind: "text",
+					Truncated:  trunc,
+				})
+			}
 			e.writeLiveStatus(LiveStatus{
 				Active:       false,
 				Title:        title,
@@ -419,6 +545,22 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 		ResultPreview: formatted,
 	})
 
+	if e.events.Active() {
+		det, trunc := events.CapPreview(formatted, events.DefaultReadPreview)
+		e.events.Emit(events.Event{
+			Kind:       events.KindExecEnd,
+			SessionID:  sid,
+			RunID:      runID,
+			Tool:       "exec",
+			Title:      title,
+			Status:     statusTag,
+			DurationMs: res.DurationMs,
+			HostOps:    len(res.Traces),
+			Detail:     det,
+			DetailKind: "text",
+			Truncated:  trunc,
+		})
+	}
 	e.writeLiveStatus(LiveStatus{
 		Active:       false,
 		Title:        title,

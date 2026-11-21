@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aliothmoon/mcplex/pkg/events"
 	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
 )
@@ -135,15 +137,38 @@ func (b *ShellGitBinder) RunArgv(parentCtx context.Context, env *sandbox.Executi
 	}
 	stdout := newLimitedSyncBuffer(512 * 1024)
 	stderr := newLimitedSyncBuffer(256 * 1024)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
+	var live *events.LiveStream
+	streamID := ""
+	if b.Events.Active() {
+		streamID = fmt.Sprintf("sh_%d", shellStreamSeq.Add(1))
+		baseEv := events.Event{
+			Kind:       events.KindShell,
+			SessionID:  b.SessionID,
+			RunID:      b.RunID,
+			StreamID:   streamID,
+			Tool:       "sh.run",
+			Cwd:        cleanSlash(cwd),
+			Title:      line,
+			DetailKind: "shell",
+		}
+		live = events.NewLiveStream(b.Events, baseEv, 80*time.Millisecond, 4096, func(totalBytes int64) string {
+			return fmt.Sprintf("running · %s", events.FormatBytes(totalBytes))
+		})
+		cmd.Stdout = io.MultiWriter(stdout, live)
+		cmd.Stderr = io.MultiWriter(stderr, live)
+		live.EmitStart("running…")
+	} else {
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+	}
 
 	start := time.Now()
-	runErr := cmd.Run()
+	runErr := runManagedCmd(cmd)
 	durMs := time.Since(start).Milliseconds()
 
 	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(runErr, exec.ErrWaitDelay)
 	exitCode := 0
+	spawnErr := ""
 	if runErr != nil {
 		var exitErr *exec.ExitError
 		switch {
@@ -152,8 +177,56 @@ func (b *ShellGitBinder) RunArgv(parentCtx context.Context, env *sandbox.Executi
 		case errors.As(runErr, &exitErr):
 			exitCode = exitErr.ExitCode()
 		default:
-			return nil, fmt.Errorf("%s: %v", file, runErr)
+			exitCode = -1
+			spawnErr = runErr.Error()
 		}
+	}
+
+	cleanOut := cleanStream(stdout.String())
+	cleanErr := cleanStream(stderr.String())
+	if live != nil {
+		combined := cleanOut
+		if cleanErr != "" {
+			if combined != "" {
+				combined += "\n" + cleanErr
+			} else {
+				combined = cleanErr
+			}
+		}
+		finalStatus := "ok"
+		summary := fmt.Sprintf("exit=%d · %dms", exitCode, durMs)
+		switch {
+		case timedOut:
+			finalStatus = "timeout"
+			summary = fmt.Sprintf("timeout · %dms", durMs)
+		case parentCtx.Err() != nil:
+			finalStatus = "canceled"
+			summary = fmt.Sprintf("canceled · %dms", durMs)
+		case exitCode != 0 || spawnErr != "":
+			finalStatus = "error"
+		}
+		ec := exitCode
+		preview, trunc := events.CapTailPreview(combined, events.DefaultShellPreview)
+		live.EmitEnd(events.Event{
+			Kind:       events.KindShell,
+			SessionID:  b.SessionID,
+			RunID:      b.RunID,
+			StreamID:   streamID,
+			Tool:       "sh.run",
+			Cwd:        cleanSlash(cwd),
+			Title:      line,
+			Status:     finalStatus,
+			ExitCode:   &ec,
+			DurationMs: durMs,
+			Summary:    summary,
+			Error:      spawnErr,
+			Detail:     preview,
+			DetailKind: "shell",
+			Truncated:  trunc,
+		})
+	}
+	if spawnErr != "" {
+		return nil, fmt.Errorf("%s: %s", file, spawnErr)
 	}
 	if parentCtx.Err() != nil {
 		return nil, fmt.Errorf("%s canceled after %dms (outer program ended)", line, durMs)
@@ -168,8 +241,8 @@ func (b *ShellGitBinder) RunArgv(parentCtx context.Context, env *sandbox.Executi
 		"ok":         exitCode == 0 && !timedOut,
 		"exitCode":   exitCode,
 		"timedOut":   timedOut,
-		"stdout":     cleanStream(stdout.String()),
-		"stderr":     cleanStream(stderr.String()),
+		"stdout":     cleanOut,
+		"stderr":     cleanErr,
 		"durationMs": durMs,
 	}
 	if ok, _ := res["ok"].(bool); !ok && (optBool(opts, "throwOnError", false) || !optBool(opts, "settle", true)) {

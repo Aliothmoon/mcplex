@@ -56,6 +56,17 @@ mcplex serve \
 ```
 - Endpoint: `POST http://127.0.0.1:8787/mcp` (`Authorization: Bearer your-secret-token`)
 - Health probe: `GET http://127.0.0.1:8787/healthz`
+- Live event stream: `GET http://127.0.0.1:8787/events` (SSE) and `GET http://127.0.0.1:8787/api/events`
+
+### 3. Interactive Live TUI (`--ui` / `mcplex ui`)
+Launch the GrokNight dark interactive console to watch live colorized CRUD diffs, real-time streaming shell/task output, and inspect full files in a floating `less`-style search modal:
+```bash
+# Start HTTP server + embedded interactive TUI (defaults to 127.0.0.1:8787)
+mcplex serve --ui --cwd /path/to/workspace
+
+# Or attach to a remote/container mcplex HTTP instance
+mcplex ui http://127.0.0.1:8787 --token "your-secret-token"
+```
 
 ---
 

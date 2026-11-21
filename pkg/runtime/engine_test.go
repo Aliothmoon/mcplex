@@ -203,12 +203,13 @@ func TestExternalMCPStreamableHTTPProxyBridge(t *testing.T) {
 			} `json:"params"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&rpc)
+		q, _ := rpc.Params.Arguments["query"].(string)
 		reply := map[string]any{
 			"jsonrpc": "2.0",
 			"id":      rpc.ID,
 			"result": map[string]any{
 				"content": []map[string]any{
-					{"type": "text", "text": `{"hits":["auth.go:42","jwt.go:18"],"query":"` + rpc.Params.Arguments["query"].(string) + `"}`},
+					{"type": "text", "text": `{"hits":["auth.go:42","jwt.go:18"],"query":"` + q + `"}`},
 				},
 			},
 		}

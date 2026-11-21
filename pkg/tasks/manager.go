@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aliothmoon/mcplex/pkg/events"
 	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/policy"
 )
@@ -131,12 +132,21 @@ type Manager struct {
 	logDir        string
 	maxConcurrent int
 	maxRetained   int
+	events        atomic.Pointer[events.Hub]
 
 	mu     sync.Mutex
 	tasks  map[string]*managedTask
 	order  []string
 	seq    atomic.Int64
 	closed bool
+}
+
+// SetEventHub attaches an optional real-time event hub for streaming live task output.
+func (m *Manager) SetEventHub(hub *events.Hub) {
+	if m == nil {
+		return
+	}
+	m.events.Store(hub)
 }
 
 // NewManager creates a TaskManager storing per-task logs under <dataDir>/tasks when dataDir != "".
@@ -189,6 +199,7 @@ type managedTask struct {
 	fileCapped  bool
 	wakeCh      chan struct{}
 	lastReadErr string
+	live        *events.LiveStream
 }
 
 // Start validates policy, launches a shell command, waits up to waitMs, and hands off to background if still running.
@@ -311,6 +322,30 @@ func (m *Manager) Start(ctx context.Context, pol *policy.Engine, req StartReques
 		wakeCh:    make(chan struct{}),
 	}
 
+	var pidAtom atomic.Int64
+	if hub := m.events.Load(); hub != nil {
+		cleanCwd := filepath.ToSlash(filepath.Clean(cwd))
+		baseEv := events.Event{
+			Kind:       events.KindTask,
+			SessionID:  tk.sessionID,
+			RunID:      tk.id,
+			StreamID:   tk.id,
+			Tool:       "spawn",
+			Cwd:        cleanCwd,
+			Title:      cmdLine,
+			DetailKind: "shell",
+		}
+		taskID := tk.id
+		isDaemon := tk.daemon
+		tk.live = events.NewLiveStream(hub, baseEv, 80*time.Millisecond, 4096, func(totalBytes int64) string {
+			lbl := "running"
+			if isDaemon {
+				lbl = "daemon · running"
+			}
+			return fmt.Sprintf("%s · %s (pid %d) · %s", taskID, lbl, pidAtom.Load(), events.FormatBytes(totalBytes))
+		})
+	}
+
 	writer := &taskLogWriter{task: tk}
 	cmd.Stdout = writer
 	cmd.Stderr = writer
@@ -324,12 +359,34 @@ func (m *Manager) Start(ctx context.Context, pol *policy.Engine, req StartReques
 		return nil, fmt.Errorf("failed starting command: %w", err)
 	}
 	tk.pid = cmd.Process.Pid
+	pidAtom.Store(int64(tk.pid))
 	tk.proc = attachProcessHandle(cmd)
+	if tk.live != nil {
+		lbl := "running"
+		if tk.daemon {
+			lbl = "daemon · running"
+		}
+		tk.live.EmitStart(fmt.Sprintf("%s · %s (pid %d)", tk.id, lbl, tk.pid))
+	}
 
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		tk.kill()
+		if tk.live != nil {
+			tk.live.EmitEnd(events.Event{
+				Kind:       events.KindTask,
+				SessionID:  tk.sessionID,
+				RunID:      tk.id,
+				StreamID:   tk.id,
+				Tool:       "spawn",
+				Cwd:        filepath.ToSlash(filepath.Clean(tk.cwd)),
+				Title:      tk.command,
+				Status:     string(StatusKilled),
+				Summary:    fmt.Sprintf("%s · killed (manager closed)", tk.id),
+				DetailKind: "shell",
+			})
+		}
 		return nil, errors.New("task manager is closed")
 	}
 	m.tasks[id] = tk
@@ -422,6 +479,32 @@ func (m *Manager) reapTask(tk *managedTask) {
 	close(tk.wakeCh)
 	tk.wakeCh = make(chan struct{})
 	tk.mu.Unlock()
+
+	if tk.live != nil {
+		outText, _, _ := tk.readTail(200, events.DefaultShellPreview)
+		det, trunc := events.CapTailPreview(outText, events.DefaultShellPreview)
+		sum := tk.summary()
+		exitPart := string(sum.Status)
+		if sum.ExitCode != nil {
+			exitPart = fmt.Sprintf("%s (exit=%d)", sum.Status, *sum.ExitCode)
+		}
+		tk.live.EmitEnd(events.Event{
+			Kind:       events.KindTask,
+			SessionID:  tk.sessionID,
+			RunID:      tk.id,
+			StreamID:   tk.id,
+			Tool:       "spawn",
+			Cwd:        filepath.ToSlash(filepath.Clean(tk.cwd)),
+			Title:      tk.command,
+			Status:     string(sum.Status),
+			ExitCode:   sum.ExitCode,
+			DurationMs: sum.DurationMs,
+			Summary:    fmt.Sprintf("%s · %s · %dms", tk.id, exitPart, sum.DurationMs),
+			Detail:     det,
+			DetailKind: "shell",
+			Truncated:  trunc,
+		})
+	}
 
 	tk.cancel()
 	close(tk.doneCh)
@@ -974,7 +1057,6 @@ func (w *taskLogWriter) Write(p []byte) (int, error) {
 	}
 	tk := w.task
 	tk.mu.Lock()
-	defer tk.mu.Unlock()
 
 	tk.totalBytes += int64(len(p))
 
@@ -1010,6 +1092,12 @@ func (w *taskLogWriter) Write(p []byte) (int, error) {
 
 	close(tk.wakeCh)
 	tk.wakeCh = make(chan struct{})
+	live := tk.live
+	tk.mu.Unlock()
+
+	if live != nil {
+		_, _ = live.Write(p)
+	}
 	return len(p), nil
 }
 

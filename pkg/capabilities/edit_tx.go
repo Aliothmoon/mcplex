@@ -14,6 +14,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/aliothmoon/mcplex/pkg/events"
 	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/policy"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
@@ -85,6 +86,9 @@ type EditTxBinder struct {
 	Policy      *policy.Engine
 	ShellRunner *ShellGitBinder
 	Locks       *FileLockTable
+	Events      *events.Hub
+	SessionID   string
+	RunID       string
 }
 
 func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
@@ -110,6 +114,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			restored, failed := rollbackSnapshots(tx)
 			tx.releaseLocks()
+			emitTxStatus(b.Events, b.SessionID, b.RunID, id, "rolled_back", restored, "auto-rolled back (uncommitted)")
 			if len(restored) > 0 {
 				env.AddWarning(fmt.Sprintf("%s was never committed — auto-rolled back %d file(s): %s (call `await t.commit()` to keep tx edits)", id, len(restored), joinLimited(restored, 10)))
 			}
@@ -266,6 +271,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			tx.committed = true
 			tx.releaseLocks()
+			emitTxStatus(b.Events, b.SessionID, b.RunID, id, "committed", tx.touched, "")
 			return map[string]any{
 				"ok":           true,
 				"id":           id,
@@ -286,6 +292,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			restored, failed := rollbackSnapshots(tx)
 			tx.releaseLocks()
+			emitTxStatus(b.Events, b.SessionID, b.RunID, id, "rolled_back", restored, "")
 			res := map[string]any{
 				"ok":            len(failed) == 0,
 				"id":            id,
@@ -337,7 +344,11 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 				tx.snapshots[abs] = fileSnapshot{absPath: abs, relPath: rel, existed: true, mode: info.Mode().Perm(), origBytes: orig}
 				tx.touched = append(tx.touched, rel)
 			}
-			return nil, os.Remove(abs)
+			if rmErr := os.Remove(abs); rmErr != nil {
+				return nil, rmErr
+			}
+			emitFileDiff(b.Events, b.SessionID, b.RunID, tx.id, "open", "tx.rm", env.Cwd, rel, abs, orig, nil, true, false)
+			return nil, nil
 		},
 		// t.rename(from, to) / t.mv: moves a file inside the tx; rollback restores both paths.
 		"_rename": func(ctx context.Context, args []any) (any, error) {
@@ -399,7 +410,11 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err := os.MkdirAll(filepath.Dir(absTo), 0o755); err != nil {
 				return nil, err
 			}
-			return nil, os.Rename(absFrom, absTo)
+			if mvErr := os.Rename(absFrom, absTo); mvErr != nil {
+				return nil, mvErr
+			}
+			emitFileRename(b.Events, b.SessionID, b.RunID, tx.id, "open", "tx.rename", env.Cwd, relDisplayPath(env.Cwd, absFrom), absFrom, relDisplayPath(env.Cwd, absTo), absTo)
+			return nil, nil
 		},
 		// t.diff() -> unified diff of every file touched by the tx (current disk content vs. snapshot).
 		"_diff": func(_ context.Context, args []any) (any, error) {
@@ -681,6 +696,18 @@ func (b *EditTxBinder) applyFileSpecsWithOwner(ctx context.Context, cwd, execOwn
 				return nil, fmt.Errorf("failed writing '%s': %w", pw.relPath, err)
 			}
 			written = append(written, pw)
+		}
+		if b.Events.Active() {
+			toolName := "edit.apply"
+			txID, txPhase := "", ""
+			if tx != nil {
+				toolName = "tx.edit"
+				txID = tx.id
+				txPhase = "open"
+			}
+			for _, pw := range written {
+				emitFileDiff(b.Events, b.SessionID, b.RunID, txID, txPhase, toolName, cwd, pw.relPath, pw.absPath, pw.origBytes, pw.newBytes, pw.existed, true)
+			}
 		}
 	}
 

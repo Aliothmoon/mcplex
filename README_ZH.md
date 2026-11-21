@@ -56,6 +56,17 @@ mcplex serve \
 ```
 - MCP 端点：`POST http://127.0.0.1:8787/mcp`（请求头携带 `Authorization: Bearer your-secret-token`）
 - 健康检查：`GET http://127.0.0.1:8787/healthz`
+- 实时事件流：`GET http://127.0.0.1:8787/events`（SSE）与 `GET http://127.0.0.1:8787/api/events`
+
+### 3. 交互式实时 TUI（`--ui` / `mcplex ui`）
+开启 GrokNight 暗色交互终端，实时查看带颜色行内高亮的 CRUD Diff、`shell`/`task` 流式日志输出，并支持鼠标点击与 `less` 风格悬浮弹窗全文检索：
+```bash
+# 一键启动 HTTP 服务并进入交互式 TUI（默认监听 127.0.0.1:8787）
+mcplex serve --ui --cwd /path/to/workspace
+
+# 或远程挂载到正在运行的 mcplex HTTP 服务
+mcplex ui http://127.0.0.1:8787 --token "your-secret-token"
+```
 
 ---
 

@@ -4,14 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/aliothmoon/mcplex/pkg/events"
 	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/policy"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
@@ -32,9 +35,14 @@ var allowedGitReadSubcommands = map[string]bool{
 	"remote":    true,
 }
 
+var shellStreamSeq atomic.Int64
+
 // ShellGitBinder exposes `sh.*` (`exec`, `checks`) and `git.*` (`status`, `diff`, `log`, `show`, `branch`, `blame`, `query`).
 type ShellGitBinder struct {
-	Policy *policy.Engine
+	Policy    *policy.Engine
+	Events    *events.Hub
+	SessionID string
+	RunID     string
 }
 
 func (b *ShellGitBinder) Bind(env *sandbox.ExecutionEnv) error {
@@ -62,7 +70,7 @@ func (b *ShellGitBinder) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			compact := optBool(opts, "compact", false)
 			extraEnv, _ := opts["env"].(map[string]any)
-			res, err := b.runShell(ctx, workDir, cmdStr, cmdTimeout, settle, compact, firstString(opts, "shell"), extraEnv)
+			res, err := b.runShell(ctx, "sh.exec", workDir, cmdStr, cmdTimeout, settle, compact, firstString(opts, "shell"), extraEnv)
 			if err != nil {
 				return nil, err
 			}
@@ -90,6 +98,7 @@ func (b *ShellGitBinder) Bind(env *sandbox.ExecutionEnv) error {
 			res, err := b.RunChecksBatch(ctx, env.Cwd, args)
 			if err == nil {
 				warnTruncatedChecks(env, "sh.checks", res)
+				emitChecksResult(b.Events, b.SessionID, b.RunID, env.Cwd, res)
 			}
 			return res, err
 		},
@@ -251,11 +260,11 @@ func (b *ShellGitBinder) RunSingleCommand(parentCtx context.Context, cwd, cmdLin
 
 // RunSingleCommandDuration executes one shell command after validating policy rules, killing the entire child process tree on timeout.
 func (b *ShellGitBinder) RunSingleCommandDuration(parentCtx context.Context, cwd, cmdLine string, timeoutDur time.Duration, settle, compact bool) (map[string]any, error) {
-	return b.runShell(parentCtx, cwd, cmdLine, timeoutDur, settle, compact, "", nil)
+	return b.runShell(parentCtx, "sh.check", cwd, cmdLine, timeoutDur, settle, compact, "", nil)
 }
 
 // runShell runs cmdLine through `shell` ("" = platform default) with optional extra environment variables.
-func (b *ShellGitBinder) runShell(parentCtx context.Context, cwd, cmdLine string, timeoutDur time.Duration, settle, compact bool, shell string, extraEnv map[string]any) (map[string]any, error) {
+func (b *ShellGitBinder) runShell(parentCtx context.Context, toolName, cwd, cmdLine string, timeoutDur time.Duration, settle, compact bool, shell string, extraEnv map[string]any) (map[string]any, error) {
 	if err := b.Policy.CheckCommand(cmdLine); err != nil {
 		return nil, err
 	}
@@ -282,10 +291,32 @@ func (b *ShellGitBinder) runShell(parentCtx context.Context, cwd, cmdLine string
 
 	stdout := newLimitedSyncBuffer(512 * 1024)
 	stderr := newLimitedSyncBuffer(256 * 1024)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
+	var live *events.LiveStream
+	streamID := ""
+	if b.Events.Active() {
+		streamID = fmt.Sprintf("sh_%d", shellStreamSeq.Add(1))
+		baseEv := events.Event{
+			Kind:       events.KindShell,
+			SessionID:  b.SessionID,
+			RunID:      b.RunID,
+			StreamID:   streamID,
+			Tool:       toolName,
+			Cwd:        cleanSlash(cwd),
+			Title:      cmdLine,
+			DetailKind: "shell",
+		}
+		live = events.NewLiveStream(b.Events, baseEv, 80*time.Millisecond, 4096, func(totalBytes int64) string {
+			return fmt.Sprintf("running · %s", events.FormatBytes(totalBytes))
+		})
+		cmd.Stdout = io.MultiWriter(stdout, live)
+		cmd.Stderr = io.MultiWriter(stderr, live)
+		live.EmitStart("running…")
+	} else {
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+	}
 
-	runErr := cmd.Run()
+	runErr := runManagedCmd(cmd)
 	durMs := time.Since(start).Milliseconds()
 	parentErr := parentCtx.Err()
 	parentTimedOut := errors.Is(parentErr, context.DeadlineExceeded)
@@ -338,6 +369,42 @@ func (b *ShellGitBinder) runShell(parentCtx context.Context, cwd, cmdLine string
 		} else {
 			formatted = fmt.Sprintf("CANCELED after %dms (outer execution already ended)\n%s", durMs, msg)
 		}
+	}
+
+	if live != nil {
+		finalStatus := "ok"
+		switch {
+		case timedOut:
+			finalStatus = "timeout"
+		case parentAborted:
+			finalStatus = "canceled"
+		case exitCode != 0 || spawnErr != "":
+			finalStatus = "error"
+		}
+		ec := exitCode
+		preview, trunc := events.CapTailPreview(formatted, events.DefaultShellPreview)
+		summary := fmt.Sprintf("exit=%d · %dms", exitCode, durMs)
+		if timedOut {
+			summary = fmt.Sprintf("timeout · %dms", durMs)
+		} else if parentAborted {
+			summary = fmt.Sprintf("canceled · %dms", durMs)
+		}
+		live.EmitEnd(events.Event{
+			Kind:       events.KindShell,
+			SessionID:  b.SessionID,
+			RunID:      b.RunID,
+			StreamID:   streamID,
+			Tool:       toolName,
+			Cwd:        cleanSlash(cwd),
+			Title:      cmdLine,
+			Status:     finalStatus,
+			ExitCode:   &ec,
+			DurationMs: durMs,
+			Summary:    summary,
+			Detail:     preview,
+			DetailKind: "shell",
+			Truncated:  trunc,
+		})
 	}
 
 	// If the outer vm_exec deadline or cancellation fired, return an error so the sandbox trace captures the partial stdout/stderr!

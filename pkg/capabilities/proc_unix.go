@@ -33,3 +33,7 @@ func killCmdProcessTree(cmd *exec.Cmd) {
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	_ = cmd.Process.Kill()
 }
+
+func runManagedCmd(cmd *exec.Cmd) error {
+	return cmd.Run()
+}

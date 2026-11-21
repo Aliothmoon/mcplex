@@ -12,10 +12,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -23,6 +25,7 @@ import (
 	"github.com/aliothmoon/mcplex/pkg/mcpserver"
 	ptcruntime "github.com/aliothmoon/mcplex/pkg/runtime"
 	"github.com/aliothmoon/mcplex/pkg/skill"
+	"github.com/aliothmoon/mcplex/pkg/tui"
 	"github.com/aliothmoon/mcplex/pkg/version"
 )
 
@@ -52,6 +55,8 @@ func main() {
 	switch sub {
 	case "serve", "mcp":
 		runServe(args)
+	case "ui":
+		runUI(args)
 	case "run":
 		runStandalone(args)
 	case "skill":
@@ -74,36 +79,32 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println(`mcplex — Universal Code Mode MCP Tool Proxy (Single-Core Local Tools + Downstream MCP Aggregator)
+	fmt.Println(`mcplex — Universal Code Mode MCP Tool Proxy (Local Tools + Downstream MCP Aggregator)
 
 Usage:
   mcplex <command> [flags]
 
 Commands:
-  serve [flags]                          Start the MCP proxy server (stdio default, or --http addr)
-  mcp [flags]                            Alias for 'serve'
-  run [--cwd <dir>] [--code <ts> | file] Execute a TypeScript Code Mode script directly from CLI
-  skill [--tools all|exec]               Print the embedded Code Mode Skill guide (Markdown)
-  logs [-e] [--tail N] [--full]          Inspect recorded execution/error JSONL logs
-  errors [--tail N]                      Shortcut for 'logs --errors'
-  stats                                  Summarize execution success rates and error hotspots
-  version                                Print version
+  serve [flags]              Start MCP proxy (stdio default; --http or --ui for HTTP)
+  mcp [flags]                Alias for 'serve'
+  ui [url]                   Attach interactive TUI to a running HTTP server
+  run [--code <ts> | file]   Run a TypeScript Code Mode script directly
+  skill [--tools all|exec]   Print the Code Mode Skill guide (Markdown)
+  logs / errors / stats      Inspect audit logs and execution metrics
+  version                    Print version
 
-Common serve flags:
-  --tools <spec>           Exposed MCP tools: all (default: exec,read,spawn,task), exec, or comma list
-  --cwd <dir>              Default workspace root directory (defaults to current working dir)
-  --strict-root            Confine all file and shell access strictly to --cwd (+ --allow-root)
-  --allow-root <dir>       Additional allowed root directory (repeatable)
-  --mcp-config <file>      Downstream mcpServers JSON config file to proxy/aggregate (repeatable)
-  --policy-file <file>     Custom JSON policy rules file (repeatable)
-  --trust-workspace-mcp    Opt in to loading <workspace>/.agents/mcp_config.json
-  --data-dir <dir>         Persistent state/logs directory (default: ~/.config/mcplex)
-  --max-output <bytes>     Default inline response cap (default: 24576)
-  --compact-schema         Use brief exec tool description (rely on initialize.instructions / mcplex://skill)
-  --http <addr>            Serve MCP Streamable HTTP instead of stdio (e.g. 127.0.0.1:8787)
-  --http-path <path>       HTTP endpoint path (default: /mcp)
-  --token <secret>         Require Authorization: Bearer <secret> on HTTP requests (or MCPLEX_TOKEN env)
-  --cors-origin <origin>   Optional Access-Control-Allow-Origin header for HTTP mode`)
+Core serve flags:
+  --cwd <dir>                Workspace root directory (default: current dir)
+  --http <addr[/path]>       Serve Streamable HTTP (e.g. 127.0.0.1:8787 or :8787/mcp)
+  --ui                       Start HTTP (default 127.0.0.1:8787) with interactive TUI
+  --token <secret>           Bearer token for HTTP mode (or MCPLEX_TOKEN env)
+  --tools <spec>             Exposed MCP tools: all (default) | exec | read,tasks
+  --strict-root              Confine access strictly to --cwd (+ --allow-root)
+  --mcp-config <file>        Downstream mcpServers JSON config (repeatable)
+  --policy-file <file>       Custom JSON policy rules file (repeatable)
+
+Advanced flags (run 'mcplex serve -h' for full list):
+  --allow-root, --data-dir, --max-output, --cors-origin, --compact-schema, --trust-workspace-mcp`)
 }
 
 func parseToolSet(spec string) (mcpserver.ToolSet, error) {
@@ -172,6 +173,7 @@ func runServe(args []string) {
 	httpPath := fs.String("http-path", "/mcp", "HTTP endpoint path for Streamable HTTP mode")
 	token := fs.String("token", os.Getenv("MCPLEX_TOKEN"), "Bearer token required in HTTP mode")
 	corsOrigin := fs.String("cors-origin", "", "Optional Access-Control-Allow-Origin header in HTTP mode")
+	uiMode := fs.Bool("ui", false, "Launch interactive TUI console (defaults --http to 127.0.0.1:8787)")
 
 	var extraRoots, mcpConfigs, policyFiles stringListFlag
 	fs.Var(&extraRoots, "allow-root", "Additional allowed workspace root (repeatable)")
@@ -182,10 +184,38 @@ func runServe(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Allow `mcplex serve --ui` without repeating `--http` (defaults to 127.0.0.1:8787).
+	if *uiMode && strings.TrimSpace(*httpAddr) == "" {
+		*httpAddr = "127.0.0.1:8787"
+	}
+	// Support optional path embedded in --http (e.g. `127.0.0.1:8787/mcp` or `http://127.0.0.1:8787/custom`).
+	if rawHTTP := strings.TrimSpace(*httpAddr); rawHTTP != "" {
+		if strings.HasPrefix(rawHTTP, "http://") || strings.HasPrefix(rawHTTP, "https://") {
+			if parsed, pErr := url.Parse(rawHTTP); pErr == nil && parsed.Host != "" {
+				*httpAddr = parsed.Host
+				if parsed.Path != "" && parsed.Path != "/" && *httpPath == "/mcp" {
+					*httpPath = parsed.Path
+				}
+			}
+		} else if slash := strings.IndexByte(rawHTTP, '/'); slash > 0 {
+			if *httpPath == "/mcp" {
+				*httpPath = rawHTTP[slash:]
+			}
+			*httpAddr = rawHTTP[:slash]
+		}
+	}
+
 	toolSet, err := parseToolSet(*toolsFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid --tools value: %v\n", err)
 		os.Exit(1)
+	}
+
+	uiHistory := 500
+	if rawHist := strings.TrimSpace(os.Getenv("MCPLEX_UI_HISTORY")); rawHist != "" {
+		if n, convErr := strconv.Atoi(rawHist); convErr == nil && n > 0 {
+			uiHistory = n
+		}
 	}
 
 	eng := ptcruntime.NewEngineWithOptions(ptcruntime.EngineOptions{
@@ -199,6 +229,8 @@ func runServe(args []string) {
 		TrustWorkspaceMCP:     *trustWsMCP,
 		AntigravityMode:       false,
 		EnableTasks:           toolSet.Tasks,
+		EnableEvents:          strings.TrimSpace(*httpAddr) != "",
+		EventHistory:          uiHistory,
 	})
 	defer eng.Close()
 
@@ -219,6 +251,53 @@ func runServe(args []string) {
 	})
 
 	if strings.TrimSpace(*httpAddr) != "" {
+		httpOpts := mcpserver.HTTPOptions{
+			Addr:        *httpAddr,
+			Path:        *httpPath,
+			Token:       *token,
+			AllowOrigin: *corsOrigin,
+		}
+		if *uiMode {
+			srvCtx, srvCancel := context.WithCancel(ctx)
+			defer srvCancel()
+
+			boundCh := make(chan string, 1)
+			srvErrCh := make(chan error, 1)
+			go func() {
+				srvErrCh <- srv.ListenAndServeHTTP(srvCtx, httpOpts, func(addr string) {
+					boundCh <- addr
+				})
+			}()
+
+			var boundAddr string
+			select {
+			case boundAddr = <-boundCh:
+			case err := <-srvErrCh:
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "mcplex http error: %v\n", err)
+					os.Exit(1)
+				}
+				return
+			}
+
+			endpoint := fmt.Sprintf("http://%s%s", boundAddr, *httpPath)
+			src := tui.NewLocalHubSource(eng.EventHub(), "")
+			err := tui.Run(ctx, tui.Config{
+				Endpoint:    endpoint,
+				Version:     version.Version,
+				ModeLabel:   "local",
+				AuthEnabled: *token != "",
+				StrictRoot:  *strictRoot,
+			}, src)
+			srvCancel()
+			<-srvErrCh
+			if err != nil && !errors.Is(err, context.Canceled) {
+				fmt.Fprintf(os.Stderr, "mcplex ui error: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
+
 		if *token == "" {
 			host, _, splitErr := net.SplitHostPort(*httpAddr)
 			if splitErr != nil {
@@ -232,12 +311,7 @@ func runServe(args []string) {
 		}
 		fmt.Fprintf(os.Stderr, "mcplex v%s listening on http://%s%s (auth=%v, strict-root=%v)\n",
 			version.Version, *httpAddr, *httpPath, *token != "", *strictRoot)
-		err := srv.ServeHTTP(ctx, mcpserver.HTTPOptions{
-			Addr:        *httpAddr,
-			Path:        *httpPath,
-			Token:       *token,
-			AllowOrigin: *corsOrigin,
-		})
+		err := srv.ServeHTTP(ctx, httpOpts)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			fmt.Fprintf(os.Stderr, "mcplex http error: %v\n", err)
 			os.Exit(1)
@@ -247,6 +321,32 @@ func runServe(args []string) {
 
 	if err := srv.Serve(ctx, os.Stdin, os.Stdout); err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintf(os.Stderr, "mcplex stdio error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runUI(args []string) {
+	fs := flag.NewFlagSet("ui", flag.ExitOnError)
+	targetURL := fs.String("url", "http://127.0.0.1:8787", "Base URL of running 'mcplex serve --http' instance")
+	token := fs.String("token", os.Getenv("MCPLEX_TOKEN"), "Optional Bearer token if HTTP server requires auth")
+	session := fs.String("session", "", "Optional Mcp-Session-Id filter")
+	_ = fs.Parse(args)
+	if fs.NArg() > 0 && strings.TrimSpace(fs.Arg(0)) != "" {
+		*targetURL = strings.TrimSpace(fs.Arg(0))
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	src := tui.NewSSESource(ctx, *targetURL, *token, *session)
+	cfg := tui.Config{
+		Endpoint:    strings.TrimRight(*targetURL, "/"),
+		Version:     version.Version,
+		ModeLabel:   "remote",
+		AuthEnabled: *token != "",
+	}
+	if err := tui.Run(ctx, cfg, src); err != nil && !errors.Is(err, context.Canceled) {
+		fmt.Fprintf(os.Stderr, "mcplex ui error: %v\n", err)
 		os.Exit(1)
 	}
 }

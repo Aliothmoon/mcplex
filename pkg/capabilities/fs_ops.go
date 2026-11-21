@@ -66,7 +66,11 @@ func (b *FSSearchBinder) fileOps(env *sandbox.ExecutionEnv) map[string]sandbox.A
 			if err != nil {
 				return nil, err
 			}
-			return nil, os.MkdirAll(abs, 0o755)
+			if mkErr := os.MkdirAll(abs, 0o755); mkErr != nil {
+				return nil, mkErr
+			}
+			emitDirCreate(b.Events, b.SessionID, b.RunID, "fs.mkdir", env.Cwd, relDisplayPath(env.Cwd, abs), abs)
+			return nil, nil
 		},
 		// fs.rm(path, { force? }): removes a file, symlink or empty dir. Non-empty dirs need approval (recursive delete).
 		"rm": func(ctx context.Context, args []any) (any, error) {
@@ -101,7 +105,18 @@ func (b *FSSearchBinder) fileOps(env *sandbox.ExecutionEnv) map[string]sandbox.A
 					return nil, sandbox.NewHostError(sandbox.KindNeedsApproval, nil, "%s is a non-empty dir — recursive delete; run it via native run_command", p)
 				}
 			}
-			return nil, os.Remove(abs)
+			var preBytes []byte
+			captureDel := b.Events.Active() && !info.IsDir() && info.Size() <= 256*1024
+			if captureDel {
+				preBytes, _ = os.ReadFile(abs)
+			}
+			if rmErr := os.Remove(abs); rmErr != nil {
+				return nil, rmErr
+			}
+			if b.Events.Active() {
+				emitFileDiff(b.Events, b.SessionID, b.RunID, "", "", "fs.rm", env.Cwd, relDisplayPath(env.Cwd, abs), abs, preBytes, nil, true, false)
+			}
+			return nil, nil
 		},
 		// fs.rename(from, to): moves/renames a file or dir, creating the target's parent; overwrites files like Node.
 		"rename": func(ctx context.Context, args []any) (any, error) {
@@ -134,7 +149,11 @@ func (b *FSSearchBinder) fileOps(env *sandbox.ExecutionEnv) map[string]sandbox.A
 			if err := os.MkdirAll(filepath.Dir(absTo), 0o755); err != nil {
 				return nil, err
 			}
-			return nil, os.Rename(absFrom, absTo)
+			if mvErr := os.Rename(absFrom, absTo); mvErr != nil {
+				return nil, mvErr
+			}
+			emitFileRename(b.Events, b.SessionID, b.RunID, "", "", "fs.rename", env.Cwd, relDisplayPath(env.Cwd, absFrom), absFrom, relDisplayPath(env.Cwd, absTo), absTo)
+			return nil, nil
 		},
 		// fs.cp(from, to, { recursive? }): copies a file, or a directory tree with { recursive: true } (like Node fs.cp).
 		"cp": func(ctx context.Context, args []any) (any, error) {
@@ -167,7 +186,25 @@ func (b *FSSearchBinder) fileOps(env *sandbox.ExecutionEnv) map[string]sandbox.A
 					}
 					defer relLock()
 				}
-				return nil, copyFile(absFrom, absTo)
+				var beforeDst []byte
+				var dstExisted bool
+				if b.Events.Active() {
+					if st, stErr := os.Stat(absTo); stErr == nil && !st.IsDir() && st.Size() <= 256*1024 {
+						dstExisted = true
+						beforeDst, _ = os.ReadFile(absTo)
+					}
+				}
+				if cpErr := copyFile(absFrom, absTo); cpErr != nil {
+					return nil, cpErr
+				}
+				if b.Events.Active() {
+					var afterDst []byte
+					if info.Size() <= 256*1024 {
+						afterDst, _ = os.ReadFile(absTo)
+					}
+					emitFileDiff(b.Events, b.SessionID, b.RunID, "", "", "fs.cp", env.Cwd, relDisplayPath(env.Cwd, absTo), absTo, beforeDst, afterDst, dstExisted, true)
+				}
+				return nil, nil
 			}
 			if !optBool(opts, "recursive", false) {
 				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is a directory; pass { recursive: true }", from)

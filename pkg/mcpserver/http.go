@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,6 +50,132 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 			"server":  s.serverName(),
 			"version": s.serverVersion(),
 		})
+	})
+
+	checkAuthAndOrigin := func(w http.ResponseWriter, r *http.Request) bool {
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin != "" && !isAllowedOrigin(origin, r.Host, opts.AllowOrigin) {
+			w.Header().Set("Content-Type", "application/json")
+			http.Error(w, `{"error":"forbidden origin"}`, http.StatusForbidden)
+			return false
+		}
+		if opts.AllowOrigin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", opts.AllowOrigin)
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Last-Event-ID")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return false
+		}
+		if opts.Token != "" && !validBearerToken(r.Header.Get("Authorization"), opts.Token) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="mcplex"`)
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return false
+		}
+		return true
+	}
+
+	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAuthAndOrigin(w, r) {
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET, OPTIONS")
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if s.Engine == nil || s.Engine.EventHub() == nil {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"events":[]}`))
+			return
+		}
+		sessionFilter := strings.TrimSpace(r.URL.Query().Get("session"))
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		afterSeq, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+		list := s.Engine.EventHub().Recent(sessionFilter, limit, afterSeq)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"events": list})
+	})
+
+	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAuthAndOrigin(w, r) {
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET, OPTIONS")
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok || s.Engine == nil || s.Engine.EventHub() == nil {
+			http.Error(w, `{"error":"streaming unsupported"}`, http.StatusInternalServerError)
+			return
+		}
+
+		sessionFilter := strings.TrimSpace(r.URL.Query().Get("session"))
+		replay := 200
+		if raw := strings.TrimSpace(r.URL.Query().Get("replay")); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+				replay = n
+			}
+		}
+		var afterSeq int64
+		if raw := strings.TrimSpace(r.Header.Get("Last-Event-ID")); raw != "" {
+			afterSeq, _ = strconv.ParseInt(raw, 10, 64)
+		} else if raw := strings.TrimSpace(r.URL.Query().Get("after")); raw != "" {
+			afterSeq, _ = strconv.ParseInt(raw, 10, 64)
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+
+		ch, history, cancel := s.Engine.EventHub().Subscribe(sessionFilter, replay, afterSeq)
+		defer cancel()
+
+		writeEvent := func(ev any, seq int64) bool {
+			raw, err := json.Marshal(ev)
+			if err != nil {
+				return true
+			}
+			if _, err := fmt.Fprintf(w, "id: %d\nevent: mcplex\ndata: %s\n\n", seq, raw); err != nil {
+				return false
+			}
+			flusher.Flush()
+			return true
+		}
+
+		for _, ev := range history {
+			if !writeEvent(ev, ev.Seq) {
+				return
+			}
+		}
+		// Flush headers immediately even when history is empty so remote clients mark connected.
+		_, _ = fmt.Fprint(w, ": connected\n\n")
+		flusher.Flush()
+
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case ev, open := <-ch:
+				if !open {
+					return
+				}
+				if !writeEvent(ev, ev.Seq) {
+					return
+				}
+			case <-ticker.C:
+				if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+			}
+		}
 	})
 
 	mux.HandleFunc(mcpPath, func(w http.ResponseWriter, r *http.Request) {
@@ -176,18 +303,31 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 
 // ServeHTTP runs the MCP Streamable HTTP server until ctx is canceled.
 func (s *Server) ServeHTTP(ctx context.Context, opts HTTPOptions) error {
+	return s.ListenAndServeHTTP(ctx, opts, nil)
+}
+
+// ListenAndServeHTTP binds the TCP listener first (failing fast on port conflicts), invokes onBound
+// with the actual listening address, and serves HTTP until ctx is canceled.
+func (s *Server) ListenAndServeHTTP(ctx context.Context, opts HTTPOptions, onBound func(addr string)) error {
 	addr := strings.TrimSpace(opts.Addr)
 	if addr == "" {
 		addr = "127.0.0.1:8787"
 	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	if onBound != nil {
+		onBound(ln.Addr().String())
+	}
 	srv := &http.Server{
-		Addr:              addr,
+		Addr:              ln.Addr().String(),
 		Handler:           s.HTTPHandler(opts),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	errCh := make(chan error, 1)
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 		close(errCh)
