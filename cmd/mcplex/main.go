@@ -605,8 +605,9 @@ func runOAuth(args []string) int {
 	fs := flag.NewFlagSet("oauth "+action, flag.ContinueOnError)
 	dataDir := fs.String("data-dir", defaultDataDir(), "Data directory used by `mcplex serve`")
 	asJSON := fs.Bool("json", false, "Output JSON")
-	if err := fs.Parse(args[1:]); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
+	positional, perr := parseInterspersed(fs, args[1:])
+	if perr != nil {
+		if errors.Is(perr, flag.ErrHelp) {
 			return 0
 		}
 		return 1
@@ -637,7 +638,7 @@ func runOAuth(args []string) int {
 		}
 		return 0
 	default: // revoke
-		ids := fs.Args()
+		ids := positional
 		if len(ids) == 0 {
 			fmt.Fprintln(os.Stderr, "mcplex oauth revoke: pass client IDs (see `mcplex oauth clients`) or `all`")
 			return 1
@@ -649,5 +650,26 @@ func runOAuth(args []string) int {
 		}
 		fmt.Printf("Revoked %d client(s); their access and refresh tokens no longer work.\n", n)
 		return 0
+	}
+}
+
+// parseInterspersed parses flags that may appear before or after positional arguments
+// (`mcplex oauth revoke all --data-dir X`); the standard flag package stops at the first positional.
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positional []string
+	rest := args
+	for {
+		if err := fs.Parse(rest); err != nil {
+			return nil, err
+		}
+		rest = fs.Args()
+		if len(rest) == 0 {
+			return positional, nil
+		}
+		if rest[0] == "--" {
+			return append(positional, rest[1:]...), nil
+		}
+		positional = append(positional, rest[0])
+		rest = rest[1:]
 	}
 }

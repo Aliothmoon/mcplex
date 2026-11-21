@@ -69,6 +69,25 @@ mcplex serve --ui --cwd /path/to/workspace
 mcplex ui http://127.0.0.1:8787 --token "your-secret-token"
 ```
 
+### 4. 通过 Cloudflare 隧道接入只支持 OAuth 的客户端（Gemini 自定义应用）
+Gemini 网页版这类客户端只能通过 HTTPS + **OAuth**（动态客户端注册，无法配置自定义请求头）连接远程 MCP 服务器。开启 `--oauth` 后，MCPlex 会按 [MCP 授权规范](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization) 充当标准的 OAuth 2.1 授权服务器（RFC 9728 / 8414 / 7591 / 8707 / 7009，PKCE S256）：
+```bash
+# 1. 用具名隧道把 127.0.0.1:8787 暴露到固定域名（需要你在 Cloudflare 上的域名）
+cloudflared tunnel login   # 仅首次：授权拥有 example.com 的 Cloudflare 站点
+cloudflared tunnel --name mcplex --hostname mcp.example.com --url http://127.0.0.1:8787
+
+# 2. 以 OAuth 保护模式启动 MCPlex
+mcplex serve --http 127.0.0.1:8787 --oauth --public-url https://mcp.example.com \
+  --token "$(openssl rand -hex 24)" --strict-root --cwd /path/to/workspace
+```
+3. 在 Gemini 中打开 **设置 → Connected Apps → 添加自定义应用**，填入 `https://mcp.example.com/mcp`。浏览器会跳到 MCPlex 的授权页，输入 `--token` 的值（主人口令）后点 **Approve**。
+
+- `--token` 既是授权页的主人口令，也仍可作为普通 `Authorization: Bearer` 令牌，供 Claude Code、Cursor、`mcplex ui` 等支持请求头的客户端使用。
+- 默认只接受 Google 账号关联使用的回调地址；可用 `--oauth-redirect-allow <pattern>` 追加（`loopback` 表示允许本机原生客户端）。
+- 机密客户端（Gemini）的 refresh token 长期有效（持久关联），公共客户端的 refresh token 每次刷新都会轮换。客户端与授权记录以哈希形式保存在 `<data-dir>/oauth-server/`，沙箱无法读写；用 `mcplex oauth clients` / `mcplex oauth revoke <client-id|all>` 查看或撤销，撤销对运行中的服务立即生效。
+- OAuth issuer 绑定 `--public-url`：域名变化（如随机的 `*.trycloudflare.com` 临时隧道）会让已有关联失效，建议使用具名隧道。只用请求头令牌的客户端，可以单独加 `--public-url`（不开 `--oauth`），仅用于放行隧道域名。
+- 所有工具都声明了 MCP annotations（`read`/`docs` 只读；`exec`/`spawn`/`task` 有破坏性），客户端执行命令前会先请求确认。任何完成授权的人都能在本机执行代码：请保留 `--strict-root`、使用足够长的随机口令，并按需用 `--tools` 收窄工具。
+
 ---
 
 ## 对外暴露的 MCP 工具集（`--tools`）

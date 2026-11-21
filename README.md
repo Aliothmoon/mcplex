@@ -69,6 +69,25 @@ mcplex serve --ui --cwd /path/to/workspace
 mcplex ui http://127.0.0.1:8787 --token "your-secret-token"
 ```
 
+### 4. Expose to OAuth-only MCP clients (Gemini custom apps) via Cloudflare Tunnel
+Clients such as the Gemini web app only connect to remote MCP servers over HTTPS with **OAuth** (dynamic client registration, no custom headers). `--oauth` turns MCPlex into a standards-based OAuth 2.1 authorization server ([MCP Authorization spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization): RFC 9728 / 8414 / 7591 / 8707 / 7009, PKCE S256):
+```bash
+# 1. Expose 127.0.0.1:8787 at a stable hostname (named tunnel on your own Cloudflare domain)
+cloudflared tunnel login   # once: authorize the Cloudflare zone that owns example.com
+cloudflared tunnel --name mcplex --hostname mcp.example.com --url http://127.0.0.1:8787
+
+# 2. Serve MCPlex as an OAuth-protected MCP server for that hostname
+mcplex serve --http 127.0.0.1:8787 --oauth --public-url https://mcp.example.com \
+  --token "$(openssl rand -hex 24)" --strict-root --cwd /path/to/workspace
+```
+3. In Gemini: **Settings → Connected Apps → Add a custom app**, enter `https://mcp.example.com/mcp`. Your browser opens the MCPlex consent page; enter the `--token` value (the *owner secret*) and click **Approve**.
+
+- The token is the owner secret for the consent page and still works as a plain `Authorization: Bearer` token for header-capable clients (Claude Code, Cursor, `mcplex ui`).
+- Only Google's account-linking redirect URIs are accepted by default; add more with `--oauth-redirect-allow <pattern>` (`loopback` allows local native clients).
+- Refresh tokens are long-lived for confidential clients (Gemini "persistent linking") and rotate for public clients. Clients/grants persist in `<data-dir>/oauth-server/` (hashed, unreadable from the sandbox). List or revoke them with `mcplex oauth clients` / `mcplex oauth revoke <client-id|all>` — revocation applies to a running server.
+- The OAuth issuer is bound to `--public-url`: a changing hostname (e.g. a random `*.trycloudflare.com` quick tunnel) breaks existing links, so prefer a named tunnel. For header-token clients only, `--public-url` without `--oauth` just allows the tunnel hostname.
+- Every tool declares MCP annotations (`read`/`docs` read-only; `exec`/`spawn`/`task` destructive) so clients ask for confirmation before running commands. Anyone who completes the consent step can run code on this machine: keep `--strict-root`, a long random token, and consider `--tools`.
+
 ---
 
 ## Exposed MCP Tools (`--tools`)

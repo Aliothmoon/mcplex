@@ -52,7 +52,7 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	st, err := openStore(cfg.DataDir)
+	st, err := openStore(cfg.DataDir, true)
 	if err != nil {
 		return nil, err
 	}

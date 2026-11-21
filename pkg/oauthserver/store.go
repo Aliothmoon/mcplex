@@ -71,13 +71,17 @@ type store struct {
 	size    int64
 }
 
-func openStore(dataDir string) (*store, error) {
+// openStore opens the persisted state. create=false (CLI listing/revocation) never creates directories, so
+// inspecting a data dir that never ran `serve --oauth` leaves no trace.
+func openStore(dataDir string, create bool) (*store, error) {
 	if dataDir == "" {
 		return nil, errors.New("oauth server needs a data dir to persist clients and grants")
 	}
 	dir := StateDir(dataDir)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
+	if create {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, err
+		}
 	}
 	s := &store{path: filepath.Join(dir, "state.json"), st: newPersistedState()}
 	s.mu.Lock()
@@ -263,7 +267,7 @@ type ClientInfo struct {
 
 // ListClients returns registered clients persisted under dataDir.
 func ListClients(dataDir string) ([]ClientInfo, error) {
-	s, err := openStore(dataDir)
+	s, err := openStore(dataDir, false)
 	if err != nil {
 		return nil, err
 	}
@@ -287,7 +291,7 @@ func ListClients(dataDir string) ([]ClientInfo, error) {
 // RevokeClients deletes the given client IDs (or all clients when ids contains "all") together with their grants
 // and tokens. A running server picks the change up on its next request. Returns the number of clients removed.
 func RevokeClients(dataDir string, ids []string) (int, error) {
-	s, err := openStore(dataDir)
+	s, err := openStore(dataDir, false)
 	if err != nil {
 		return 0, err
 	}

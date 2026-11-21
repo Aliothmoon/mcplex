@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -541,5 +542,18 @@ func TestNewValidatesConfig(t *testing.T) {
 	}
 	if s, err := New(Config{PublicURL: "http://127.0.0.1:8787/", OwnerSecret: "x", DataDir: data}); err != nil || s.Resource() != "http://127.0.0.1:8787/mcp" {
 		t.Fatalf("localhost http public URL: %v", err)
+	}
+}
+
+func TestCLIStoreAccessDoesNotCreateDirectories(t *testing.T) {
+	data := t.TempDir()
+	if list, err := ListClients(data); err != nil || len(list) != 0 {
+		t.Fatalf("ListClients on empty dir: %v %v", list, err)
+	}
+	if n, err := RevokeClients(data, []string{"all"}); err != nil || n != 0 {
+		t.Fatalf("RevokeClients on empty dir: %d %v", n, err)
+	}
+	if _, err := os.Stat(StateDir(data)); !os.IsNotExist(err) {
+		t.Fatalf("CLI access created %s (err=%v)", StateDir(data), err)
 	}
 }

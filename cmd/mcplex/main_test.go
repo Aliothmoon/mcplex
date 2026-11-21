@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"testing"
 )
 
@@ -50,5 +51,15 @@ func TestBuildPublicExposureValidation(t *testing.T) {
 	hosts, srv, err := buildPublicExposure("127.0.0.1:8787", "/mcp", "https://mcp.example.com", true, "secret-secret-secret", data, []string{"loopback"})
 	if err != nil || srv == nil || srv.Resource() != "https://mcp.example.com/mcp" || len(hosts) != 1 || hosts[0] != "mcp.example.com" {
 		t.Fatalf("valid oauth exposure: %v %v %v", hosts, srv, err)
+	}
+}
+
+func TestParseInterspersedFlags(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	dir := fs.String("data-dir", "default", "")
+	js := fs.Bool("json", false, "")
+	pos, err := parseInterspersed(fs, []string{"all", "--data-dir", "X", "id2", "--json", "--", "--literal"})
+	if err != nil || *dir != "X" || !*js || len(pos) != 3 || pos[0] != "all" || pos[1] != "id2" || pos[2] != "--literal" {
+		t.Fatalf("got pos=%v dir=%q json=%v err=%v", pos, *dir, *js, err)
 	}
 }
