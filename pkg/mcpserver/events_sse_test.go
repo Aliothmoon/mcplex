@@ -69,7 +69,30 @@ func TestHTTPEventsSSEAuthAndLiveCRUDDiffs(t *testing.T) {
 		}
 	}()
 
-	// 3. Execute a real exec call performing Create + Update + Read
+	// 3. Initialize a named MCP session so events carry SessionID + readable SessionLabel
+	initBody, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      0,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2025-03-26",
+			"clientInfo":      map[string]any{"name": "claude-code", "version": "2.1.0"},
+		},
+	})
+	initReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp", strings.NewReader(string(initBody)))
+	initReq.Header.Set("Content-Type", "application/json")
+	initReq.Header.Set("Authorization", "Bearer secret-tok")
+	initResp, err := http.DefaultClient.Do(initReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := initResp.Header.Get("Mcp-Session-Id")
+	initResp.Body.Close()
+	if sessionID == "" {
+		t.Fatal("expected Mcp-Session-Id on initialize")
+	}
+
+	// 4. Execute a real exec call under that session performing Create + Update + Read
 	callBody, _ := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      1,
@@ -90,6 +113,7 @@ func TestHTTPEventsSSEAuthAndLiveCRUDDiffs(t *testing.T) {
 	postReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp", strings.NewReader(string(callBody)))
 	postReq.Header.Set("Content-Type", "application/json")
 	postReq.Header.Set("Authorization", "Bearer secret-tok")
+	postReq.Header.Set("Mcp-Session-Id", sessionID)
 	postResp, err := http.DefaultClient.Do(postReq)
 	if err != nil {
 		t.Fatal(err)
@@ -106,7 +130,7 @@ func TestHTTPEventsSSEAuthAndLiveCRUDDiffs(t *testing.T) {
 		case ev := <-evCh:
 			switch ev.Kind {
 			case events.KindFileCreate:
-				if ev.Path == "demo.txt" && ev.Diff != nil && ev.Diff.Added == 2 {
+				if ev.Path == "demo.txt" && ev.Diff != nil && ev.Diff.Added == 2 && ev.SessionLabel == "claude-code" {
 					gotCreate = true
 				}
 			case events.KindFileUpdate:
@@ -118,7 +142,9 @@ func TestHTTPEventsSSEAuthAndLiveCRUDDiffs(t *testing.T) {
 					gotRead = true
 				}
 			case events.KindExecEnd:
-				gotExecEnd = true
+				if len(ev.Ops) >= 3 && ev.SessionLabel == "claude-code" {
+					gotExecEnd = true
+				}
 			}
 		case <-deadline:
 			t.Fatalf("timed out waiting for SSE CRUD events: create=%v updateDiff=%v read=%v execEnd=%v",

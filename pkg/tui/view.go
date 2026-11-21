@@ -16,6 +16,9 @@ const maxInlinePreviewLines = 24
 func (m *Model) View() string {
 	m.recomputeLayoutMetrics()
 	base := m.renderMainView()
+	if m.sessPicker.open {
+		return m.compositeSessionPickerModal(base)
+	}
 	if !m.detail.open {
 		return base
 	}
@@ -61,6 +64,9 @@ func (m *Model) renderMainView() string {
 			var line string
 			if idx < len(rows) {
 				line = rows[idx]
+				if m.sel.active && m.sel.scope == selScopeFeed {
+					line = m.highlightFeedRowSelection(line, idx, feedW)
+				}
 			} else {
 				line = paintLineBg("", colorCanvas, feedW)
 			}
@@ -203,8 +209,8 @@ func (m *Model) renderTabBar() string {
 
 	var leftCtrls, rightCtrls []renderedCtrl
 	for i, c := range ctrls {
-		focused := m.focus == focusToolbar && !m.detail.open && i == m.toolbarIdx
-		hovered := !m.detail.open && i == m.hoverToolbar
+		focused := m.focus == focusToolbar && !m.detail.open && !m.sessPicker.open && i == m.toolbarIdx
+		hovered := !m.detail.open && !m.sessPicker.open && i == m.hoverToolbar
 		activeTab := c.isTab && m.activeTab == c.tab
 
 		text := c.label
@@ -303,7 +309,7 @@ func (m *Model) renderFooterBar() string {
 	} else if m.focus == focusToolbar {
 		left = " " + hint("←→", "select") + sep + hint("enter", "apply") + sep + hint("↓/tab", "feed") + sep + hint("1-4", "filter") + sep + hint("q", "quit")
 	} else {
-		left = " " + hint("↑↓", "move") + sep + hint("enter", "fold") + sep + hint("o", "inspect") + sep + hint("/", "find") + sep + hint("f", "follow") + sep + hint("tab", "bar") + sep + hint("q", "quit")
+		left = " " + hint("↑↓", "move") + sep + hint("enter", "fold") + sep + hint("o", "inspect") + sep + hint("drag/y", "copy") + sep + hint("s", "sessions") + sep + hint("/", "find") + sep + hint("q", "quit")
 	}
 
 	modeTag := styleFooterTag.Render("FEED")
@@ -316,7 +322,15 @@ func (m *Model) renderFooterBar() string {
 		pct := min(100, (endRow*100)/max(1, m.totalVisRows))
 		posTxt = styleFooterSep.Render(" · ") + styleDim.Render(fmt.Sprintf("%d%%", pct))
 	}
-	right := modeTag + posTxt + " "
+	toastPart := ""
+	if m.copyToast != "" {
+		ts := styleCopyToast
+		if m.copyToastErr {
+			ts = styleCopyToastErr
+		}
+		toastPart = ts.Render(" "+m.copyToast+" ") + styleFooterSep.Render("  ·  ")
+	}
+	right := toastPart + modeTag + posTxt + " "
 	return composeSplitRow(left, right, colorSurface, m.width)
 }
 
@@ -326,8 +340,10 @@ func (m *Model) buildFeedRows() ([]string, []rowTarget) {
 	m.nodeOrder = m.nodeOrder[:0]
 	feedW := max(10, m.width-1) // reserve 1 rightmost column for sleek scrollbar
 
+	m.lastFeedPlain = m.lastFeedPlain[:0]
 	appendRow := func(text string, rt rowTarget) {
 		rows = append(rows, text)
+		m.lastFeedPlain = append(m.lastFeedPlain, ansi.Strip(text))
 		targets = append(targets, rt)
 	}
 
@@ -352,12 +368,17 @@ func (m *Model) buildFeedRows() ([]string, []rowTarget) {
 		}
 
 		if !g.isExec {
-			bodyLines, moreCount := renderEventBodyLines(g.startEv, "     ", feedW-6)
-			for _, bl := range bodyLines {
-				appendRow(paintLineBg(bl, colorCanvas, feedW), rowTarget{nodeID: g.id, action: "select"})
+			bodyLines, moreCount, copyX1, copyX2 := renderEventBodyLines(g.startEv, "     ", feedW-6, m.hoverCopyNodeID == g.id)
+			for bi, bl := range bodyLines {
+				rt := rowTarget{nodeID: g.id, action: "select"}
+				if bi == 0 && copyX2 > copyX1 {
+					rt.copyX1 = copyX1
+					rt.copyX2 = copyX2
+				}
+				appendRow(paintLineBg(bl, colorCanvas, feedW), rt)
 			}
 			if moreCount > 0 || g.startEv.Truncated || g.startEv.Detail != "" || g.startEv.Status == "running" || (g.startEv.Diff != nil && len(g.startEv.Diff.Hunks) > 0) {
-				link := "     " + renderInspectLink(moreCount, g.startEv, sel || hov)
+				link := "     " + renderInspectFooter(moreCount, g.startEv, sel || hov, max(24, feedW-8))
 				appendRow(paintLineBg(link, colorCanvas, feedW), rowTarget{nodeID: g.id, action: "inspect"})
 			}
 			continue
@@ -368,6 +389,16 @@ func (m *Model) buildFeedRows() ([]string, []rowTarget) {
 			if m.eventMatchesTab(ch.ev) {
 				visChildren = append(visChildren, ch)
 			}
+		}
+
+		// Compact chained Ops summary line right under an exec group header (clickable to inspect)
+		if g.endEv != nil && len(g.endEv.Ops) > 0 {
+			conn := "    " + styleTreeConn.Render("│") + "  "
+			if len(visChildren) == 0 {
+				conn = "    " + styleTreeConn.Render("╰─") + " "
+			}
+			opsLine := conn + renderOpsChainInline(g.endEv.Ops)
+			appendRow(paintLineBg(opsLine, colorCanvas, feedW), rowTarget{nodeID: g.id, action: "inspect"})
 		}
 
 		for ci, ch := range visChildren {
@@ -382,18 +413,386 @@ func (m *Model) buildFeedRows() ([]string, []rowTarget) {
 				if isLast {
 					branchPrefix = "        "
 				}
-				bodyLines, moreCount := renderEventBodyLines(ch.ev, branchPrefix, feedW-9)
-				for _, bl := range bodyLines {
-					appendRow(paintLineBg(bl, colorCanvas, feedW), rowTarget{nodeID: ch.id, action: "select"})
+				bodyLines, moreCount, copyX1, copyX2 := renderEventBodyLines(ch.ev, branchPrefix, feedW-9, m.hoverCopyNodeID == ch.id)
+				for bi, bl := range bodyLines {
+					rt := rowTarget{nodeID: ch.id, action: "select"}
+					if bi == 0 && copyX2 > copyX1 {
+						rt.copyX1 = copyX1
+						rt.copyX2 = copyX2
+					}
+					appendRow(paintLineBg(bl, colorCanvas, feedW), rt)
 				}
 				if moreCount > 0 || ch.ev.Truncated || ch.ev.Detail != "" || ch.ev.Status == "running" || (ch.ev.Diff != nil && len(ch.ev.Diff.Hunks) > 0) {
-					link := branchPrefix + renderInspectLink(moreCount, ch.ev, cSel || cHov)
+					link := branchPrefix + renderInspectFooter(moreCount, ch.ev, cSel || cHov, max(24, feedW-11))
 					appendRow(paintLineBg(link, colorCanvas, feedW), rowTarget{nodeID: ch.id, action: "inspect"})
 				}
 			}
 		}
 	}
 	return rows, targets
+}
+
+func isBoxedCardEvent(ev events.Event) bool {
+	if ev.Diff != nil && len(ev.Diff.Hunks) > 0 {
+		return false
+	}
+	if ev.Detail == "" {
+		return false
+	}
+	return ev.DetailKind == "code" || ev.DetailKind == "shell" || ev.DetailKind == "search" ||
+		ev.Tool == "code" || ev.Tool == "result" || ev.Tool == "docs" || ev.Kind == events.KindFileRead
+}
+
+func renderInspectFooter(moreCount int, ev events.Event, highlight bool, boxW int) string {
+	if !isBoxedCardEvent(ev) || boxW < 30 {
+		return renderInspectLink(moreCount, ev, highlight)
+	}
+	// Close the recessed code/output box seamlessly with a sleek bottom border + clickable inspect hint
+	innerW := boxW - 2
+	var label string
+	var lblStyle interface{ Render(...string) string }
+	switch {
+	case ev.Status == "running":
+		if moreCount > 0 {
+			label = fmt.Sprintf(" ⋯ %d earlier lines · o live tail ", moreCount)
+		} else {
+			label = " live output · o tail -f "
+		}
+		lblStyle = styleInspectLive
+	case moreCount > 0 && ev.DetailKind == "shell":
+		label = fmt.Sprintf(" ⋯ %d earlier lines · o inspect ", moreCount)
+		lblStyle = styleInspectQuiet
+	case moreCount > 0:
+		label = fmt.Sprintf(" ⋯ %d more lines · o inspect ", moreCount)
+		lblStyle = styleInspectQuiet
+	default:
+		label = " o inspect full view "
+		lblStyle = styleInspectQuiet
+	}
+	if highlight && ev.Status != "running" {
+		lblStyle = styleInspectSel
+	}
+	lblRendered := lblStyle.Render(label)
+	lblW := ansi.StringWidth(lblRendered)
+	if lblW > innerW-2 && innerW > 4 {
+		lblRendered = clampLineWidth(lblRendered, innerW-2)
+		lblW = ansi.StringWidth(lblRendered)
+	}
+	leftDash := max(1, innerW-lblW-1)
+	return styleCodeBorder.Render("╰"+strings.Repeat("─", leftDash)) + lblRendered + styleCodeBorder.Render("─╯")
+}
+
+func formatOpToken(op events.OpItem) (plain string, styled string) {
+	mark := "✓"
+	markStyled := styleBadgeOk.Render("✓")
+	capStyled := stylePath.Render(op.Capability)
+	if op.Status == "error" {
+		mark = "✗"
+		markStyled = styleBadgeErr.Render("✗")
+		capStyled = styleBadgeErr.Render(op.Capability)
+	}
+	dur := fmt.Sprintf("(%dms)", op.DurationMs)
+	plain = mark + op.Capability + dur
+	styled = markStyled + capStyled + styleDim.Render(dur)
+	return plain, styled
+}
+
+// groupOpsIntoWaves sorts ops by dispatch Seq and groups ops sharing a parallel Wave ID.
+func groupOpsIntoWaves(ops []events.OpItem) [][]events.OpItem {
+	if len(ops) == 0 {
+		return nil
+	}
+	sorted := make([]events.OpItem, len(ops))
+	copy(sorted, ops)
+	// Insertion sort preserves original order when Seq == 0.
+	for i := 1; i < len(sorted); i++ {
+		cur := sorted[i]
+		if cur.Seq <= 0 {
+			continue
+		}
+		j := i - 1
+		for j >= 0 && sorted[j].Seq > cur.Seq {
+			sorted[j+1] = sorted[j]
+			j--
+		}
+		sorted[j+1] = cur
+	}
+
+	var waves [][]events.OpItem
+	waveIdxByID := map[int]int{}
+	for _, op := range sorted {
+		if op.Wave > 0 {
+			if idx, ok := waveIdxByID[op.Wave]; ok {
+				waves[idx] = append(waves[idx], op)
+				continue
+			}
+			waveIdxByID[op.Wave] = len(waves)
+			waves = append(waves, []events.OpItem{op})
+		} else {
+			waves = append(waves, []events.OpItem{op})
+		}
+	}
+	return waves
+}
+
+func renderOpsChainInline(ops []events.OpItem) string {
+	waves := groupOpsIntoWaves(ops)
+	var b strings.Builder
+	b.WriteString(styleDim.Render("▸ Ops: "))
+	arrow := styleFooterSep.Render(" → ")
+	for wi, w := range waves {
+		if wi > 0 {
+			b.WriteString(arrow)
+		}
+		if len(w) == 1 {
+			_, st := formatOpToken(w[0])
+			b.WriteString(st)
+			continue
+		}
+		b.WriteString(styleAccent.Render("‖") + styleDim.Render("["))
+		for bi, op := range w {
+			if bi > 0 {
+				b.WriteString(styleDim.Render(", "))
+			}
+			_, st := formatOpToken(op)
+			b.WriteString(st)
+		}
+		b.WriteString(styleDim.Render("]"))
+	}
+	return b.String()
+}
+
+// renderOpsChainDetailLines renders a compact wrapped `▸ Ops:` chain for purely sequential runs,
+// or a GrokNight Fork-Join parallel flowchart with aligned mini Gantt timing bars when any
+// `Promise.all` parallel wave is present.
+func renderOpsChainDetailLines(ops []events.OpItem, wrapW int) []detailLine {
+	if len(ops) == 0 {
+		return nil
+	}
+	waves := groupOpsIntoWaves(ops)
+	parallelWaves := 0
+	for _, w := range waves {
+		if len(w) > 1 {
+			parallelWaves++
+		}
+	}
+	if parallelWaves > 0 {
+		return renderParallelFlowchartLines(ops, waves, parallelWaves, wrapW)
+	}
+
+	const firstPrefixPlain = "▸ Ops: "
+	const contPrefixPlain = "       "
+	firstPrefixStyled := styleAccent.Render("▸") + " " + styleModalKey.Render("Ops:") + " "
+	contPrefixStyled := contPrefixPlain
+	arrowPlain := " → "
+	arrowStyled := styleFooterSep.Render(" → ")
+
+	var out []detailLine
+	curPlain := firstPrefixPlain
+	curStyled := firstPrefixStyled
+	curW := ansi.StringWidth(firstPrefixPlain)
+
+	for i, op := range ops {
+		tokPlain, tokStyled := formatOpToken(op)
+		sepPlain, sepStyled := "", ""
+		if i > 0 {
+			sepPlain = arrowPlain
+			sepStyled = arrowStyled
+		}
+		addW := ansi.StringWidth(sepPlain + tokPlain)
+		if i > 0 && curW+addW > wrapW && curW > ansi.StringWidth(contPrefixPlain) {
+			out = append(out, detailLine{plain: curPlain, body: curStyled})
+			curPlain = contPrefixPlain + "→ " + tokPlain
+			curStyled = contPrefixStyled + styleFooterSep.Render("→ ") + tokStyled
+			curW = ansi.StringWidth(curPlain)
+			continue
+		}
+		curPlain += sepPlain + tokPlain
+		curStyled += sepStyled + tokStyled
+		curW += addW
+	}
+	if curPlain != "" {
+		out = append(out, detailLine{plain: curPlain, body: curStyled})
+	}
+	return out
+}
+
+func renderParallelFlowchartLines(ops []events.OpItem, waves [][]events.OpItem, parallelWaves int, wrapW int) []detailLine {
+	waveLbl := "parallel wave"
+	if parallelWaves > 1 {
+		waveLbl = "parallel waves"
+	}
+	hdrPlain := fmt.Sprintf("▸ Ops Flow  (%d ops · %d %s)", len(ops), parallelWaves, waveLbl)
+	hdrStyled := styleAccent.Render("▸") + " " + styleModalTitle.Render("Ops Flow") + "  " +
+		styleDim.Render(fmt.Sprintf("(%d ops · %d %s)", len(ops), parallelWaves, waveLbl))
+
+	out := []detailLine{{plain: hdrPlain, body: hdrStyled}}
+
+	const barW = 12
+	for wi, w := range waves {
+		isFirst := wi == 0
+		isLast := wi == len(waves)-1
+
+		if len(w) == 1 {
+			op := w[0]
+			var connPlain string
+			switch {
+			case isFirst && isLast:
+				connPlain = "  ● "
+			case isFirst:
+				connPlain = "  ┌─● "
+			case isLast:
+				connPlain = "  └─● "
+			default:
+				connPlain = "  ├─● "
+			}
+			connStyled := styleTreeConn.Render(connPlain[:len(connPlain)-len("● ")]) + styleAccent.Render("● ")
+			tokPlain, tokStyled := formatOpToken(op)
+			targetPlain, targetStyled := formatOpTargetHint(op.Target, max(12, wrapW-ansi.StringWidth(connPlain)-ansi.StringWidth(tokPlain)-2))
+			out = append(out, detailLine{
+				plain: connPlain + tokPlain + targetPlain,
+				body:  connStyled + tokStyled + targetStyled,
+			})
+			if !isLast {
+				out = append(out, detailLine{plain: "  │", body: styleTreeConn.Render("  │")})
+			}
+			continue
+		}
+
+		// Parallel wave (Promise.all fork-join block)
+		minStart := w[0].StartMs
+		maxEnd := w[0].StartMs + w[0].DurationMs
+		var sumDur, maxDur int64
+		maxLabelW := 0
+		for _, op := range w {
+			if op.StartMs < minStart {
+				minStart = op.StartMs
+			}
+			if end := op.StartMs + op.DurationMs; end > maxEnd {
+				maxEnd = end
+			}
+			sumDur += op.DurationMs
+			if op.DurationMs > maxDur {
+				maxDur = op.DurationMs
+			}
+			tp, _ := formatOpToken(op)
+			if lw := ansi.StringWidth(tp); lw > maxLabelW {
+				maxLabelW = lw
+			}
+		}
+		if maxLabelW > 28 {
+			maxLabelW = 28
+		}
+		wallMs := maxEnd - minStart
+		if wallMs <= 0 {
+			wallMs = maxDur
+		}
+		savedMs := max(int64(0), sumDur-wallMs)
+
+		var forkPlain, forkStyled string
+		switch {
+		case isFirst && isLast:
+			forkPlain = "  ┬─ "
+			forkStyled = styleTreeConn.Render("  ┬─ ")
+		case isFirst:
+			forkPlain = "  ┌─┬─ "
+			forkStyled = styleTreeConn.Render("  ┌─┬─ ")
+		case isLast:
+			forkPlain = "  └─┬─ "
+			forkStyled = styleTreeConn.Render("  └─┬─ ")
+		default:
+			forkPlain = "  ├─┬─ "
+			forkStyled = styleTreeConn.Render("  ├─┬─ ")
+		}
+
+		timingMeta := fmt.Sprintf("(wall %dms)", wallMs)
+		if savedMs > 0 {
+			timingMeta = fmt.Sprintf("(wall %dms · saved %dms)", wallMs, savedMs)
+		}
+		forkHdrPlain := fmt.Sprintf("%s‖ parallel ×%d  %s", forkPlain, len(w), timingMeta)
+		forkHdrStyled := forkStyled + styleAccent.Render(fmt.Sprintf("‖ parallel ×%d", len(w))) + "  " + styleDim.Render(timingMeta)
+		out = append(out, detailLine{plain: forkHdrPlain, body: forkHdrStyled})
+
+		// Spine prefix for branch lines inside this parallel wave
+		spinePlain := "  │ "
+		spineStyled := styleTreeConn.Render("  │ ")
+		if isLast {
+			if isFirst {
+				spinePlain = "  "
+				spineStyled = "  "
+			} else {
+				spinePlain = "    "
+				spineStyled = "    "
+			}
+		}
+
+		for bi, op := range w {
+			branchConn := "├── "
+			if bi == len(w)-1 {
+				branchConn = "└── "
+			}
+			tokPlain, tokStyled := formatOpToken(op)
+			tokW := ansi.StringWidth(tokPlain)
+			padSpaces := max(1, maxLabelW-tokW+2)
+			barPlain, barStyled := renderMiniGanttBar(op, minStart, wallMs, barW)
+
+			prefixW := ansi.StringWidth(spinePlain) + ansi.StringWidth(branchConn) + tokW + padSpaces + barW
+			targetPlain, targetStyled := formatOpTargetHint(op.Target, max(0, wrapW-prefixW-2))
+
+			out = append(out, detailLine{
+				plain: spinePlain + branchConn + tokPlain + strings.Repeat(" ", padSpaces) + barPlain + targetPlain,
+				body:  spineStyled + styleTreeConn.Render(branchConn) + tokStyled + strings.Repeat(" ", padSpaces) + barStyled + targetStyled,
+			})
+		}
+
+		if !isLast {
+			out = append(out, detailLine{plain: "  │", body: styleTreeConn.Render("  │")})
+		}
+	}
+	return out
+}
+
+func renderMiniGanttBar(op events.OpItem, waveMinStart, waveSpan int64, width int) (plain string, styled string) {
+	if width <= 0 {
+		return "", ""
+	}
+	startCell := 0
+	fillCells := width
+	if waveSpan > 0 {
+		relStart := max(int64(0), op.StartMs-waveMinStart)
+		startCell = int((relStart * int64(width)) / waveSpan)
+		if startCell >= width {
+			startCell = width - 1
+		}
+		fillCells = int((op.DurationMs*int64(width) + waveSpan - 1) / waveSpan)
+		if fillCells < 1 {
+			fillCells = 1
+		}
+		if startCell+fillCells > width {
+			fillCells = width - startCell
+		}
+	}
+	endEmpty := max(0, width-startCell-fillCells)
+	lead := strings.Repeat("─", startCell)
+	fill := strings.Repeat("━", fillCells)
+	tail := strings.Repeat("─", endEmpty)
+	plain = lead + fill + tail
+
+	fillStyle := styleGanttOk
+	if op.Status == "error" {
+		fillStyle = styleGanttErr
+	}
+	styled = styleGanttTrack.Render(lead) + fillStyle.Render(fill) + styleGanttTrack.Render(tail)
+	return plain, styled
+}
+
+func formatOpTargetHint(target string, maxW int) (plain string, styled string) {
+	target = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(target, "\r", " "), "\n", " "))
+	if target == "" || maxW < 4 {
+		return "", ""
+	}
+	clamped := clampLineWidth(target, maxW)
+	return "  " + clamped, "  " + styleDim.Render(clamped)
 }
 
 func renderInspectLink(moreCount int, ev events.Event, highlight bool) string {
@@ -484,7 +883,8 @@ func (m *Model) formatGroupHeader(g *runGroup, selected, hovered bool, feedW int
 
 	if !g.isExec {
 		dot, title := m.renderStyledOpCall(g.startEv)
-		left := fmt.Sprintf("%s %s %s %s", rail, arrow, dot, title)
+		sessBadge := m.renderInlineSessionBadge(g.startEv.SessionID)
+		left := fmt.Sprintf("%s %s %s %s%s", rail, arrow, dot, sessBadge, title)
 		var rightParts []string
 		if g.startEv.Summary != "" {
 			if g.startEv.Status == "running" {
@@ -527,8 +927,10 @@ func (m *Model) formatGroupHeader(g *runGroup, selected, hovered bool, feedW int
 	if title == "" {
 		title = "exec"
 	}
-	left := fmt.Sprintf("%s %s %s %s %s",
+	sessBadge := m.renderInlineSessionBadge(g.startEv.SessionID)
+	left := fmt.Sprintf("%s %s %s %s%s %s",
 		rail, arrow, dot,
+		sessBadge,
 		styleDim.Render("exec"),
 		styleGroupText.Render(title))
 	right := strings.Join(rightParts, styleFooterSep.Render("  ·  ")) + " "
@@ -594,6 +996,8 @@ func composeSplitRow(left, right, bgHex string, width int) string {
 	if width <= 0 {
 		return ""
 	}
+	left = sanitizeStyledLine(left)
+	right = sanitizeStyledLine(right)
 	rightW := ansi.StringWidth(right)
 	if rightW == 0 {
 		return paintLineBg(left, bgHex, width)
@@ -662,12 +1066,13 @@ func (m *Model) renderStyledOpCall(ev events.Event) (dot string, call string) {
 	}
 }
 
-func renderEventBodyLines(ev events.Event, pad string, maxW int) ([]string, int) {
+func renderEventBodyLines(ev events.Event, pad string, maxW int, hoverCopy bool) ([]string, int, int, int) {
 	var out []string
 	totalLines := 0
 	stripW := max(24, maxW-2)
 
 	if ev.Diff != nil && len(ev.Diff.Hunks) > 0 {
+		diffLang := detectLang(ev.Path, "", "", "")
 		for hi, h := range ev.Diff.Hunks {
 			if hi > 0 {
 				if len(out) < maxInlinePreviewLines {
@@ -678,42 +1083,136 @@ func renderEventBodyLines(ev events.Event, pad string, maxW int) ([]string, int)
 			for _, dl := range h.Lines {
 				totalLines++
 				if len(out) < maxInlinePreviewLines {
-					out = append(out, pad+renderColoredDiffLine(dl, stripW))
+					out = append(out, pad+renderColoredDiffLine(dl, stripW, diffLang))
 				}
 			}
 		}
 		more := max(0, totalLines-len(out))
-		return out, more
+		return out, more, 0, 0
 	}
 
-	if ev.Error != "" {
+	if ev.Error != "" && ev.Detail == "" {
 		out = append(out, pad+styleCodeRail.Render("│ ")+styleBadgeErr.Render("Error: "+ev.Error))
+		return out, 0, 0, 0
 	}
 	if ev.Detail == "" && ev.Status == "running" {
 		out = append(out, pad+styleCodeRail.Render("│ ")+styleDim.Render("waiting for output…"))
-		return out, 0
+		return out, 0, 0, 0
 	}
 	if ev.Detail != "" {
-		raw := strings.Split(strings.ReplaceAll(strings.TrimRight(ev.Detail, "\n"), "\r\n", "\n"), "\n")
-		totalLines = len(raw)
-		if ev.DetailKind == "shell" && len(raw) > maxInlinePreviewLines {
-			// Show the latest tail lines so streaming logs visibly tick live in the feed.
-			start := len(raw) - maxInlinePreviewLines
-			for i := start; i < len(raw); i++ {
-				out = append(out, fmt.Sprintf("%s%s%s", pad, styleLineNum.Render(fmt.Sprintf("%4d │ ", i+1)), styleDiffCtx.Render(raw[i])))
-			}
-			return out, start
+		detailText := ev.Detail
+		lang := detectLang(ev.Path, ev.DetailKind, ev.Tool, detailText)
+		isCode := ev.DetailKind == "code" || ev.Tool == "code"
+		isResult := ev.Tool == "result"
+		isShell := ev.DetailKind == "shell"
+		if isCode {
+			detailText = dedentBlock(detailText)
 		}
-		for i, l := range raw {
-			if len(out) >= maxInlinePreviewLines {
-				break
+		raw := splitSanitizedLines(detailText)
+		totalLines = len(raw)
+
+		// Render framed recessed GrokNight box with language-aware syntax highlighting!
+		if isBoxedCardEvent(ev) && stripW >= 30 {
+			boxW := stripW
+			innerW := boxW - 2
+			tag := lang
+			tagStyle := styleSynGlobal
+			switch {
+			case isCode:
+				tag = "typescript"
+				tagStyle = styleAccent
+			case isShell:
+				tag = "shell"
+				if ev.Kind == events.KindTask {
+					tag = "task"
+				}
+				if ev.Status == "running" {
+					tag += " · live"
+					tagStyle = styleRunDot
+				} else {
+					tagStyle = styleOpShell
+				}
+			case isResult:
+				if ev.Status != "" && ev.Status != "ok" {
+					tag = "output · error"
+					tagStyle = styleBadgeErr
+				} else {
+					tag = "output"
+					tagStyle = styleBadgeOk
+				}
+			case ev.Tool == "docs":
+				tag = "docs · markdown"
+				tagStyle = styleAccent
+			case lang == "search":
+				tag = "search"
+				tagStyle = styleOpSearch
+			case lang == "text":
+				tag = "file"
+				tagStyle = styleCodeHeader
 			}
-			out = append(out, fmt.Sprintf("%s%s%s", pad, styleLineNum.Render(fmt.Sprintf("%4d │ ", i+1)), styleDiffCtx.Render(l)))
+
+			meta := fmt.Sprintf(" %d lines ", totalLines)
+			copyBtn := styleModalBtn.Render(" Copy ")
+			if hoverCopy {
+				copyBtn = styleCtrlHover.Render(" Copy ")
+			}
+			copyW := ansi.StringWidth(copyBtn)
+			leftHdr := styleCodeBorder.Render("─ ") + tagStyle.Render(tag) + " "
+			metaRendered := styleDim.Render(meta)
+			rightHdr := metaRendered + copyBtn + styleCodeBorder.Render("─")
+			copyX1, copyX2 := 0, 0
+			hasCopyBtn := true
+			if ansi.StringWidth(leftHdr)+ansi.StringWidth(rightHdr)+1 > innerW {
+				metaRendered = ""
+				rightHdr = copyBtn + styleCodeBorder.Render("─")
+				if ansi.StringWidth(leftHdr)+ansi.StringWidth(rightHdr)+1 > innerW {
+					hasCopyBtn = false
+					rightHdr = styleCodeBorder.Render("─")
+				}
+			}
+			dashCount := max(1, innerW-ansi.StringWidth(leftHdr)-ansi.StringWidth(rightHdr))
+			if hasCopyBtn {
+				copyX1 = ansi.StringWidth(pad) + 1 + ansi.StringWidth(leftHdr) + dashCount + ansi.StringWidth(metaRendered)
+				copyX2 = copyX1 + copyW
+			}
+			topBorder := styleCodeBorder.Render("╭") + leftHdr + styleCodeBorder.Render(strings.Repeat("─", dashCount)) + rightHdr + styleCodeBorder.Render("╮")
+			out = append(out, pad+topBorder)
+
+			startIdx := 0
+			endIdx := min(totalLines, maxInlinePreviewLines)
+			more := max(0, totalLines-endIdx)
+			if isShell && totalLines > maxInlinePreviewLines {
+				startIdx = totalLines - maxInlinePreviewLines
+				endIdx = totalLines
+				more = startIdx
+			}
+
+			// Highlight full slice when Markdown (tracks fenced code blocks) or only visible slice otherwise.
+			var hlSlice []string
+			if lang == "markdown" {
+				hlAll := highlightLines(raw[:endIdx], lang)
+				hlSlice = hlAll[startIdx:endIdx]
+			} else {
+				hlSlice = highlightLines(raw[startIdx:endIdx], lang)
+			}
+
+			for idx, hl := range hlSlice {
+				lineNo := startIdx + idx + 1
+				ln := styleCodeLineNum.Render(fmt.Sprintf(" %4d │ ", lineNo))
+				rowInner := paintLineBg(ln+hl, colorCodeWell, innerW)
+				out = append(out, pad+styleCodeBorder.Render("│")+rowInner+styleCodeBorder.Render("│"))
+			}
+			return out, more, copyX1, copyX2
+		}
+
+		hl := highlightLines(raw[:min(totalLines, maxInlinePreviewLines)], lang)
+		for i, hLine := range hl {
+			out = append(out, fmt.Sprintf("%s%s%s", pad, styleLineNum.Render(fmt.Sprintf("%4d │ ", i+1)), hLine))
 		}
 		more := max(0, totalLines-len(out))
-		return out, more
+		return out, more, 0, 0
 	}
-	return out, 0
+	return out, 0, 0, 0
 }
 
 func formatDiffGutter(dl diff.DiffLine) string {
@@ -736,7 +1235,7 @@ func formatDiffGutter(dl diff.DiffLine) string {
 	return styleLineNum.Render(numStr) + sign
 }
 
-func renderColoredDiffLine(dl diff.DiffLine, stripW int) string {
+func renderColoredDiffLine(dl diff.DiffLine, stripW int, lang string) string {
 	var numStr string
 	switch dl.Kind {
 	case diff.LineAdd:
@@ -759,21 +1258,26 @@ func renderColoredDiffLine(dl diff.DiffLine, stripW int) string {
 			n = dl.OldLine
 		}
 		numStr = fmt.Sprintf("%4d │ ", n)
-		return styleLineNum.Render(numStr) + styleDiffCtx.Render("  "+dl.Text)
+		return styleLineNum.Render(numStr) + "  " + highlightLineByLang(dl.Text, lang)
 	}
 }
 
 func renderSpannedLine(sign, text string, spans []diff.Span, baseStyle, hiStyle interface{ Render(...string) string }) string {
 	if len(spans) == 0 {
-		return baseStyle.Render(sign + text)
+		return baseStyle.Render(sign + sanitizePlainLine(text))
 	}
 	var sb strings.Builder
 	sb.WriteString(baseStyle.Render(sign))
+	col := 0
 	for _, sp := range spans {
 		if sp.Start < 0 || sp.End > len(text) || sp.Start >= sp.End {
 			continue
 		}
-		chunk := text[sp.Start:sp.End]
+		var chunk string
+		chunk, col = sanitizePlainChunk(text[sp.Start:sp.End], col)
+		if chunk == "" {
+			continue
+		}
 		if sp.Changed {
 			sb.WriteString(hiStyle.Render(chunk))
 		} else {
@@ -829,6 +1333,111 @@ func (m *Model) compositeFloatingModal(baseView string) string {
 	return strings.Join(out, "\n")
 }
 
+type modalVisRow struct {
+	logicalIdx     int
+	isCont         bool
+	gutter         string
+	bodyStyled     string
+	bodyWidth      int
+	bgHex          string
+	panGroup       int
+	headerForGroup int
+	hasText        bool
+}
+
+func (m *Model) buildModalDisplayRows(contentW int) []modalVisRow {
+	re := compileSearchRegex(m.detail.query)
+	curMatchLine := -1
+	if len(m.detail.matches) > 0 && m.detail.matchCursor >= 0 && m.detail.matchCursor < len(m.detail.matches) {
+		curMatchLine = m.detail.matches[m.detail.matchCursor]
+	}
+
+	var out []modalVisRow
+	for i, dl := range m.detail.lines {
+		gutter := dl.gutter
+		body := dl.body
+		if m.detail.query != "" && re != nil && re.MatchString(dl.plain) {
+			hi := styleSearchMatch
+			if i == curMatchLine {
+				hi = styleSearchCur
+			}
+			gutter = hi.Render("›") + gutter
+			body = highlightPlainQuery(dl.plain, re, hi)
+		}
+
+		hasTxt := strings.TrimSpace(dl.plain) != ""
+		bodyW := ansi.StringWidth(body)
+		if !m.detail.wrap {
+			out = append(out, modalVisRow{
+				logicalIdx:     i,
+				gutter:         gutter,
+				bodyStyled:     body,
+				bodyWidth:      bodyW,
+				bgHex:          dl.bgHex,
+				panGroup:       dl.panGroup,
+				headerForGroup: dl.headerForGroup,
+				hasText:        hasTxt,
+			})
+			continue
+		}
+
+		gutterW := ansi.StringWidth(gutter)
+		availBodyW := max(8, contentW-gutterW-1) // reserve 1 col for cursor rail
+		if bodyW <= availBodyW {
+			out = append(out, modalVisRow{
+				logicalIdx:     i,
+				gutter:         gutter,
+				bodyStyled:     body,
+				bodyWidth:      bodyW,
+				bgHex:          dl.bgHex,
+				panGroup:       dl.panGroup,
+				headerForGroup: dl.headerForGroup,
+				hasText:        hasTxt,
+			})
+			continue
+		}
+
+		contGutter := buildContinuationGutter(gutterW, dl.bgHex)
+		for off := 0; off < bodyW; off += availBodyW {
+			seg := ansi.Cut(body, off, off+availBodyW)
+			g := gutter
+			if off > 0 {
+				g = contGutter
+			}
+			out = append(out, modalVisRow{
+				logicalIdx:     i,
+				isCont:         off > 0,
+				gutter:         g,
+				bodyStyled:     seg,
+				bodyWidth:      ansi.StringWidth(seg),
+				bgHex:          dl.bgHex,
+				panGroup:       dl.panGroup,
+				headerForGroup: dl.headerForGroup,
+				hasText:        hasTxt,
+			})
+		}
+	}
+	return out
+}
+
+func buildContinuationGutter(gutterW int, bgHex string) string {
+	if gutterW <= 0 {
+		return ""
+	}
+	raw := strings.Repeat(" ", gutterW)
+	if gutterW >= 4 {
+		raw = strings.Repeat(" ", gutterW-4) + "· │ "
+	}
+	switch bgHex {
+	case colorDiffAddBg:
+		return styleDiffAddNum.Render(raw)
+	case colorDiffDelBg:
+		return styleDiffDelNum.Render(raw)
+	default:
+		return styleLineNum.Render(raw)
+	}
+}
+
 func (m *Model) buildModalBox(mx, my, mw, mh int) []string {
 	innerW := max(20, mw-2)
 	bTop := styleModalBorderTop
@@ -882,57 +1491,196 @@ func (m *Model) buildModalBox(mx, my, mw, mh int) []string {
 	metaRowContent := "  " + styleModalKey.Render("INFO") + "  " + styleModalMeta.Render(metaTxt)
 	row2 := bdr.Render("│") + paintLineBg(metaRowContent, colorSurfaceHi, innerW) + bdr.Render("│")
 
-	// Row 3: Subtle hairline divider
-	divRow := bdr.Render("├") + paintLineBg(styleDividerModal.Render(strings.Repeat("─", innerW)), colorSurface, innerW) + bdr.Render("┤")
+	// Row 3: Subtle hairline divider (highlights lavender when body cursor is focused)
+	divStyle := styleDividerModal
+	if m.detail.focus == modalFocusBody && !m.detail.searchMode {
+		divStyle = styleDividerFocused
+	}
+	divRow := bdr.Render("├") + paintLineBg(divStyle.Render(strings.Repeat("─", innerW)), colorSurface, innerW) + bdr.Render("┤")
 
-	// Scrollable body rows on solid #13151A canvas + right-edge scrollbar
+	// Scrollable body rows with pinned gutter, active line cursor, horizontal pan, or soft word-wrap
 	page := max(3, mh-7)
-	maxScroll := max(0, len(m.detail.lines)-page)
+	contentW := max(10, innerW-2) // 1 col cursor rail + (contentW) content + 1 col scrollbar
+	visRows := m.buildModalDisplayRows(contentW)
+	totalVis := len(visRows)
+	m.detail.totalVis = totalVis
+
+	maxScroll := max(0, totalVis-page)
 	if m.detail.scroll > maxScroll {
 		m.detail.scroll = maxScroll
 	}
-	contentW := max(10, innerW-2) // 1 left margin + 1 right scrollbar column
+	if totalVis == 0 {
+		m.detail.cursor = 0
+	} else if m.detail.cursor >= totalVis {
+		m.detail.cursor = totalVis - 1
+	}
 
-	re := compileSearchRegex(m.detail.query)
-	curMatchLine := -1
-	if len(m.detail.matches) > 0 && m.detail.matchCursor >= 0 && m.detail.matchCursor < len(m.detail.matches) {
-		curMatchLine = m.detail.matches[m.detail.matchCursor]
+	// Precompute per-section horizontal pan bounds & clamped offsets (when wrap == false).
+	groupMaxH := map[int]int{}
+	groupH := map[int]int{}
+	if !m.detail.wrap {
+		for _, vr := range visRows {
+			if vr.panGroup <= 0 {
+				continue
+			}
+			gw := ansi.StringWidth(vr.gutter)
+			avail := max(4, contentW-gw)
+			if over := vr.bodyWidth - avail; over > groupMaxH[vr.panGroup] {
+				groupMaxH[vr.panGroup] = over
+			}
+		}
+		for grp, maxH := range groupMaxH {
+			if h := m.detailGroupHScroll(grp); h > 0 {
+				groupH[grp] = min(h, maxH)
+			}
+		}
 	}
 
 	thumbStart, thumbEnd := 0, page
-	if len(m.detail.lines) > page && page > 0 {
-		thumbSize := max(1, (page*page)/len(m.detail.lines))
+	if totalVis > page && page > 0 {
+		thumbSize := max(1, (page*page)/totalVis)
 		thumbStart = (m.detail.scroll * (page - thumbSize)) / max(1, maxScroll)
 		thumbEnd = min(page, thumbStart+thumbSize)
 	}
 
+	m.detail.copyZones = nil
 	bodyRows := make([]string, page)
 	for i := 0; i < page; i++ {
-		lineIdx := m.detail.scroll + i
-		var content string
+		visIdx := m.detail.scroll + i
+		var rowContent string
 		rowBg := colorSurface
-		if lineIdx < len(m.detail.lines) {
-			dl := m.detail.lines[lineIdx]
-			if dl.bgHex != "" {
-				rowBg = dl.bgHex
+
+		if visIdx < totalVis {
+			vr := visRows[visIdx]
+			isCursor := visIdx == m.detail.cursor
+			isHover := visIdx == m.detail.hoverRow && !isCursor
+
+			if vr.bgHex == colorDiffAddBg || vr.bgHex == colorDiffDelBg {
+				rowBg = vr.bgHex
+			} else if isCursor {
+				rowBg = colorSurfaceSel
+			} else if isHover {
+				rowBg = colorHoverRow
+			} else if vr.bgHex != "" {
+				rowBg = vr.bgHex
 			}
-			content = dl.styled
-			if m.detail.query != "" && re != nil && re.MatchString(dl.plain) {
-				hi := styleSearchMatch
-				if lineIdx == curMatchLine {
-					hi = styleSearchCur
+
+			rail := " "
+			if isCursor {
+				if m.detail.focus == modalFocusBody {
+					rail = styleSelectedBar.Render("▎")
+				} else {
+					rail = styleDim.Render("│")
 				}
-				content = hi.Render("›") + dl.gutter + highlightPlainQuery(dl.plain, re, hi)
 			}
+
+			gutterW := ansi.StringWidth(vr.gutter)
+			availBodyW := max(4, contentW-gutterW)
+
+			bodySeg := vr.bodyStyled
+			if !m.detail.wrap {
+				// Block-scoped horizontal scroll: all lines sharing a panGroup (e.g. CODE, OUTPUT, diff/file body)
+				// pan together in lockstep while Ops Flow, section headers, and other sections stay stationary.
+				if vr.panGroup > 0 {
+					rowHScroll := groupH[vr.panGroup]
+					overflowRight := vr.bodyWidth > rowHScroll+availBodyW
+					cutW := availBodyW
+					if overflowRight && availBodyW > 1 {
+						cutW = availBodyW - 1
+					}
+					cutSeg := ansi.Cut(vr.bodyStyled, rowHScroll, rowHScroll+cutW)
+					if overflowRight && availBodyW > 1 {
+						padW := max(0, cutW-ansi.StringWidth(cutSeg))
+						rightMark := styleDim.Render("▸")
+						if isCursor {
+							rightMark = styleAccent.Render("▸")
+						}
+						bodySeg = cutSeg + strings.Repeat(" ", padW) + rightMark
+					} else {
+						bodySeg = cutSeg
+					}
+				} else if vr.headerForGroup == 0 {
+					// Stationary row (Ops Flow, hunk separator)
+					if ansi.StringWidth(vr.bodyStyled) > availBodyW && availBodyW > 1 {
+						cutSeg := ansi.Cut(vr.bodyStyled, 0, availBodyW-1)
+						padW := max(0, (availBodyW-1)-ansi.StringWidth(cutSeg))
+						bodySeg = cutSeg + strings.Repeat(" ", padW) + styleDim.Render("▸")
+					}
+				}
+			}
+			if vr.headerForGroup > 0 {
+				// Section header (CODE / OUTPUT): always stationary with right-aligned clickable [ Copy ] pill!
+				hdrStyled := vr.bodyStyled
+				if !m.detail.wrap {
+					if gh := groupH[vr.headerForGroup]; gh > 0 {
+						hdrStyled += "  " + styleAccent.Render(fmt.Sprintf("◂ +%d", gh))
+					} else if groupMaxH[vr.headerForGroup] > 0 {
+						hdrStyled += "  " + styleDim.Render("←→")
+					}
+				}
+				copyBtn := styleModalBtn.Render(" Copy ")
+				if m.detail.hoverCopyGroup == vr.headerForGroup {
+					copyBtn = styleCtrlHover.Render(" Copy ")
+				}
+				btnW := ansi.StringWidth(copyBtn)
+				availForLeft := availBodyW - btnW - 2
+				if availForLeft >= 10 {
+					leftClamped := clampLineWidth(hdrStyled, availForLeft)
+					leftW := ansi.StringWidth(leftClamped)
+					gap := max(1, availBodyW-leftW-btnW-1)
+					bodySeg = leftClamped + strings.Repeat(" ", gap) + copyBtn + " "
+					btnX := mx + 2 + gutterW + leftW + gap
+					m.detail.copyZones = append(m.detail.copyZones, modalCopyZone{
+						y:     my + 4 + i,
+						x1:    btnX,
+						x2:    btnX + btnW,
+						group: vr.headerForGroup,
+					})
+				} else {
+					bodySeg = clampLineWidth(hdrStyled, availBodyW)
+				}
+			}
+			if m.sel.active && m.sel.scope == selScopeModal {
+				r1, c1, r2, c2 := m.sel.normalized()
+				if visIdx >= r1 && visIdx <= r2 {
+					if m.sel.lineMode {
+						rowBg = colorTextSelBg
+					} else {
+						rowHScroll := 0
+						if !m.detail.wrap && vr.panGroup > 0 {
+							rowHScroll = groupH[vr.panGroup]
+						}
+						segW := ansi.StringWidth(bodySeg)
+						visStart := 0
+						visEnd := segW
+						if visIdx == r1 {
+							visStart = max(0, c1-rowHScroll)
+						}
+						if visIdx == r2 {
+							visEnd = max(0, (c2+1)-rowHScroll)
+						}
+						bodySeg = applySelectionHighlight(bodySeg, segW, visStart, visEnd)
+					}
+				}
+			}
+			rowContent = rail + vr.gutter + bodySeg
 		}
+
 		sbChar := styleModalScrollTrack.Render("│")
-		if len(m.detail.lines) > page && i >= thumbStart && i < thumbEnd {
+		if totalVis > page && i >= thumbStart && i < thumbEnd {
 			sbChar = styleModalScrollThumb.Render("┃")
-		} else if len(m.detail.lines) <= page {
+		} else if totalVis <= page {
 			sbChar = paintLineBg(" ", colorSurface, 1)
 		}
-		bodyRows[i] = bdr.Render("│") + paintLineBg(" "+content, rowBg, contentW+1) + sbChar + bdr.Render("│")
+		bodyRows[i] = bdr.Render("│") + paintLineBg(rowContent, rowBg, contentW+1) + sbChar + bdr.Render("│")
 	}
+
+	// Bottom divider highlights when bottom action bar is focused
+	botDivStyle := styleDividerModal
+	if m.detail.focus == modalFocusBar && !m.detail.searchMode {
+		botDivStyle = styleDividerFocused
+	}
+	botDivRow := bdr.Render("├") + paintLineBg(botDivStyle.Render(strings.Repeat("─", innerW)), colorSurface, innerW) + bdr.Render("┤")
 
 	// Bottom action / search bar inside modal
 	m.detail.actionZones = nil
@@ -947,9 +1695,13 @@ func (m *Model) buildModalBox(mx, my, mw, mh int) []string {
 		ab.WriteString(" ")
 		col++
 
-		btns := []string{"/ Search", "▲ Prev", "▼ Next", "Top", "End"}
+		wrapLbl := "Wrap:OFF"
+		if m.detail.wrap {
+			wrapLbl = "Wrap:ON"
+		}
+		btns := []string{"/ Find", "▲", "▼", wrapLbl, "Copy", "Top", "End"}
 		for idx, lbl := range btns {
-			focused := idx == m.detail.btnIdx
+			focused := m.detail.focus == modalFocusBar && idx == m.detail.btnIdx
 			hovered := idx == m.detail.hoverBtn
 			txt := " " + lbl + " "
 			if focused {
@@ -961,6 +1713,8 @@ func (m *Model) buildModalBox(mx, my, mw, mh int) []string {
 				rendered = styleCtrlFocused.Render(txt)
 			case hovered:
 				rendered = styleCtrlHover.Render(txt)
+			case idx == 3 && m.detail.wrap:
+				rendered = styleFollowOn.Render(txt)
 			default:
 				rendered = styleModalBtn.Render(txt)
 			}
@@ -972,23 +1726,59 @@ func (m *Model) buildModalBox(mx, my, mw, mh int) []string {
 			col++
 		}
 
-		endLine := min(len(m.detail.lines), m.detail.scroll+page)
-		pct := 100
-		if len(m.detail.lines) > 0 {
-			pct = min(100, (endLine*100)/len(m.detail.lines))
+		// Right-aligned live status + copy toast + visual mode + cursor line + horizontal pan offset + %
+		var statusParts []string
+		if m.sel.active && m.sel.scope == selScopeModal && m.sel.lineMode {
+			r1, _, r2, _ := m.sel.normalized()
+			statusParts = append(statusParts, styleAccent.Render(fmt.Sprintf("VISUAL %dL (y)", r2-r1+1)))
+		} else if m.copyToast != "" {
+			ts := styleCopyToast
+			if m.copyToastErr {
+				ts = styleCopyToastErr
+			}
+			statusParts = append(statusParts, ts.Render(" "+m.copyToast+" "))
 		}
-		liveTag := ""
 		if m.detail.streaming {
 			if m.detail.followTail {
-				liveTag = styleRunDot.Render(m.currentSpinner()+" tail -f") + styleFooterSep.Render("  ·  ")
+				statusParts = append(statusParts, styleRunDot.Render(m.currentSpinner()+" tail -f"))
 			} else {
-				liveTag = styleDim.Render("paused (G)") + styleFooterSep.Render("  ·  ")
+				statusParts = append(statusParts, styleDim.Render("paused (G)"))
 			}
 		}
-		posInfo := liveTag + styleModalMeta.Render(fmt.Sprintf("%d-%d / %d  %d%% ",
-			min(len(m.detail.lines), m.detail.scroll+1), endLine, len(m.detail.lines), pct))
-		usedW := (col - (mx + 1)) + ansi.StringWidth(posInfo)
-		if gap := innerW - usedW; gap > 0 {
+		if !m.detail.wrap {
+			if activeH := groupH[m.detailActivePanGroup(visRows)]; activeH > 0 {
+				statusParts = append(statusParts, styleAccent.Render(fmt.Sprintf("◂ Col+%d", activeH)))
+			}
+		}
+		curLn := 0
+		if totalVis > 0 && m.detail.cursor < totalVis {
+			curLn = visRows[m.detail.cursor].logicalIdx + 1
+		}
+		endRow := min(totalVis, m.detail.scroll+page)
+		pct := 100
+		if totalVis > 0 {
+			pct = min(100, (endRow*100)/totalVis)
+		}
+		statusParts = append(statusParts, styleModalMeta.Render(fmt.Sprintf("Ln %d/%d  %d%% ", curLn, len(m.detail.lines), pct)))
+
+		// Gracefully drop lower-priority trailing status segments if narrow modal lacks width so VISUAL / Copy toast always show.
+		availRight := innerW - (col - (mx + 1))
+		posInfo := ""
+		for k := len(statusParts); k >= 1; k-- {
+			cand := strings.Join(statusParts[:k], styleFooterSep.Render(" · "))
+			if k < len(statusParts) {
+				cand += " "
+			}
+			if ansi.StringWidth(cand) < availRight {
+				posInfo = cand
+				break
+			}
+		}
+		if posInfo == "" && len(statusParts) > 0 && availRight > 6 {
+			posInfo = clampLineWidth(statusParts[0], availRight-2) + " "
+		}
+		if posInfo != "" {
+			gap := max(1, availRight-ansi.StringWidth(posInfo))
 			ab.WriteString(strings.Repeat(" ", gap))
 			ab.WriteString(posInfo)
 		}
@@ -1000,7 +1790,208 @@ func (m *Model) buildModalBox(mx, my, mw, mh int) []string {
 	var box []string
 	box = append(box, topRow, row1, row2, divRow)
 	box = append(box, bodyRows...)
-	box = append(box, divRow, actionRow, bottomRow)
+	box = append(box, botDivRow, actionRow, bottomRow)
+	return box
+}
+
+func (m *Model) renderInlineSessionBadge(sid string) string {
+	// Show compact color-coded client badge on feed headers when viewing All Sessions across multiple clients.
+	if m.activeSessionID != "" || len(m.sessions) < 2 || sid == "" {
+		return ""
+	}
+	info := m.sessionByID[sid]
+	st := styleAccent
+	if info != nil {
+		st = sessionAccentStyles[info.colorIdx%len(sessionAccentStyles)]
+	}
+	name := m.sessionDisplayName(sid)
+	if len([]rune(name)) > 14 {
+		name = string([]rune(name)[:13]) + "…"
+	}
+	return st.Render("["+name+"]") + " "
+}
+
+// compositeSessionPickerModal overlays a sleek GrokNight rounded session switcher popup.
+func (m *Model) compositeSessionPickerModal(baseView string) string {
+	mx, my, mw, mh := m.computeSessionPickerBounds()
+	m.sessPicker.rect = modalRect{x: mx, y: my, w: mw, h: mh}
+
+	popupLines := m.buildSessionPickerBox(mx, my, mw, mh)
+	baseLines := strings.Split(baseView, "\n")
+	for len(baseLines) < m.height {
+		baseLines = append(baseLines, "")
+	}
+
+	out := make([]string, len(baseLines))
+	for y := 0; y < len(baseLines); y++ {
+		plain := ansi.Strip(baseLines[y])
+		if y == my+mh && mx+2 < m.width {
+			shStart := mx + 2
+			shEnd := min(m.width, mx+mw+2)
+			leftPlain := padExactWidth(ansi.Cut(plain, 0, shStart), shStart)
+			rightPlain := padExactWidth(ansi.Cut(plain, shEnd, m.width), max(0, m.width-shEnd))
+			out[y] = styleBackdrop.Render(leftPlain) +
+				styleShadow.Render(strings.Repeat(" ", max(0, shEnd-shStart))) +
+				styleBackdrop.Render(rightPlain)
+			continue
+		}
+		if y < my || y >= my+mh {
+			out[y] = styleBackdrop.Render(padExactWidth(plain, m.width))
+			continue
+		}
+		leftPlain := padExactWidth(ansi.Cut(plain, 0, mx), mx)
+		rightStart := mx + mw
+		rightW := max(0, m.width-rightStart)
+		if y > my && rightW >= 2 {
+			afterShadow := rightStart + 2
+			rightPlain := padExactWidth(ansi.Cut(plain, afterShadow, m.width), max(0, m.width-afterShadow))
+			out[y] = styleBackdrop.Render(leftPlain) + popupLines[y-my] + styleShadow.Render("  ") + styleBackdrop.Render(rightPlain)
+		} else {
+			rightPlain := padExactWidth(ansi.Cut(plain, rightStart, m.width), rightW)
+			out[y] = styleBackdrop.Render(leftPlain) + popupLines[y-my] + styleBackdrop.Render(rightPlain)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+func (m *Model) computeSessionPickerBounds() (x, y, w, h int) {
+	w = min(m.width-6, max(58, (m.width*64)/100))
+	if w > m.width-2 {
+		w = max(36, m.width-2)
+	}
+	rowCount := len(m.sessions) + 1 // All Sessions + each session
+	// Overhead: top border(1) + subtitle(1) + divider(1) + rows + divider(1) + footer hint(1) + bottom border(1) = 6
+	desiredH := rowCount + 6
+	maxH := max(9, m.height-6)
+	h = min(maxH, max(9, desiredH))
+	x = max(1, (m.width-w)/2)
+	y = max(1, (m.height-h)/2)
+	return x, y, w, h
+}
+
+func (m *Model) buildSessionPickerBox(mx, my, mw, mh int) []string {
+	innerW := max(20, mw-2)
+	bTop := styleModalBorderTop
+	bdr := styleModalBorder
+
+	// Row 0: Top border with title & [ esc × ]
+	titlePrefix := " " + styleBrandMark.Render("◆") + " "
+	badge := "  " + styleModalBadge.Render(fmt.Sprintf(" %d active ", len(m.sessions)))
+	closeTxt := " esc × "
+	closeRendered := styleModalClose.Render(closeTxt)
+	if m.sessPicker.hoverIdx == -2 {
+		closeRendered = styleModalCloseHover.Render(closeTxt)
+	}
+	closeW := ansi.StringWidth(closeRendered)
+	maxTitleW := max(4, innerW-closeW-3)
+	rawTitle := titlePrefix + styleModalTitle.Render("Sessions") + badge + " "
+	titleCombined := paintLineBg(rawTitle, colorSurface, min(maxTitleW, ansi.StringWidth(rawTitle)))
+	titleW := ansi.StringWidth(titleCombined)
+	fillDash := max(1, innerW-1-titleW-closeW-1)
+	closeStartX := mx + 1 + 1 + titleW + fillDash
+	m.sessPicker.closeZone = hitZone{x1: closeStartX, x2: closeStartX + closeW, action: "close"}
+	topRow := bTop.Render("╭─") + titleCombined + bTop.Render(strings.Repeat("─", fillDash)) + closeRendered + bTop.Render("─╮")
+
+	// Row 1: Subtitle strip explaining what MCPlex sessions are
+	subContent := "  " + styleModalMeta.Render("Each MCP client connection gets an isolated session (state, tasks & feed filter)")
+	subRow := bdr.Render("│") + paintLineBg(subContent, colorSurfaceHi, innerW) + bdr.Render("│")
+
+	// Row 2: Divider
+	divRow := bdr.Render("├") + paintLineBg(styleDividerModal.Render(strings.Repeat("─", innerW)), colorSurface, innerW) + bdr.Render("┤")
+
+	// Body rows (All Sessions + each observed session)
+	bodyH := max(2, mh-6)
+	m.sessPicker.rowZones = nil
+
+	totalItems := len(m.sessions) + 1
+	scrollStart := 0
+	if m.sessPicker.cursor >= bodyH {
+		scrollStart = m.sessPicker.cursor - bodyH + 1
+	}
+
+	bodyRows := make([]string, bodyH)
+	for i := 0; i < bodyH; i++ {
+		idx := scrollStart + i
+		if idx >= totalItems {
+			bodyRows[i] = bdr.Render("│") + paintLineBg("", colorSurface, innerW) + bdr.Render("│")
+			continue
+		}
+		screenY := my + 3 + i
+		m.sessPicker.rowZones = append(m.sessPicker.rowZones, pickerRowZone{y: screenY, idx: idx})
+
+		focused := idx == m.sessPicker.cursor
+		hovered := idx == m.sessPicker.hoverIdx && !focused
+		rowBg := colorSurface
+		rail := "  "
+		if focused {
+			rowBg = colorSurfaceSel
+			rail = styleSelectedBar.Render("▎ ")
+		} else if hovered {
+			rowBg = colorHoverRow
+		}
+
+		var left, right string
+		if idx == 0 {
+			check := "  "
+			if m.activeSessionID == "" {
+				check = styleBadgeOk.Render("✓ ")
+			}
+			left = rail + check + styleBrandMark.Render("●") + " " + styleGroupText.Render("All Sessions") + "  " + styleDim.Render("0")
+			right = styleMuted.Render(fmt.Sprintf("%d sessions · %d runs · %d edits ", len(m.sessions), m.totalRuns, m.totalCRUD))
+		} else {
+			s := m.sessions[idx-1]
+			check := "  "
+			if m.activeSessionID == s.id {
+				check = styleBadgeOk.Render("✓ ")
+			}
+			accent := sessionAccentStyles[s.colorIdx%len(sessionAccentStyles)]
+			dot := accent.Render("●")
+			if s.active > 0 {
+				dot = styleRunDot.Render(m.currentSpinner())
+			}
+			namePart := styleGroupText.Render(s.label) + " " + styleDim.Render("#"+shortSessionID(s.id))
+			if s.label == "" {
+				namePart = styleGroupText.Render("Session") + " " + styleMuted.Render("#"+shortSessionID(s.id))
+			}
+			keyHint := ""
+			if idx <= 9 {
+				keyHint = "  " + styleDim.Render(fmt.Sprintf("%d", idx))
+			}
+			left = rail + check + dot + " " + namePart + keyHint
+
+			var parts []string
+			if s.cwd != "" {
+				base := s.cwd
+				if slash := strings.LastIndex(strings.TrimRight(base, "/"), "/"); slash >= 0 {
+					base = base[slash+1:]
+				}
+				if base != "" {
+					parts = append(parts, styleDim.Render(base))
+				}
+			}
+			parts = append(parts, styleMuted.Render(fmt.Sprintf("%dr/%de", s.runs, s.crud)))
+			if s.tasks > 0 {
+				parts = append(parts, styleOpTask.Render(fmt.Sprintf("%dt", s.tasks)))
+			}
+			if s.lastTs != "" {
+				parts = append(parts, styleDim.Render(s.lastTs))
+			}
+			right = strings.Join(parts, styleFooterSep.Render(" · ")) + " "
+		}
+		bodyRows[i] = bdr.Render("│") + composeSplitRow(left, right, rowBg, innerW) + bdr.Render("│")
+	}
+
+	// Footer hint bar
+	sep := styleFooterSep.Render("  ·  ")
+	hint := func(k, d string) string { return styleFooterKey.Render(k) + " " + styleFooterDesc.Render(d) }
+	footContent := "  " + hint("↑↓", "choose") + sep + hint("enter / click", "filter") + sep + hint("0-9", "quick pick") + sep + hint("esc", "close")
+	footRow := bdr.Render("│") + paintLineBg(footContent, colorSurfaceHi, innerW) + bdr.Render("│")
+	bottomRow := bdr.Render("╰" + strings.Repeat("─", innerW) + "╯")
+
+	var box []string
+	box = append(box, topRow, subRow, divRow)
+	box = append(box, bodyRows...)
+	box = append(box, divRow, footRow, bottomRow)
 	return box
 }
 

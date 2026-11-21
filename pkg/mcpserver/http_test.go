@@ -100,10 +100,10 @@ func TestHTTPTransportAuthSkillResourcesAndExec(t *testing.T) {
 		t.Fatalf("notification status = %d, want 202", r.StatusCode)
 	}
 
-	// 5. tools/list has self-describing exec description and only requires "code" (cwd optional in generic mode)
+	// 5. tools/list has slim progressive-disclosure exec description + docs tool and only requires "code"
 	_, body = postMCP(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`, "top-secret-token")
-	if !strings.Contains(body, "fs.hash") && !strings.Contains(body, "hash(p,algo?)") {
-		t.Fatalf("tools/list exec description missing self-describing globals:\n%s", body)
+	if !strings.Contains(body, `docs({ topic })`) {
+		t.Fatalf("tools/list exec description missing docs progressive-disclosure pointer:\n%s", body)
 	}
 	if !strings.Contains(body, `"required":["code"]`) {
 		t.Fatalf("generic mode should only require code (cwd optional):\n%s", body)

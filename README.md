@@ -72,7 +72,7 @@ mcplex ui http://127.0.0.1:8787 --token "your-secret-token"
 
 ## Exposed MCP Tools (`--tools`)
 
-By default, `mcplex serve` runs with `--tools all` and exposes **4 orthogonal tools** (pass `--tools exec` for single-tool Code Mode inside hosts that already provide native file/terminal tools):
+By default, `mcplex serve` runs with `--tools all` and exposes **5 orthogonal tools** (pass `--tools exec` for single-tool Code Mode inside hosts that already provide native file/terminal tools):
 
 | MCP Tool | Purpose |
 | :--- | :--- |
@@ -80,6 +80,7 @@ By default, `mcplex serve` runs with `--tools all` and exposes **4 orthogonal to
 | `read` | Direct parallel file reader (up to 800 lines / 48 KB per call with `startLine`/`endLine`/`tail`/`byteOffset`) + native MCP `image` blocks for `.png`/`.jpg`/`.webp`/`.gif` |
 | `spawn` | Start `>15s` builds, full test suites, interactive commands, or persistent `daemon: true` processes (sync `waitMs` window -> automatic background handoff with process-tree / Job Object cleanup) |
 | `task` | Manage spawned tasks: `list`, `status`, incremental `logs` (`offset`/`tail`), `wait` (with instant `expect` regex readiness wakeup), stdin `input`, `kill`, `kill_all` |
+| `docs` | Instant on-demand API & pattern lookup (`docs()` index, `docs({ topic })` by namespace, `docs({ query })` keyword search) so clients keep upfront prompt overhead minimal |
 
 ---
 

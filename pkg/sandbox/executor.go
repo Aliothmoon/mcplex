@@ -57,8 +57,10 @@ func EffectiveMaxTimeout() time.Duration {
 // OpTrace records a single host capability call executed by a guest program.
 type OpTrace struct {
 	Seq        int    `json:"seq"`
+	Wave       int    `json:"wave,omitempty"` // parallel execution wave ID; ops sharing a Wave overlapped in flight (e.g. Promise.all)
 	Capability string `json:"capability"`
 	Target     string `json:"target,omitempty"`
+	StartMs    int64  `json:"startMs,omitempty"` // offset in ms from exec start
 	DurationMs int64  `json:"durationMs"`
 	Status     string `json:"status"` // "ok" | "error"
 	Kind       string `json:"kind,omitempty"`
@@ -129,31 +131,34 @@ var sandboxExecSeq atomic.Int64
 
 // ExecutionEnv represents one isolated VM run and provides safe host binding helpers.
 type ExecutionEnv struct {
-	ExecID     string
-	Ctx        context.Context
-	Cwd        string
-	VM         *goja.Runtime
-	loopCh     chan loopAction
-	deliverFn  goja.Callable
-	makeErrFn  goja.Callable
-	opSeq      atomic.Int32
-	maxOps     int
-	onOpStart  func(capability, target string, seq int)
-	tracesMu   sync.Mutex
-	traces     []OpTrace
-	inFlightMu sync.Mutex
-	inFlight   map[int]inFlightEntry
-	asyncWG    sync.WaitGroup
-	logsMu     sync.Mutex
-	logs       []string
-	logBytes   int
-	pendingOps atomic.Int32
-	cleanupFns []func()
-	warnMu     sync.Mutex
-	warnings   []string
-	warnCount  map[string]int
-	compiled   *compiler.CompileResult
-	asyncErr   error // VM-thread only: first exception thrown outside the main promise chain (timer callbacks)
+	ExecID        string
+	Ctx           context.Context
+	Cwd           string
+	VM            *goja.Runtime
+	loopCh        chan loopAction
+	deliverFn     goja.Callable
+	makeErrFn     goja.Callable
+	opSeq         atomic.Int32
+	maxOps        int
+	onOpStart     func(capability, target string, seq int)
+	tracesMu      sync.Mutex
+	traces        []OpTrace
+	inFlightMu    sync.Mutex
+	inFlight      map[int]inFlightEntry
+	asyncWG       sync.WaitGroup
+	logsMu        sync.Mutex
+	logs          []string
+	logBytes      int
+	pendingOps    atomic.Int32
+	vmActiveAsync int // VM-thread only: count of unsettled async ops for exact Promise.all wave grouping
+	waveSeq       int // VM-thread only: increments whenever a new serial step or parallel wave starts
+	startedAt     time.Time
+	cleanupFns    []func()
+	warnMu        sync.Mutex
+	warnings      []string
+	warnCount     map[string]int
+	compiled      *compiler.CompileResult
+	asyncErr      error // VM-thread only: first exception thrown outside the main promise chain (timer callbacks)
 }
 
 // RegisterCleanup registers a function to run when the VM execution finishes (e.g. rolling back uncommitted transactions).
@@ -246,15 +251,22 @@ func (env *ExecutionEnv) wrapSync(capability string, fn SyncHostFunc) func(goja.
 		if env.onOpStart != nil {
 			env.onOpStart(capability, target, seq)
 		}
+		if env.vmActiveAsync == 0 {
+			env.waveSeq++
+		}
+		wave := env.waveSeq
 		start := time.Now()
+		startMs := start.Sub(env.startedAt).Milliseconds()
 		res, err := fn(env.Ctx, exported)
 		dur := time.Since(start).Milliseconds()
 		if err != nil {
 			tr, jsErr := env.hostFailure(seq, capability, target, dur, line, err)
+			tr.Wave = wave
+			tr.StartMs = startMs
 			env.recordTrace(tr)
 			panic(jsErr())
 		}
-		env.recordTrace(OpTrace{Seq: seq, Capability: capability, Target: target, DurationMs: dur, Status: "ok", Bytes: approxSize(res)})
+		env.recordTrace(OpTrace{Seq: seq, Wave: wave, Capability: capability, Target: target, StartMs: startMs, DurationMs: dur, Status: "ok", Bytes: approxSize(res)})
 		return env.toJSValue(res)
 	}
 }
@@ -277,9 +289,15 @@ func (env *ExecutionEnv) wrapAsync(capability string, fn AsyncHostFunc) func(goj
 		}
 
 		promise, resolve, reject := env.VM.NewPromise()
+		if env.vmActiveAsync == 0 {
+			env.waveSeq++
+		}
+		wave := env.waveSeq
+		env.vmActiveAsync++
 		env.pendingOps.Add(1)
 		env.asyncWG.Add(1)
 		start := time.Now()
+		startMs := start.Sub(env.startedAt).Milliseconds()
 		env.trackInFlightStart(seq, capability, target, start)
 
 		go func() {
@@ -291,15 +309,22 @@ func (env *ExecutionEnv) wrapAsync(capability string, fn AsyncHostFunc) func(goj
 			if err != nil {
 				var tr OpTrace
 				tr, jsErr = env.hostFailure(seq, capability, target, dur, line, err)
+				tr.Wave = wave
+				tr.StartMs = startMs
 				env.recordTrace(tr)
 			} else {
-				env.recordTrace(OpTrace{Seq: seq, Capability: capability, Target: target, DurationMs: dur, Status: "ok", Bytes: approxSize(res)})
+				env.recordTrace(OpTrace{Seq: seq, Wave: wave, Capability: capability, Target: target, StartMs: startMs, DurationMs: dur, Status: "ok", Bytes: approxSize(res)})
 			}
 
 			select {
 			case env.loopCh <- loopAction{
 				run: func() {
 					defer env.pendingOps.Add(-1)
+					// Decrement vmActiveAsync BEFORE settling the Promise so a sequential `await`
+					// resuming inside deliverFn starts a fresh wave instead of joining this one.
+					if env.vmActiveAsync > 0 {
+						env.vmActiveAsync--
+					}
 					if err != nil {
 						_ = reject(jsErr())
 						_, _ = env.deliverFn(goja.Undefined())
@@ -503,6 +528,7 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 		maxOps:    maxOps,
 		onOpStart: req.OnOpStart,
 		inFlight:  map[int]inFlightEntry{},
+		startedAt: start,
 		compiled:  cr,
 	}
 	// Crucial teardown order on exit:

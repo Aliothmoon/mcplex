@@ -479,6 +479,7 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 					Status:     statusTag,
 					DurationMs: ee.DurationMs,
 					HostOps:    len(ee.Traces),
+					Ops:        tracesToOpItems(ee.Traces),
 					Error:      ee.Message,
 					Detail:     det,
 					DetailKind: "text",
@@ -506,6 +507,21 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 			PayloadKeys:   audit.PayloadKeyLengths(in.Payloads),
 			Code:          in.Code,
 		})
+		if e.events.Active() {
+			det, trunc := events.CapPreview(formatted, events.DefaultReadPreview)
+			e.events.Emit(events.Event{
+				Kind:       events.KindExecEnd,
+				SessionID:  sid,
+				RunID:      runID,
+				Tool:       "exec",
+				Title:      title,
+				Status:     "runtime_error",
+				Error:      execErr.Error(),
+				Detail:     det,
+				DetailKind: "text",
+				Truncated:  trunc,
+			})
+		}
 		e.writeLiveStatus(LiveStatus{
 			Active:       false,
 			Title:        title,
@@ -556,6 +572,7 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 			Status:     statusTag,
 			DurationMs: res.DurationMs,
 			HostOps:    len(res.Traces),
+			Ops:        tracesToOpItems(res.Traces),
 			Detail:     det,
 			DetailKind: "text",
 			Truncated:  trunc,
@@ -581,6 +598,26 @@ func countFailedTraces(traces []sandbox.OpTrace) int {
 		}
 	}
 	return n
+}
+
+func tracesToOpItems(traces []sandbox.OpTrace) []events.OpItem {
+	if len(traces) == 0 {
+		return nil
+	}
+	out := make([]events.OpItem, 0, len(traces))
+	for _, tr := range traces {
+		out = append(out, events.OpItem{
+			Seq:        tr.Seq,
+			Wave:       tr.Wave,
+			Capability: tr.Capability,
+			Target:     tr.Target,
+			StartMs:    tr.StartMs,
+			DurationMs: tr.DurationMs,
+			Status:     tr.Status,
+			Error:      tr.Error,
+		})
+	}
+	return out
 }
 
 // resolveEffectiveCwd ensures relative paths (`"go.mod"`, `"internal/..."`) NEVER accidentally resolve against

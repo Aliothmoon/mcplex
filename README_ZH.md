@@ -72,7 +72,7 @@ mcplex ui http://127.0.0.1:8787 --token "your-secret-token"
 
 ## 对外暴露的 MCP 工具集（`--tools`）
 
-`mcplex serve` 默认启用 `--tools all`，暴露 **4 个正交工具**（若宿主已自带文件与终端工具，可传 `--tools exec` 切换为单工具纯 Code Mode）：
+`mcplex serve` 默认启用 `--tools all`，暴露 **5 个正交工具**（若宿主已自带文件与终端工具，可传 `--tools exec` 切换为单工具纯 Code Mode）：
 
 | MCP 工具 | 职责 |
 | :--- | :--- |
@@ -80,6 +80,7 @@ mcplex ui http://127.0.0.1:8787 --token "your-secret-token"
 | `read` | 独立大预算并发文件直读（单次最高 800 行 / 48 KB，支持 `startLine`/`endLine`/`tail`/`byteOffset`）及 `.png`/`.jpg`/`.webp`/`.gif` 原生 MCP 多模态图片返回 |
 | `spawn` | 启动 `>15s` 重构建、全量测试、交互式命令或常驻服务（`daemon: true`）；支持 `waitMs` 同步等待窗口，超时自动转后台并配备进程树/Windows Job Object 兜底清理 |
 | `task` | 后台任务统一管理：`list`、`status`、按字节 `offset`/`tail` 增量拉取 `logs`、带正则 `expect` 毫秒级唤醒的 `wait`、交互式 `input`、`kill` 与 `kill_all` |
+| `docs` | 零开销按需文档查询（无参查目录、`{ topic }` 查命名空间精确签名与示例、`{ query }` 关键词检索），大幅降低握手期上下文占用 |
 
 ---
 

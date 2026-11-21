@@ -54,10 +54,10 @@ func TestToolsListRespectsToolSetProfile(t *testing.T) {
 		t.Fatalf("expected -32602 for disabled read tool, got %+v", denyRead)
 	}
 
-	// Full MCPlex ToolSet: exec, read, spawn, task.
+	// Full MCPlex ToolSet: exec, read, spawn, task, docs.
 	fullSrv := NewServerWithOptions(eng, ServerOptions{
 		ServerName: "mcplex",
-		Tools:      ToolSet{Read: true, Tasks: true},
+		Tools:      ToolSet{Read: true, Tasks: true, Docs: true},
 	})
 	resFull := fullSrv.handleSingle(t.Context(), jsonRPCRequest{
 		JSONRPC: "2.0",
@@ -76,8 +76,20 @@ func TestToolsListRespectsToolSetProfile(t *testing.T) {
 		names = append(names, tool.Name)
 	}
 	got := strings.Join(names, ",")
-	if got != "exec,read,spawn,task" {
-		t.Fatalf("expected exec,read,spawn,task; got %q", got)
+	if got != "exec,read,spawn,task,docs" {
+		t.Fatalf("expected exec,read,spawn,task,docs; got %q", got)
+	}
+
+	// Verify on-demand docs tool (index, topic, and keyword query)
+	docsResp := fullSrv.handleSingle(t.Context(), jsonRPCRequest{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage("4"),
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"docs","arguments":{"topic":"tx"}}`),
+	})
+	rawDocs, _ := json.Marshal(docsResp.Result)
+	if !strings.Contains(string(rawDocs), "tx.begin()") || !strings.Contains(string(rawDocs), "t.commit()") {
+		t.Fatalf("expected tx topic docs from docs tool, got: %s", string(rawDocs))
 	}
 }
 

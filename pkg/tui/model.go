@@ -54,6 +54,14 @@ type hitZone struct {
 type rowTarget struct {
 	nodeID string
 	action string // "toggle" | "inspect" | "select"
+	copyX1 int    // clickable inline card header [ Copy ] button start X (exclusive end copyX2)
+	copyX2 int
+}
+
+type modalCopyZone struct {
+	y      int
+	x1, x2 int
+	group  int // panGroup to copy (1=CODE, 2=OUTPUT)
 }
 
 type childItem struct {
@@ -89,39 +97,84 @@ func (sr *streamRef) eventPtr() *events.Event {
 }
 
 type detailLine struct {
-	gutter string
-	plain  string
-	styled string
-	bgHex  string
+	gutter         string // pinned styled gutter (e.g. "   12 │ "), empty for Ops Flow / hunk header
+	plain          string // plain body text without gutter (for search & horizontal offset math)
+	body           string // styled body text without gutter (for pinned-gutter horizontal pan & soft-wrap)
+	bgHex          string
+	panGroup       int // >0: lines sharing the same panGroup horizontally scroll together; 0: stationary
+	headerForGroup int // >0: stationary section header representing panGroup (shows ◂ +N badge & routes ←→)
 }
+
+type modalFocusArea int
+
+const (
+	modalFocusBody modalFocusArea = iota
+	modalFocusBar
+)
 
 type modalRect struct {
 	x, y, w, h int
 }
 
+type sessionInfo struct {
+	id       string
+	label    string
+	cwd      string
+	runs     int
+	crud     int
+	tasks    int
+	active   int
+	lastTs   string
+	colorIdx int
+}
+
+type pickerRowZone struct {
+	y   int
+	idx int
+}
+
+type sessionPickerState struct {
+	open      bool
+	cursor    int // 0 = All Sessions, 1..len(sessions) = specific session
+	hoverIdx  int // -1 = none, -2 = close chip
+	rect      modalRect
+	closeZone hitZone
+	rowZones  []pickerRowZone
+}
+
 type detailState struct {
-	open        bool
-	streamID    string
-	streaming   bool
-	followTail  bool
-	title       string
-	badgeText   string
-	absPath     string
-	oldAbsPath  string
-	cwd         string
-	metaLine    string
-	lines       []detailLine
-	scroll      int
-	searchMode  bool
-	searchInput string
-	query       string
-	matches     []int
-	matchCursor int
-	btnIdx      int // focused button index in popup bottom action bar (0..4)
-	hoverBtn    int // hovered button index (-1=none, -2=close chip)
-	rect        modalRect
-	closeZone   hitZone   // clickable [ × Esc ] on modal top border row
-	actionZones []hitZone // clickable buttons on modal bottom action row
+	open           bool
+	focus          modalFocusArea
+	runID          string
+	isExecGroup    bool
+	streamID       string
+	streaming      bool
+	followTail     bool
+	wrap           bool
+	title          string
+	badgeText      string
+	absPath        string
+	oldAbsPath     string
+	cwd            string
+	metaLine       string
+	lines          []detailLine
+	scroll         int
+	cursor         int         // active visual row index inside modal body
+	groupHScroll   map[int]int // per-panGroup horizontal scroll offset in display columns (when wrap == false)
+	totalVis       int         // cached total visual rows for current wrap/width
+	searchMode     bool
+	searchInput    string
+	query          string
+	matches        []int
+	matchCursor    int
+	btnIdx         int // focused button index in popup bottom action bar (0..5)
+	hoverBtn       int // hovered button index (-1=none, -2=close chip)
+	hoverRow       int // hovered visual body row index (-1=none)
+	rect           modalRect
+	closeZone      hitZone         // clickable [ esc × ] on modal top border row
+	actionZones    []hitZone       // clickable buttons on modal bottom action row
+	copyZones      []modalCopyZone // clickable [ Copy ] buttons on CODE/OUTPUT section headers
+	hoverCopyGroup int             // hovered section copy group (0=none)
 }
 
 // Model is the Bubble Tea state machine for the Grok-Build-CLI dark interactive MCPlex console.
@@ -137,16 +190,18 @@ type Model struct {
 	focus      focusArea
 	toolbarIdx int
 
-	groups      []*runGroup
-	groupByRun  map[string]*runGroup
-	streamByID  map[string]*streamRef
-	nodeOrder   []string
-	selectedID  string
-	scroll      int
-	follow      bool
-	activeTab   filterTab
-	sessionList []string
-	sessionIdx  int
+	groups          []*runGroup
+	groupByRun      map[string]*runGroup
+	streamByID      map[string]*streamRef
+	nodeOrder       []string
+	selectedID      string
+	scroll          int
+	follow          bool
+	activeTab       filterTab
+	sessions        []*sessionInfo
+	sessionByID     map[string]*sessionInfo
+	activeSessionID string
+	sessPicker      sessionPickerState
 
 	// Feed search state (/ + n / N)
 	searchMode  bool
@@ -156,13 +211,15 @@ type Model struct {
 	feedMatchAt int
 
 	// Cached layout & mouse hit-testing / hover state
-	tabZones     []hitZone
-	rowTargets   []rowTarget
-	totalVisRows int
-	bodyTopY     int
-	bodyHeight   int
-	hoverToolbar int
-	hoverNodeID  string
+	tabZones        []hitZone
+	rowTargets      []rowTarget
+	lastFeedPlain   []string
+	totalVisRows    int
+	bodyTopY        int
+	bodyHeight      int
+	hoverToolbar    int
+	hoverNodeID     string
+	hoverCopyNodeID string
 
 	// Double-click detection
 	lastClickID   string
@@ -176,8 +233,15 @@ type Model struct {
 	totalAdd   int
 	totalDel   int
 
-	// Floating overlay detail popup (less-style scroll + search + full absolute path)
-	detail detailState
+	// Floating overlay detail popup (less-style cursor + scroll + h-pan + wrap + search)
+	detail     detailState
+	detailWrap bool // persists user's word-wrap preference across popups
+
+	// Mouse drag text selection + select-to-copy (选中即复制) + visual mode & toast
+	sel          textSelection
+	copyToast    string
+	copyToastErr bool
+	copyToastSeq int
 
 	// On-demand braille spinner (only ticks while exec/shell/task is actively running)
 	spinnerFrame int
@@ -221,6 +285,8 @@ func NewModel(cfg Config, src EventSource) *Model {
 		toolbarIdx:   0,
 		groupByRun:   map[string]*runGroup{},
 		streamByID:   map[string]*streamRef{},
+		sessionByID:  map[string]*sessionInfo{},
+		sessPicker:   sessionPickerState{hoverIdx: -1},
 		follow:       true,
 		connected:    true,
 		bodyTopY:     3,
@@ -237,14 +303,14 @@ func (m *Model) toolbarControls() []toolbarControl {
 		{id: "tab_read", label: "Read", isTab: true, tab: tabReadSearch},
 		{id: "tab_shell", label: "Shell/Task", isTab: true, tab: tabShellTask},
 	}
-	if len(m.sessionList) > 0 {
-		label := "Sess:all"
+	if len(m.sessions) > 0 {
+		label := fmt.Sprintf("Sess:All(%d)", len(m.sessions))
 		if sf := m.activeSessionFilter(); sf != "" {
-			short := sf
-			if len(short) > 10 {
-				short = short[:10] + "…"
+			name := m.sessionDisplayName(sf)
+			if len([]rune(name)) > 14 {
+				name = string([]rune(name)[:13]) + "…"
 			}
-			label = "Sess:" + short
+			label = "Sess:" + name
 		}
 		ctrls = append(ctrls, toolbarControl{id: "session", label: label})
 	}
@@ -318,8 +384,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.connNote = "disconnected"
 		return m, nil
 
+	case copyToastClearMsg:
+		if msg.seq == m.copyToastSeq {
+			m.copyToast = ""
+			m.copyToastErr = false
+		}
+		return m, nil
+
 	case tea.MouseMsg:
-		return m.handleMouse(msg), nil
+		return m.handleMouse(msg)
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -329,7 +402,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) recomputeLayoutMetrics() {
 	m.bodyTopY = 3
-	m.bodyHeight = max(4, m.height-4)
+	m.bodyHeight = max(1, m.height-4)
 }
 
 func (m *Model) modalPageHeight() int {
@@ -355,6 +428,9 @@ func (m *Model) computeModalBounds() (x, y, w, h int) {
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.Type == tea.KeyCtrlC || msg.String() == "ctrl+c" {
 		return m, tea.Quit
+	}
+	if m.sessPicker.open {
+		return m.handleSessionPickerKey(msg)
 	}
 	if m.detail.open {
 		return m.handleDetailKey(msg)
@@ -398,12 +474,17 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "x":
 		m.clearFeed()
 		return m, nil
+	case "s":
+		m.openSessionPicker()
+		return m, nil
 	case "n":
 		m.jumpFeedMatch(1)
 		return m, nil
 	case "N":
 		m.jumpFeedMatch(-1)
 		return m, nil
+	case "y":
+		return m, m.copyFromFeed()
 	}
 
 	if msg.Type == tea.KeyTab {
@@ -432,6 +513,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if msg.Type == tea.KeyEsc {
+		if m.sel.active && m.sel.scope == selScopeFeed {
+			m.clearSelection()
+			return m, nil
+		}
 		if m.feedQuery != "" {
 			m.feedQuery = ""
 			m.feedMatches = nil
@@ -581,8 +666,6 @@ func (m *Model) handleFeedKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.scrollToBottom()
 	case "d":
 		m.selectFilterTab(tabCRUD)
-	case "s":
-		m.cycleSession()
 	}
 	return m, nil
 }
@@ -632,7 +715,7 @@ func (m *Model) activateToolbarControl(idx int) {
 			m.focus = focusFeed
 		}
 	case "session":
-		m.cycleSession()
+		m.openSessionPicker()
 	case "expand_all":
 		m.setAllExpanded(true)
 		m.syncFeedLayout()
@@ -662,14 +745,79 @@ func (m *Model) toggleFollow() {
 	}
 }
 
-func (m *Model) cycleSession() {
-	if len(m.sessionList) == 0 {
-		return
+func (m *Model) openSessionPicker() {
+	cursor := 0
+	if m.activeSessionID != "" {
+		for i, s := range m.sessions {
+			if s.id == m.activeSessionID {
+				cursor = i + 1
+				break
+			}
+		}
 	}
-	m.sessionIdx = (m.sessionIdx + 1) % (len(m.sessionList) + 1)
+	m.sessPicker = sessionPickerState{
+		open:     true,
+		cursor:   cursor,
+		hoverIdx: -1,
+	}
+}
+
+func (m *Model) applySessionPickerChoice(idx int) {
+	if idx <= 0 || idx > len(m.sessions) {
+		m.activeSessionID = ""
+	} else {
+		m.activeSessionID = m.sessions[idx-1].id
+	}
+	m.sessPicker.open = false
 	m.syncFeedLayout()
 	m.snapSelectionToVisible()
 	m.rebuildFeedMatches()
+}
+
+func (m *Model) handleSessionPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	total := len(m.sessions) + 1 // 0 = All Sessions, 1..N = individual sessions
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.sessPicker.open = false
+		return m, nil
+	case tea.KeyUp:
+		m.sessPicker.cursor = (m.sessPicker.cursor - 1 + total) % total
+		return m, nil
+	case tea.KeyDown:
+		m.sessPicker.cursor = (m.sessPicker.cursor + 1) % total
+		return m, nil
+	case tea.KeyHome:
+		m.sessPicker.cursor = 0
+		return m, nil
+	case tea.KeyEnd:
+		m.sessPicker.cursor = max(0, total-1)
+		return m, nil
+	case tea.KeyEnter:
+		m.applySessionPickerChoice(m.sessPicker.cursor)
+		return m, nil
+	}
+	switch msg.String() {
+	case "q", "s":
+		m.sessPicker.open = false
+	case "k":
+		m.sessPicker.cursor = (m.sessPicker.cursor - 1 + total) % total
+	case "j":
+		m.sessPicker.cursor = (m.sessPicker.cursor + 1) % total
+	case " ":
+		m.applySessionPickerChoice(m.sessPicker.cursor)
+	case "0":
+		m.applySessionPickerChoice(0)
+	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+		n := int(msg.String()[0] - '0')
+		if n < total {
+			m.applySessionPickerChoice(n)
+		}
+	}
+	return m, nil
+}
+
+func (m *Model) cycleSession() {
+	m.openSessionPicker()
 }
 
 func (m *Model) handleFeedSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -705,10 +853,9 @@ func (m *Model) handleFeedSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-const modalActionCount = 5 // Search, Prev, Next, Top, End
+const modalActionCount = 7 // Search, Prev, Next, Wrap, Copy, Top, End
 
-func (m *Model) triggerDetailAction(idx int) {
-	page := m.modalPageHeight()
+func (m *Model) triggerDetailAction(idx int) tea.Cmd {
 	switch idx {
 	case 0: // / Search
 		m.detail.searchMode = true
@@ -717,13 +864,16 @@ func (m *Model) triggerDetailAction(idx int) {
 		m.stepDetailMatch(-1)
 	case 2: // Next match
 		m.stepDetailMatch(1)
-	case 3: // Top
-		m.detail.scroll = 0
-		m.detail.followTail = false
-	case 4: // End
-		m.detail.scroll = max(0, len(m.detail.lines)-page)
-		m.detail.followTail = true
+	case 3: // Wrap toggle
+		m.toggleDetailWrap()
+	case 4: // Copy active selection or section
+		return m.copyFromModal(false)
+	case 5: // Top
+		m.jumpDetailTop()
+	case 6: // End
+		m.jumpDetailBottom()
 	}
+	return nil
 }
 
 func (m *Model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -740,6 +890,7 @@ func (m *Model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.detail.matchCursor = 0
 				m.jumpDetailToMatch(0)
 			}
+			m.detail.focus = modalFocusBody
 			return m, nil
 		case tea.KeyBackspace:
 			r := []rune(m.detail.searchInput)
@@ -759,30 +910,26 @@ func (m *Model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	page := m.modalPageHeight()
+	// Global modal keys regardless of body/bar focus
 	switch msg.Type {
 	case tea.KeyEsc:
-		if m.detail.query != "" {
+		if m.sel.active && m.sel.scope == selScopeModal {
+			m.clearSelection()
+		} else if m.detail.query != "" {
 			m.detail.query = ""
 			m.detail.searchInput = ""
 			m.detail.matches = nil
 		} else {
+			m.clearSelection()
 			m.detail.open = false
 		}
 		return m, nil
-	case tea.KeyDown:
-		m.scrollDetail(1)
-		return m, nil
-	case tea.KeyUp:
-		m.scrollDetail(-1)
-		return m, nil
-	case tea.KeyLeft, tea.KeyShiftTab:
-		m.detail.btnIdx = (m.detail.btnIdx - 1 + modalActionCount) % modalActionCount
-		return m, nil
-	case tea.KeyRight, tea.KeyTab:
-		m.detail.btnIdx = (m.detail.btnIdx + 1) % modalActionCount
-		return m, nil
-	case tea.KeyEnter:
-		m.triggerDetailAction(m.detail.btnIdx)
+	case tea.KeyTab, tea.KeyShiftTab:
+		if m.detail.focus == modalFocusBody {
+			m.detail.focus = modalFocusBar
+		} else {
+			m.detail.focus = modalFocusBody
+		}
 		return m, nil
 	case tea.KeyPgDown:
 		m.scrollDetail(page)
@@ -797,77 +944,252 @@ func (m *Model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.scrollDetail(-max(2, page/2))
 		return m, nil
 	case tea.KeyHome:
-		m.detail.scroll = 0
-		m.detail.followTail = false
+		m.jumpDetailTop()
 		return m, nil
 	case tea.KeyEnd:
-		m.detail.scroll = max(0, len(m.detail.lines)-page)
-		m.detail.followTail = true
+		m.jumpDetailBottom()
 		return m, nil
 	}
 
 	switch msg.String() {
 	case "q", "o":
+		m.clearSelection()
 		m.detail.open = false
-	case "j":
-		m.scrollDetail(1)
-	case "k":
-		m.scrollDetail(-1)
-	case "h":
-		m.detail.btnIdx = (m.detail.btnIdx - 1 + modalActionCount) % modalActionCount
-	case "l":
-		m.detail.btnIdx = (m.detail.btnIdx + 1) % modalActionCount
-	case " ", "f":
-		m.scrollDetail(page)
-	case "b":
-		m.scrollDetail(-page)
-	case "d":
-		m.scrollDetail(max(2, page/2))
-	case "u":
-		m.scrollDetail(-max(2, page/2))
-	case "g":
-		m.detail.scroll = 0
-		m.detail.followTail = false
-	case "G":
-		m.detail.scroll = max(0, len(m.detail.lines)-page)
-		m.detail.followTail = true
+		return m, nil
+	case "w":
+		m.clearSelection()
+		m.toggleDetailWrap()
+		return m, nil
+	case "v":
+		m.toggleModalVisualSelect()
+		return m, nil
+	case "y":
+		return m, m.copyFromModal(false)
+	case "Y":
+		return m, m.copyFromModal(true)
 	case "/":
 		m.detail.searchMode = true
 		m.detail.searchInput = m.detail.query
+		return m, nil
 	case "n":
 		m.stepDetailMatch(1)
+		return m, nil
 	case "N":
 		m.stepDetailMatch(-1)
+		return m, nil
+	case "g":
+		m.jumpDetailTop()
+		return m, nil
+	case "G":
+		m.jumpDetailBottom()
+		return m, nil
+	case "b":
+		m.scrollDetail(-page)
+		return m, nil
+	case "f":
+		m.scrollDetail(page)
+		return m, nil
+	case "d":
+		m.scrollDetail(max(2, page/2))
+		return m, nil
+	case "u":
+		m.scrollDetail(-max(2, page/2))
+		return m, nil
+	}
+
+	if m.detail.focus == modalFocusBar {
+		switch msg.Type {
+		case tea.KeyUp:
+			m.detail.focus = modalFocusBody
+			return m, nil
+		case tea.KeyLeft:
+			m.detail.btnIdx = (m.detail.btnIdx - 1 + modalActionCount) % modalActionCount
+			return m, nil
+		case tea.KeyRight:
+			m.detail.btnIdx = (m.detail.btnIdx + 1) % modalActionCount
+			return m, nil
+		case tea.KeyEnter:
+			return m, m.triggerDetailAction(m.detail.btnIdx)
+		}
+		switch msg.String() {
+		case "k":
+			m.detail.focus = modalFocusBody
+		case "h":
+			m.detail.btnIdx = (m.detail.btnIdx - 1 + modalActionCount) % modalActionCount
+		case "l":
+			m.detail.btnIdx = (m.detail.btnIdx + 1) % modalActionCount
+		case " ":
+			return m, m.triggerDetailAction(m.detail.btnIdx)
+		}
+		return m, nil
+	}
+
+	// modalFocusBody: cursor up/down + horizontal pan left/right when wrap is off
+	switch msg.Type {
+	case tea.KeyDown:
+		m.moveDetailCursor(1)
+		return m, nil
+	case tea.KeyUp:
+		m.moveDetailCursor(-1)
+		return m, nil
+	case tea.KeyLeft:
+		m.panDetailHorizontal(-8)
+		return m, nil
+	case tea.KeyRight:
+		m.panDetailHorizontal(8)
+		return m, nil
+	case tea.KeyEnter:
+		if m.sel.active && m.sel.scope == selScopeModal && m.sel.lineMode {
+			return m, m.copyFromModal(false)
+		}
+		m.detail.focus = modalFocusBar
+		return m, nil
+	}
+	switch msg.String() {
+	case "j":
+		m.moveDetailCursor(1)
+	case "k":
+		m.moveDetailCursor(-1)
+	case "h":
+		m.panDetailHorizontal(-8)
+	case "l":
+		m.panDetailHorizontal(8)
+	case "0", "^":
+		m.resetActiveDetailHScroll()
+	case "$":
+		m.panDetailToGroupEnd()
+	case " ":
+		m.scrollDetail(page)
 	}
 	return m, nil
 }
 
-func (m *Model) handleMouse(msg tea.MouseMsg) tea.Model {
+func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.sessPicker.open {
+		r := m.sessPicker.rect
+		if msg.Button == tea.MouseButtonWheelUp {
+			total := len(m.sessions) + 1
+			m.sessPicker.cursor = (m.sessPicker.cursor - 1 + total) % total
+			return m, nil
+		}
+		if msg.Button == tea.MouseButtonWheelDown {
+			total := len(m.sessions) + 1
+			m.sessPicker.cursor = (m.sessPicker.cursor + 1) % total
+			return m, nil
+		}
+		if msg.Action == tea.MouseActionMotion {
+			m.sessPicker.hoverIdx = -1
+			if msg.Y == r.y && msg.X >= m.sessPicker.closeZone.x1 && msg.X < m.sessPicker.closeZone.x2 {
+				m.sessPicker.hoverIdx = -2
+				return m, nil
+			}
+			for _, rz := range m.sessPicker.rowZones {
+				if msg.Y == rz.y && msg.X > r.x && msg.X < r.x+r.w-1 {
+					m.sessPicker.hoverIdx = rz.idx
+					break
+				}
+			}
+			return m, nil
+		}
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			if msg.X < r.x || msg.X >= r.x+r.w || msg.Y < r.y || msg.Y >= r.y+r.h {
+				m.sessPicker.open = false
+				return m, nil
+			}
+			if msg.Y == r.y && msg.X >= m.sessPicker.closeZone.x1 && msg.X < m.sessPicker.closeZone.x2 {
+				m.sessPicker.open = false
+				return m, nil
+			}
+			for _, rz := range m.sessPicker.rowZones {
+				if msg.Y == rz.y && msg.X > r.x && msg.X < r.x+r.w-1 {
+					m.applySessionPickerChoice(rz.idx)
+					return m, nil
+				}
+			}
+		}
+		return m, nil
+	}
+
+	if msg.Button == tea.MouseButtonWheelLeft {
+		if m.detail.open {
+			m.panDetailHoverOrActive(-6)
+		}
+		return m, nil
+	}
+	if msg.Button == tea.MouseButtonWheelRight {
+		if m.detail.open {
+			m.panDetailHoverOrActive(6)
+		}
+		return m, nil
+	}
 	if msg.Button == tea.MouseButtonWheelUp {
 		if m.detail.open {
-			m.scrollDetail(-3)
+			if msg.Shift {
+				m.panDetailHoverOrActive(-6)
+			} else {
+				m.scrollDetail(-3)
+			}
 		} else {
 			m.follow = false
 			m.scrollFeed(-3)
 		}
-		return m
+		return m, nil
 	}
 	if msg.Button == tea.MouseButtonWheelDown {
 		if m.detail.open {
-			m.scrollDetail(3)
+			if msg.Shift {
+				m.panDetailHoverOrActive(6)
+			} else {
+				m.scrollDetail(3)
+			}
 		} else {
 			m.scrollFeed(3)
 		}
-		return m
+		return m, nil
+	}
+
+	// Mouse button release -> finalize drag selection & auto-copy (选中即复制), or execute pending single-click!
+	if msg.Action == tea.MouseActionRelease {
+		if m.sel.dragging {
+			return m, m.finishMouseDrag(msg.X, msg.Y)
+		}
+		return m, nil
 	}
 
 	if msg.Action == tea.MouseActionMotion {
+		// Active left-button drag -> live-update text selection range!
+		if m.sel.dragging {
+			if msg.Button == tea.MouseButtonLeft {
+				m.updateMouseDrag(msg.X, msg.Y)
+				return m, nil
+			}
+			// Released outside terminal window -> finalize cleanly.
+			return m, m.finishMouseDrag(msg.X, msg.Y)
+		}
+
 		if m.detail.open {
 			m.detail.hoverBtn = -1
+			m.detail.hoverRow = -1
+			m.detail.hoverCopyGroup = 0
 			r := m.detail.rect
 			if msg.Y == r.y && msg.X >= m.detail.closeZone.x1 && msg.X < m.detail.closeZone.x2 {
 				m.detail.hoverBtn = -2
-				return m
+				return m, nil
+			}
+			for _, cz := range m.detail.copyZones {
+				if msg.Y == cz.y && msg.X >= cz.x1 && msg.X < cz.x2 {
+					m.detail.hoverCopyGroup = cz.group
+					return m, nil
+				}
+			}
+			bodyStartY := r.y + 4
+			bodyEndY := r.y + r.h - 3
+			if msg.X > r.x && msg.X < r.x+r.w-1 && msg.Y >= bodyStartY && msg.Y < bodyEndY {
+				visIdx := m.detail.scroll + (msg.Y - bodyStartY)
+				if visIdx >= 0 && visIdx < m.detail.totalVis {
+					m.detail.hoverRow = visIdx
+				}
+				return m, nil
 			}
 			if msg.Y == r.y+r.h-2 {
 				for _, z := range m.detail.actionZones {
@@ -877,10 +1199,11 @@ func (m *Model) handleMouse(msg tea.MouseMsg) tea.Model {
 					}
 				}
 			}
-			return m
+			return m, nil
 		}
 		m.hoverToolbar = -1
 		m.hoverNodeID = ""
+		m.hoverCopyNodeID = ""
 		if msg.Y == 1 {
 			for _, z := range m.tabZones {
 				if msg.X >= z.x1 && msg.X < z.x2 {
@@ -891,85 +1214,89 @@ func (m *Model) handleMouse(msg tea.MouseMsg) tea.Model {
 		} else if msg.Y >= m.bodyTopY && msg.Y < m.bodyTopY+m.bodyHeight {
 			visIdx := m.scroll + (msg.Y - m.bodyTopY)
 			if visIdx >= 0 && visIdx < len(m.rowTargets) {
-				m.hoverNodeID = m.rowTargets[visIdx].nodeID
+				rt := m.rowTargets[visIdx]
+				m.hoverNodeID = rt.nodeID
+				if rt.copyX2 > rt.copyX1 && msg.X >= rt.copyX1 && msg.X < rt.copyX2 {
+					m.hoverCopyNodeID = rt.nodeID
+				}
 			}
 		}
-		return m
+		return m, nil
 	}
 
 	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
-		return m
+		return m, nil
 	}
 
 	if m.detail.open {
 		r := m.detail.rect
 		// Click outside the floating popup backdrop dismisses it cleanly!
 		if msg.X < r.x || msg.X >= r.x+r.w || msg.Y < r.y || msg.Y >= r.y+r.h {
+			m.clearSelection()
 			m.detail.open = false
-			return m
+			return m, nil
 		}
-		// Click [ × Esc ] on modal top border row.
+		// Click [ esc × ] on modal top border row.
 		if msg.Y == r.y && msg.X >= m.detail.closeZone.x1 && msg.X < m.detail.closeZone.x2 {
+			m.clearSelection()
 			m.detail.open = false
-			return m
+			return m, nil
+		}
+		// Click a section header [ Copy ] button (CODE / OUTPUT) -> 1-click copy that whole section!
+		for _, cz := range m.detail.copyZones {
+			if msg.Y == cz.y && msg.X >= cz.x1 && msg.X < cz.x2 {
+				return m, m.copyModalGroup(cz.group)
+			}
+		}
+		// Press inside the modal body -> place cursor & begin potential drag selection!
+		bodyStartY := r.y + 4
+		bodyEndY := r.y + r.h - 3
+		if msg.X > r.x && msg.X < r.x+r.w-1 && msg.Y >= bodyStartY && msg.Y < bodyEndY {
+			m.beginModalDrag(msg.X, msg.Y)
+			return m, nil
 		}
 		// Click action buttons on modal bottom action bar.
 		if msg.Y == r.y+r.h-2 {
 			for _, z := range m.detail.actionZones {
 				if msg.X >= z.x1 && msg.X < z.x2 {
 					m.detail.btnIdx = z.idx
-					m.triggerDetailAction(z.idx)
-					return m
+					return m, m.triggerDetailAction(z.idx)
 				}
 			}
 		}
-		return m
+		return m, nil
 	}
 
 	// Toolbar click (row 1).
 	if msg.Y == 1 {
+		m.clearSelection()
 		for _, z := range m.tabZones {
 			if msg.X >= z.x1 && msg.X < z.x2 {
 				m.focus = focusToolbar
 				m.activateToolbarControl(z.idx)
-				return m
+				return m, nil
 			}
 		}
-		return m
+		return m, nil
 	}
 
-	// Feed body click.
+	// Feed body press -> check inline card [ Copy ] button first; otherwise begin potential drag selection!
 	if msg.Y >= m.bodyTopY && msg.Y < m.bodyTopY+m.bodyHeight {
 		visIdx := m.scroll + (msg.Y - m.bodyTopY)
 		if visIdx >= 0 && visIdx < len(m.rowTargets) {
 			rt := m.rowTargets[visIdx]
-			if rt.nodeID == "" {
-				return m
-			}
-			now := time.Now()
-			isDouble := rt.nodeID == m.lastClickID && now.Sub(m.lastClickTime) < 400*time.Millisecond
-			m.lastClickID = rt.nodeID
-			m.lastClickTime = now
-
-			m.focus = focusFeed
-			m.selectedID = rt.nodeID
-			m.follow = false
-
-			switch {
-			case rt.action == "inspect" || isDouble:
-				m.openDetailForNode(rt.nodeID)
-			case rt.action == "toggle":
-				m.toggleNode(rt.nodeID)
-				m.syncFeedLayout()
+			if rt.copyX2 > rt.copyX1 && msg.X >= rt.copyX1 && msg.X < rt.copyX2 {
+				return m, m.copyEventNodeContent(rt.nodeID)
 			}
 		}
+		m.beginFeedDrag(msg.X, msg.Y)
 	}
-	return m
+	return m, nil
 }
 
 func (m *Model) ingestEvent(ev events.Event) {
 	if ev.SessionID != "" {
-		m.recordSession(ev.SessionID)
+		m.recordSessionEvent(ev)
 	}
 	hadNodes := len(m.nodeOrder) > 0
 
@@ -1002,6 +1329,12 @@ func (m *Model) ingestEvent(ev events.Event) {
 		if g, ok := m.groupByRun[ev.RunID]; ok {
 			evCopy := ev
 			g.endEv = &evCopy
+			for _, ch := range g.children {
+				if ch.ev.Tool == "code" {
+					ch.ev.Ops = ev.Ops
+					ch.ev.DurationMs = ev.DurationMs
+				}
+			}
 			if ev.Detail != "" || ev.Error != "" {
 				body := ev.Detail
 				if body == "" {
@@ -1017,6 +1350,9 @@ func (m *Model) ingestEvent(ev events.Event) {
 						Tool:       "result",
 						Title:      "Output / Return",
 						Status:     ev.Status,
+						DurationMs: ev.DurationMs,
+						HostOps:    ev.HostOps,
+						Ops:        ev.Ops,
 						Summary:    countLinesLabel(body),
 						Error:      ev.Error,
 						Detail:     body,
@@ -1026,6 +1362,25 @@ func (m *Model) ingestEvent(ev events.Event) {
 					},
 					expanded: ev.Status != "ok",
 				})
+			}
+			if m.detail.open && m.detail.isExecGroup && m.detail.runID == ev.RunID {
+				_, _, mw, _ := m.computeModalBounds()
+				badge, absPath, metaLine, lines := buildDetailContent(g.startEv, g.endEv, max(48, mw-6))
+				m.detail.badgeText = badge
+				if absPath != "" {
+					m.detail.absPath = absPath
+				}
+				m.detail.metaLine = metaLine
+				m.detail.lines = lines
+				m.detail.streaming = false
+				if m.detail.query != "" {
+					m.recomputeDetailMatches()
+				}
+				visCount := len(m.buildModalDisplayRows(m.modalContentWidth()))
+				m.detail.totalVis = visCount
+				if m.detail.cursor >= visCount {
+					m.detail.cursor = max(0, visCount-1)
+				}
 			}
 		}
 
@@ -1180,20 +1535,67 @@ func (m *Model) trimGroups() {
 	}
 }
 
-func (m *Model) recordSession(sid string) {
-	for _, s := range m.sessionList {
-		if s == sid {
-			return
+func (m *Model) recordSessionEvent(ev events.Event) {
+	sid := strings.TrimSpace(ev.SessionID)
+	if sid == "" {
+		return
+	}
+	info, ok := m.sessionByID[sid]
+	if !ok {
+		info = &sessionInfo{
+			id:       sid,
+			colorIdx: len(m.sessions) % len(sessionAccentStyles),
+		}
+		m.sessionByID[sid] = info
+		m.sessions = append(m.sessions, info)
+	}
+	if ev.SessionLabel != "" {
+		info.label = ev.SessionLabel
+	}
+	if ev.Cwd != "" {
+		info.cwd = ev.Cwd
+	}
+	if ts := shortTimestamp(ev.Timestamp); ts != "" {
+		info.lastTs = ts
+	}
+	switch ev.Kind {
+	case events.KindExecStart:
+		info.runs++
+		info.active++
+	case events.KindExecEnd:
+		if info.active > 0 {
+			info.active--
+		}
+	case events.KindFileCreate, events.KindFileUpdate, events.KindFileDelete, events.KindFileRename:
+		info.crud++
+	case events.KindTask:
+		if ev.Status == "running" {
+			info.tasks++
+			info.active++
+		} else if info.active > 0 && ev.StreamID != "" {
+			info.active--
 		}
 	}
-	m.sessionList = append(m.sessionList, sid)
+}
+
+func (m *Model) sessionDisplayName(sid string) string {
+	info := m.sessionByID[sid]
+	short := shortSessionID(sid)
+	if info != nil && info.label != "" {
+		return info.label
+	}
+	return "#" + short
+}
+
+func shortSessionID(sid string) string {
+	if len(sid) <= 8 {
+		return sid
+	}
+	return sid[:8]
 }
 
 func (m *Model) activeSessionFilter() string {
-	if m.sessionIdx <= 0 || m.sessionIdx > len(m.sessionList) {
-		return ""
-	}
-	return m.sessionList[m.sessionIdx-1]
+	return m.activeSessionID
 }
 
 func (m *Model) clearFeed() {
@@ -1205,6 +1607,9 @@ func (m *Model) clearFeed() {
 	m.groups = nil
 	m.groupByRun = map[string]*runGroup{}
 	m.streamByID = map[string]*streamRef{}
+	m.sessions = nil
+	m.sessionByID = map[string]*sessionInfo{}
+	m.activeSessionID = ""
 	m.nodeOrder = nil
 	m.rowTargets = nil
 	m.totalVisRows = 0
@@ -1464,7 +1869,7 @@ func (m *Model) openDetailForNode(id string) {
 	}
 }
 
-func buildDetailContent(ev events.Event, endEv *events.Event) (badge, absPath, metaLine string, lines []detailLine) {
+func buildDetailContent(ev events.Event, endEv *events.Event, wrapW int) (badge, absPath, metaLine string, lines []detailLine) {
 	badge = ev.Summary
 	if ev.Diff != nil && (ev.Diff.Added > 0 || ev.Diff.Removed > 0) {
 		badge = fmt.Sprintf("+%d -%d", ev.Diff.Added, ev.Diff.Removed)
@@ -1488,10 +1893,14 @@ func buildDetailContent(ev events.Event, endEv *events.Event) (badge, absPath, m
 	if ev.Cwd != "" {
 		metaParts = append(metaParts, "Cwd: "+ev.Cwd)
 	}
-	if ev.Status == "running" {
+	durMs := ev.DurationMs
+	if durMs == 0 && endEv != nil {
+		durMs = endEv.DurationMs
+	}
+	if ev.Status == "running" && endEv == nil {
 		metaParts = append(metaParts, "Status: running (live)")
-	} else if ev.DurationMs > 0 {
-		metaParts = append(metaParts, fmt.Sprintf("%dms", ev.DurationMs))
+	} else if durMs > 0 {
+		metaParts = append(metaParts, fmt.Sprintf("%dms", durMs))
 	}
 	if ev.Truncated {
 		metaParts = append(metaParts, "preview capped")
@@ -1499,14 +1908,80 @@ func buildDetailContent(ev events.Event, endEv *events.Event) (badge, absPath, m
 	metaLine = strings.Join(metaParts, "  ·  ")
 
 	if ev.Diff != nil && len(ev.Diff.Hunks) > 0 {
-		lines = renderDiffDetailLines(ev.Diff)
+		diffLang := detectLang(ev.Path, "", "", "")
+		if diffLang != "text" {
+			metaParts = append(metaParts, "Lang: "+diffLang)
+			metaLine = strings.Join(metaParts, "  ·  ")
+		}
+		lines = renderDiffDetailLines(ev.Diff, diffLang)
+		return strings.TrimSpace(badge), absPath, metaLine, lines
+	}
+
+	ops := ev.Ops
+	if len(ops) == 0 && endEv != nil {
+		ops = endEv.Ops
+	}
+	if len(ops) > 0 {
+		lines = append(lines, renderOpsChainDetailLines(ops, max(48, wrapW))...)
+		lines = append(lines, detailLine{})
+	}
+
+	isExecModal := ev.Kind == events.KindExecStart && ev.Tool == "exec" && endEv != nil
+	if isExecModal {
+		// Structured GrokNight Code + Output recessed cards inside exec detail popup
+		if strings.TrimSpace(ev.Detail) != "" {
+			codeText := dedentBlock(ev.Detail)
+			codeLines := strings.Split(codeText, "\n")
+			hlCode := highlightLines(codeLines, "typescript")
+			lines = append(lines, buildModalSectionHeader("CODE", "TypeScript", fmt.Sprintf("%d lines", len(codeLines)), colorCodeWell, true, 1))
+			for i, l := range codeLines {
+				gutter := styleCodeLineNum.Render(fmt.Sprintf("%5d │ ", i+1))
+				lines = append(lines, detailLine{
+					gutter:   gutter,
+					plain:    l,
+					body:     hlCode[i],
+					bgHex:    colorCodeWell,
+					panGroup: 1,
+				})
+			}
+			lines = append(lines, detailLine{})
+		}
+		outText := endEv.Detail
+		if outText == "" {
+			outText = endEv.Error
+		}
+		if outText == "" {
+			outText = "(no output returned)"
+		}
+		outLines := splitSanitizedLines(outText)
+		hlOut := highlightLines(outLines, "output")
+		outStatus := "OK"
+		outOk := endEv.Status == "ok" || endEv.Status == ""
+		if !outOk {
+			outStatus = strings.ToUpper(endEv.Status)
+		}
+		outMeta := fmt.Sprintf("%d lines", len(outLines))
+		if endEv.DurationMs > 0 {
+			outMeta = fmt.Sprintf("%d lines · %dms", len(outLines), endEv.DurationMs)
+		}
+		lines = append(lines, buildModalSectionHeader("OUTPUT", outStatus, outMeta, colorCodeWell, outOk, 2))
+		for i, l := range outLines {
+			gutter := styleCodeLineNum.Render(fmt.Sprintf("%5d │ ", i+1))
+			lines = append(lines, detailLine{
+				gutter:   gutter,
+				plain:    l,
+				body:     hlOut[i],
+				bgHex:    colorCodeWell,
+				panGroup: 2,
+			})
+		}
 		return strings.TrimSpace(badge), absPath, metaLine, lines
 	}
 
 	body := ev.Detail
 	if endEv != nil && endEv.Detail != "" {
 		if body != "" {
-			body += "\n\n--- Execution Result ---\n" + endEv.Detail
+			body += "\n\n" + endEv.Detail
 		} else {
 			body = endEv.Detail
 		}
@@ -1526,48 +2001,99 @@ func buildDetailContent(ev events.Event, endEv *events.Event) (badge, absPath, m
 		body = fmt.Sprintf("From: %s\nTo:   %s", from, to)
 	}
 	if body == "" {
-		if ev.Status == "running" {
+		if ev.Status == "running" && endEv == nil {
 			body = "(running — waiting for output…)"
 		} else {
 			body = "(no detailed payload recorded)"
 		}
 	}
-	rawLines := strings.Split(strings.ReplaceAll(strings.TrimRight(body, "\n"), "\r\n", "\n"), "\n")
+
+	lang := detectLang(ev.Path, ev.DetailKind, ev.Tool, body)
+	if lang != "text" && lang != "output" {
+		metaParts = append(metaParts, "Lang: "+lang)
+		metaLine = strings.Join(metaParts, "  ·  ")
+	}
+	if lang == "typescript" && (ev.DetailKind == "code" || ev.Tool == "code") {
+		body = dedentBlock(body)
+	}
+	rawLines := splitSanitizedLines(body)
+	hlLines := highlightLines(rawLines, lang)
+	useCodeWell := lang != "text" || ev.Kind == events.KindFileRead
+	wellBg := ""
+	if useCodeWell {
+		wellBg = colorCodeWell
+	}
 	for i, l := range rawLines {
 		gutter := styleLineNum.Render(fmt.Sprintf("%5d │ ", i+1))
+		if useCodeWell {
+			gutter = styleCodeLineNum.Render(fmt.Sprintf("%5d │ ", i+1))
+		}
 		lines = append(lines, detailLine{
-			gutter: gutter,
-			plain:  l,
-			styled: gutter + styleDiffCtx.Render(l),
+			gutter:   gutter,
+			plain:    l,
+			body:     hlLines[i],
+			bgHex:    wellBg,
+			panGroup: 1,
 		})
 	}
 	return strings.TrimSpace(badge), absPath, metaLine, lines
 }
 
-func (m *Model) openDetailForEvent(ev events.Event, endEv *events.Event) {
-	title := formatOpCallTitle(ev)
-	badge, absPath, metaLine, lines := buildDetailContent(ev, endEv)
-	isStreaming := ev.Status == "running" && ev.StreamID != ""
-	initScroll := 0
-	if isStreaming {
-		initScroll = max(0, len(lines)-m.modalPageHeight())
+func buildModalSectionHeader(tag, label, meta, _ string, okTone bool, forGroup int) detailLine {
+	tagStyle := styleSectionPillCode
+	lblStyle := styleMuted
+	if tag == "OUTPUT" {
+		if okTone {
+			tagStyle = styleSectionPillOk
+			lblStyle = styleBadgeOk
+		} else {
+			tagStyle = styleSectionPillErr
+			lblStyle = styleBadgeErr
+		}
 	}
+	plain := fmt.Sprintf("▸ %s · %s  (%s)", tag, label, meta)
+	body := styleAccent.Render("▸ ") + tagStyle.Render(" "+tag+" ") + " " + lblStyle.Render(label) + "  " + styleDim.Render("·  "+meta)
+	return detailLine{
+		plain:          plain,
+		body:           body,
+		bgHex:          colorSurfaceHi,
+		headerForGroup: forGroup,
+	}
+}
+
+func (m *Model) openDetailForEvent(ev events.Event, endEv *events.Event) {
+	m.clearSelection()
+	title := formatOpCallTitle(ev)
+	_, _, mw, _ := m.computeModalBounds()
+	badge, absPath, metaLine, lines := buildDetailContent(ev, endEv, max(48, mw-6))
+	isStreaming := ev.Status == "running" && ev.StreamID != ""
+	isExecGrp := ev.Kind == events.KindExecStart && ev.Tool == "exec"
 
 	m.detail = detailState{
-		open:       true,
-		streamID:   ev.StreamID,
-		streaming:  isStreaming,
-		followTail: isStreaming,
-		title:      title,
-		badgeText:  badge,
-		absPath:    absPath,
-		oldAbsPath: ev.OldAbsPath,
-		cwd:        ev.Cwd,
-		metaLine:   metaLine,
-		lines:      lines,
-		scroll:     initScroll,
-		btnIdx:     0,
-		hoverBtn:   -1,
+		open:         true,
+		focus:        modalFocusBody,
+		runID:        ev.RunID,
+		isExecGroup:  isExecGrp,
+		streamID:     ev.StreamID,
+		streaming:    isStreaming || (isExecGrp && endEv == nil),
+		followTail:   isStreaming,
+		wrap:         m.detailWrap,
+		title:        title,
+		badgeText:    badge,
+		absPath:      absPath,
+		oldAbsPath:   ev.OldAbsPath,
+		cwd:          ev.Cwd,
+		metaLine:     metaLine,
+		lines:        lines,
+		scroll:       0,
+		cursor:       0,
+		groupHScroll: nil,
+		btnIdx:       0,
+		hoverBtn:     -1,
+		hoverRow:     -1,
+	}
+	if isStreaming {
+		m.jumpDetailBottom()
 	}
 }
 
@@ -1575,7 +2101,8 @@ func (m *Model) refreshOpenDetailForStream(ev events.Event) {
 	if !m.detail.open || m.detail.streamID == "" || m.detail.streamID != ev.StreamID {
 		return
 	}
-	badge, absPath, metaLine, lines := buildDetailContent(ev, nil)
+	_, _, mw, _ := m.computeModalBounds()
+	badge, absPath, metaLine, lines := buildDetailContent(ev, nil, max(48, mw-6))
 	m.detail.badgeText = badge
 	if absPath != "" {
 		m.detail.absPath = absPath
@@ -1586,54 +2113,298 @@ func (m *Model) refreshOpenDetailForStream(ev events.Event) {
 	if m.detail.query != "" {
 		m.recomputeDetailMatches()
 	}
+	visCount := len(m.buildModalDisplayRows(m.modalContentWidth()))
+	m.detail.totalVis = visCount
 	page := m.modalPageHeight()
-	maxScroll := max(0, len(m.detail.lines)-page)
+	maxScroll := max(0, visCount-page)
 	if m.detail.followTail {
 		m.detail.scroll = maxScroll
-	} else if m.detail.scroll > maxScroll {
-		m.detail.scroll = maxScroll
+		m.detail.cursor = max(0, visCount-1)
+	} else {
+		if m.detail.scroll > maxScroll {
+			m.detail.scroll = maxScroll
+		}
+		if m.detail.cursor >= visCount {
+			m.detail.cursor = max(0, visCount-1)
+		}
 	}
 }
 
-func renderDiffDetailLines(d *diff.Result) []detailLine {
+func renderDiffDetailLines(d *diff.Result, lang string) []detailLine {
 	var out []detailLine
 	for hi, h := range d.Hunks {
 		if hi > 0 {
 			sep := fmt.Sprintf("  ⋯   │  @@ -%d,%d +%d,%d @@", h.OldStart, h.OldCount, h.NewStart, h.NewCount)
-			out = append(out, detailLine{plain: sep, styled: styleHunkSep.Render(sep)})
+			out = append(out, detailLine{plain: sep, body: styleHunkSep.Render(sep)})
 		}
 		for _, dl := range h.Lines {
-			bgHex := ""
+			var gutter, body, bgHex string
 			switch dl.Kind {
 			case diff.LineAdd:
+				gutter = styleDiffAddNum.Render(fmt.Sprintf("%4d │ ", dl.NewLine))
+				body = renderSpannedLine("+ ", dl.Text, dl.Spans, styleDiffAddBg, styleDiffAddHi)
 				bgHex = colorDiffAddBg
 			case diff.LineDel:
+				gutter = styleDiffDelNum.Render(fmt.Sprintf("%4d │ ", dl.OldLine))
+				body = renderSpannedLine("- ", dl.Text, dl.Spans, styleDiffDelBg, styleDiffDelHi)
 				bgHex = colorDiffDelBg
+			default:
+				n := dl.NewLine
+				if n == 0 {
+					n = dl.OldLine
+				}
+				gutter = styleLineNum.Render(fmt.Sprintf("%4d │ ", n))
+				body = "  " + highlightLineByLang(dl.Text, lang)
 			}
 			out = append(out, detailLine{
-				gutter: formatDiffGutter(dl),
-				plain:  dl.Text,
-				styled: renderColoredDiffLine(dl, 0),
-				bgHex:  bgHex,
+				gutter:   gutter,
+				plain:    sanitizePlainLine(dl.Text),
+				body:     body,
+				bgHex:    bgHex,
+				panGroup: 1,
 			})
 		}
 	}
 	if d.Truncated {
 		note := fmt.Sprintf("  ⋯   │  ... diff truncated (total +%d -%d lines)", d.Added, d.Removed)
-		out = append(out, detailLine{plain: note, styled: styleHunkSep.Render(note)})
+		out = append(out, detailLine{plain: note, body: styleHunkSep.Render(note)})
 	}
 	return out
 }
 
-func (m *Model) scrollDetail(delta int) {
+func (m *Model) modalContentWidth() int {
+	_, _, mw, _ := m.computeModalBounds()
+	innerW := max(20, mw-2)
+	return max(10, innerW-2) // 1 left margin/cursor col + 1 right scrollbar col
+}
+
+func (m *Model) moveDetailCursor(delta int) {
+	visRows := m.buildModalDisplayRows(m.modalContentWidth())
+	total := len(visRows)
+	m.detail.totalVis = total
+	if total == 0 {
+		m.detail.cursor = 0
+		m.detail.scroll = 0
+		return
+	}
 	page := m.modalPageHeight()
-	maxScroll := max(0, len(m.detail.lines)-page)
+	m.detail.cursor = max(0, min(total-1, m.detail.cursor+delta))
+	if m.detail.cursor < m.detail.scroll {
+		m.detail.scroll = m.detail.cursor
+	} else if m.detail.cursor >= m.detail.scroll+page {
+		m.detail.scroll = m.detail.cursor - page + 1
+	}
+	maxScroll := max(0, total-page)
+	m.detail.scroll = max(0, min(maxScroll, m.detail.scroll))
+	if m.sel.active && m.sel.scope == selScopeModal && m.sel.lineMode {
+		m.sel.focusRow = m.detail.cursor
+	}
+	if delta < 0 {
+		m.detail.followTail = false
+	} else if m.detail.cursor >= total-1 {
+		m.detail.followTail = true
+	}
+}
+
+func (m *Model) scrollDetail(delta int) {
+	visRows := m.buildModalDisplayRows(m.modalContentWidth())
+	total := len(visRows)
+	m.detail.totalVis = total
+	page := m.modalPageHeight()
+	maxScroll := max(0, total-page)
 	m.detail.scroll = max(0, min(maxScroll, m.detail.scroll+delta))
+	if total > 0 {
+		if m.detail.cursor < m.detail.scroll {
+			m.detail.cursor = m.detail.scroll
+		} else if m.detail.cursor >= m.detail.scroll+page {
+			m.detail.cursor = min(total-1, m.detail.scroll+page-1)
+		}
+		if m.sel.active && m.sel.scope == selScopeModal && m.sel.lineMode {
+			m.sel.focusRow = m.detail.cursor
+		}
+	}
 	if delta < 0 {
 		m.detail.followTail = false
 	} else if m.detail.scroll >= maxScroll {
 		m.detail.followTail = true
 	}
+}
+
+func (m *Model) jumpDetailTop() {
+	m.detail.scroll = 0
+	m.detail.cursor = 0
+	m.detail.followTail = false
+	if m.sel.active && m.sel.scope == selScopeModal && m.sel.lineMode {
+		m.sel.focusRow = 0
+	}
+}
+
+func (m *Model) jumpDetailBottom() {
+	visRows := m.buildModalDisplayRows(m.modalContentWidth())
+	total := len(visRows)
+	m.detail.totalVis = total
+	page := m.modalPageHeight()
+	m.detail.scroll = max(0, total-page)
+	m.detail.cursor = max(0, total-1)
+	m.detail.followTail = true
+	if m.sel.active && m.sel.scope == selScopeModal && m.sel.lineMode {
+		m.sel.focusRow = m.detail.cursor
+	}
+}
+
+func detailPanGroupAtRow(visRows []modalVisRow, idx int) int {
+	if idx < 0 || idx >= len(visRows) {
+		return 0
+	}
+	vr := visRows[idx]
+	if vr.panGroup > 0 {
+		return vr.panGroup
+	}
+	if vr.headerForGroup > 0 {
+		return vr.headerForGroup
+	}
+	return 0
+}
+
+func (m *Model) detailActivePanGroup(visRows []modalVisRow) int {
+	return detailPanGroupAtRow(visRows, m.detail.cursor)
+}
+
+func (m *Model) detailGroupHScroll(group int) int {
+	if m.detail.wrap || group <= 0 || m.detail.groupHScroll == nil {
+		return 0
+	}
+	return m.detail.groupHScroll[group]
+}
+
+func (m *Model) setDetailGroupHScroll(group, offset int) {
+	if group <= 0 {
+		return
+	}
+	if offset <= 0 {
+		if m.detail.groupHScroll != nil {
+			delete(m.detail.groupHScroll, group)
+		}
+		return
+	}
+	if m.detail.groupHScroll == nil {
+		m.detail.groupHScroll = make(map[int]int)
+	}
+	m.detail.groupHScroll[group] = offset
+}
+
+func detailGroupMaxHScroll(visRows []modalVisRow, contentW, group int) int {
+	if group <= 0 {
+		return 0
+	}
+	maxH := 0
+	for _, vr := range visRows {
+		if vr.panGroup != group {
+			continue
+		}
+		gw := ansi.StringWidth(vr.gutter)
+		avail := max(4, contentW-gw)
+		if over := vr.bodyWidth - avail; over > maxH {
+			maxH = over
+		}
+	}
+	return maxH
+}
+
+func (m *Model) activeDetailHScroll() int {
+	if m.detail.wrap {
+		return 0
+	}
+	contentW := m.modalContentWidth()
+	visRows := m.buildModalDisplayRows(contentW)
+	grp := m.detailActivePanGroup(visRows)
+	if grp <= 0 {
+		return 0
+	}
+	maxH := detailGroupMaxHScroll(visRows, contentW, grp)
+	return min(m.detailGroupHScroll(grp), maxH)
+}
+
+func (m *Model) panDetailGroup(visRows []modalVisRow, contentW, group, delta int) {
+	if m.detail.wrap || group <= 0 {
+		return
+	}
+	maxH := detailGroupMaxHScroll(visRows, contentW, group)
+	cur := min(m.detailGroupHScroll(group), maxH)
+	m.setDetailGroupHScroll(group, max(0, min(maxH, cur+delta)))
+}
+
+func (m *Model) panDetailHorizontal(delta int) {
+	if m.detail.wrap {
+		return
+	}
+	contentW := m.modalContentWidth()
+	visRows := m.buildModalDisplayRows(contentW)
+	grp := m.detailActivePanGroup(visRows)
+	m.panDetailGroup(visRows, contentW, grp, delta)
+}
+
+func (m *Model) panDetailHoverOrActive(delta int) {
+	if m.detail.wrap {
+		return
+	}
+	contentW := m.modalContentWidth()
+	visRows := m.buildModalDisplayRows(contentW)
+	grp := detailPanGroupAtRow(visRows, m.detail.hoverRow)
+	if grp <= 0 {
+		grp = m.detailActivePanGroup(visRows)
+	}
+	m.panDetailGroup(visRows, contentW, grp, delta)
+}
+
+func (m *Model) resetActiveDetailHScroll() {
+	if m.detail.wrap {
+		return
+	}
+	contentW := m.modalContentWidth()
+	visRows := m.buildModalDisplayRows(contentW)
+	grp := m.detailActivePanGroup(visRows)
+	m.setDetailGroupHScroll(grp, 0)
+}
+
+func (m *Model) panDetailToGroupEnd() {
+	if m.detail.wrap {
+		return
+	}
+	contentW := m.modalContentWidth()
+	visRows := m.buildModalDisplayRows(contentW)
+	grp := m.detailActivePanGroup(visRows)
+	if grp <= 0 {
+		return
+	}
+	maxH := detailGroupMaxHScroll(visRows, contentW, grp)
+	m.setDetailGroupHScroll(grp, maxH)
+}
+
+func (m *Model) toggleDetailWrap() {
+	contentW := m.modalContentWidth()
+	oldRows := m.buildModalDisplayRows(contentW)
+	curLogical := 0
+	if m.detail.cursor >= 0 && m.detail.cursor < len(oldRows) {
+		curLogical = oldRows[m.detail.cursor].logicalIdx
+	}
+	m.detail.wrap = !m.detail.wrap
+	m.detailWrap = m.detail.wrap
+	m.detail.groupHScroll = nil
+
+	newRows := m.buildModalDisplayRows(contentW)
+	m.detail.totalVis = len(newRows)
+	newCursor := 0
+	for i, vr := range newRows {
+		if vr.logicalIdx >= curLogical {
+			newCursor = i
+			break
+		}
+	}
+	m.detail.cursor = newCursor
+	page := m.modalPageHeight()
+	maxScroll := max(0, len(newRows)-page)
+	m.detail.scroll = max(0, min(maxScroll, newCursor-page/3))
 }
 
 func compileSearchRegex(q string) *regexp.Regexp {
@@ -1673,12 +2444,42 @@ func (m *Model) jumpDetailToMatch(cursor int) {
 	if cursor < 0 || cursor >= len(m.detail.matches) {
 		return
 	}
-	lineIdx := m.detail.matches[cursor]
+	logicalIdx := m.detail.matches[cursor]
+	contentW := m.modalContentWidth()
+	visRows := m.buildModalDisplayRows(contentW)
+	m.detail.totalVis = len(visRows)
+	visIdx := logicalIdx
+	for i, vr := range visRows {
+		if vr.logicalIdx == logicalIdx {
+			visIdx = i
+			break
+		}
+	}
 	page := m.modalPageHeight()
-	targetScroll := max(0, lineIdx-page/3)
-	maxScroll := max(0, len(m.detail.lines)-page)
+	m.detail.cursor = max(0, min(max(0, len(visRows)-1), visIdx))
+	targetScroll := max(0, m.detail.cursor-page/3)
+	maxScroll := max(0, len(visRows)-page)
 	m.detail.scroll = min(maxScroll, targetScroll)
 	m.detail.followTail = false
+
+	// When horizontal pan is active (wrap=false), auto-pan the match's section block so off-screen match jumps into view!
+	if !m.detail.wrap && logicalIdx >= 0 && logicalIdx < len(m.detail.lines) {
+		dl := m.detail.lines[logicalIdx]
+		if dl.panGroup > 0 {
+			if re := compileSearchRegex(m.detail.query); re != nil {
+				if loc := re.FindStringIndex(dl.plain); loc != nil {
+					matchCol := ansi.StringWidth(dl.plain[:loc[0]])
+					gw := ansi.StringWidth(dl.gutter)
+					avail := max(8, contentW-gw)
+					curH := m.detailGroupHScroll(dl.panGroup)
+					if matchCol < curH || matchCol >= curH+avail-4 {
+						maxH := detailGroupMaxHScroll(visRows, contentW, dl.panGroup)
+						m.setDetailGroupHScroll(dl.panGroup, max(0, min(maxH, matchCol-8)))
+					}
+				}
+			}
+		}
+	}
 }
 
 func (m *Model) groupMatchesTab(g *runGroup) bool {
@@ -1751,6 +2552,7 @@ func countLinesLabel(s string) string {
 }
 
 func clampLineWidth(s string, maxWidth int) string {
+	s = sanitizeStyledLine(s)
 	if maxWidth <= 0 {
 		return s
 	}

@@ -110,7 +110,7 @@ Advanced flags (run 'mcplex serve -h' for full list):
 func parseToolSet(spec string) (mcpserver.ToolSet, error) {
 	raw := strings.ToLower(strings.TrimSpace(spec))
 	if raw == "" || raw == "all" {
-		return mcpserver.ToolSet{Read: true, Tasks: true}, nil
+		return mcpserver.ToolSet{Read: true, Tasks: true, Docs: true}, nil
 	}
 	if raw == "exec" || raw == "minimal" {
 		return mcpserver.ToolSet{}, nil
@@ -124,12 +124,15 @@ func parseToolSet(spec string) (mcpserver.ToolSet, error) {
 		case "all":
 			ts.Read = true
 			ts.Tasks = true
+			ts.Docs = true
 		case "read":
 			ts.Read = true
 		case "tasks", "task", "spawn":
 			ts.Tasks = true
+		case "docs", "help", "guide":
+			ts.Docs = true
 		default:
-			return mcpserver.ToolSet{}, fmt.Errorf("unknown tool %q (allowed: all, exec, read, tasks, spawn, task)", p)
+			return mcpserver.ToolSet{}, fmt.Errorf("unknown tool %q (allowed: all, exec, read, tasks, spawn, task, docs)", p)
 		}
 	}
 	return ts, nil
@@ -138,11 +141,21 @@ func parseToolSet(spec string) (mcpserver.ToolSet, error) {
 func runSkill(args []string) {
 	fs := flag.NewFlagSet("skill", flag.ExitOnError)
 	toolsFlag := fs.String("tools", "all", "Tool profile to render guide for (all, exec, or comma-separated list)")
+	topicFlag := fs.String("topic", "", "Optional docs topic (e.g. fs, tx, sh, tasks, errors, patterns, all)")
+	queryFlag := fs.String("query", "", "Optional keyword search query across MCPlex docs")
 	_ = fs.Parse(args)
 	ts, err := parseToolSet(*toolsFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid --tools value: %v\n", err)
 		os.Exit(1)
+	}
+	topic := strings.TrimSpace(*topicFlag)
+	if topic == "" && fs.NArg() > 0 {
+		topic = strings.TrimSpace(fs.Arg(0))
+	}
+	if topic != "" || strings.TrimSpace(*queryFlag) != "" {
+		fmt.Println(skill.Lookup(topic, *queryFlag, ts.Read, ts.Tasks))
+		return
 	}
 	fmt.Print(skill.FullGuideForTools(ts.Read, ts.Tasks))
 }

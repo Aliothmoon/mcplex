@@ -862,6 +862,22 @@ func planSingleFile(absPath, relPath string, spec FileEditSpec) (plannedFileWrit
 					actualLine := offsetToLineNumber(lineStarts, actualOff)
 					return plannedFileWrite{}, sandbox.NewHostError(sandbox.KindNoMatch, map[string]any{"lines": []int{actualLine}}, "%s hunk %d: target not in %s; exact match at L%d", relPath, hIdx+1, scope, actualLine)
 				}
+				// Fallback: quote-aware horizontal whitespace & indent normalization when strictly unique (count == 1).
+				if h.Nth <= 1 {
+					wsStart, wsEnd, wsRepl, wsLines := matchWhitespaceNormalized(windowText, normTarget, normRepl, relPath, winStart, lineStarts)
+					if len(wsLines) == 1 {
+						spans = append(spans, span{start: winStart + wsStart, end: winStart + wsEnd, repl: wsRepl, idx: hIdx})
+						continue
+					}
+					if len(wsLines) > 1 {
+						where := make([]string, len(wsLines))
+						for i, l := range wsLines {
+							where[i] = symbolAt(outline(), l, sep)
+						}
+						return plannedFileWrite{}, sandbox.NewHostError(sandbox.KindAmbiguous, map[string]any{"lines": wsLines, "symbols": where},
+							"%s hunk %d: target matches %d places via whitespace normalization (%s); set symbol or startLine/endLine", relPath, hIdx+1, len(wsLines), formatMatchList(wsLines, where, 6))
+					}
+				}
 				hint := closestLineHint(normText, normTarget)
 				return plannedFileWrite{}, sandbox.NewHostError(sandbox.KindNoMatch, nil, "%s hunk %d: target not found%s", relPath, hIdx+1, hint)
 			}
@@ -974,17 +990,298 @@ func lineWindowBounds(text string, starts []int, startLine, endLine int) (int, i
 	return winStart, winEnd, nil
 }
 
-// closestLineHint finds the closest matching anchor line in the file so the caller can self-correct without an extra read turn.
-func closestLineHint(fileText, target string) string {
-	targetLines := strings.Split(target, "\n")
-	anchor := ""
-	for _, l := range targetLines {
-		t := strings.TrimSpace(l)
-		if utf8.RuneCountInString(t) >= 3 {
-			anchor = t
+type winLineSpan struct {
+	start int // byte offset relative to windowText
+	end   int // byte offset relative to windowText (excluding '\n')
+	raw   string
+}
+
+func splitWindowLines(windowText string) []winLineSpan {
+	var out []winLineSpan
+	lineStart := 0
+	for i := 0; i < len(windowText); i++ {
+		if windowText[i] == '\n' {
+			out = append(out, winLineSpan{start: lineStart, end: i, raw: windowText[lineStart:i]})
+			lineStart = i + 1
+		}
+	}
+	if lineStart <= len(windowText) {
+		out = append(out, winLineSpan{start: lineStart, end: len(windowText), raw: windowText[lineStart:]})
+	}
+	return out
+}
+
+func isIndentSensitivePath(relPath string) bool {
+	base := strings.ToLower(filepath.Base(relPath))
+	if base == "makefile" || base == "gnumakefile" {
+		return true
+	}
+	switch strings.ToLower(filepath.Ext(relPath)) {
+	case ".py", ".pyw", ".yaml", ".yml", ".star", ".mk":
+		return true
+	}
+	return false
+}
+
+func splitLeadingHSpace(s string) (lead, rest string) {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	return s[:i], strings.TrimRight(s[i:], " \t")
+}
+
+// canonicalizeCodeLine collapses runs of horizontal whitespace (' ' / '\t') OUTSIDE string literals
+// while preserving exact characters inside "...", '...', and `...`.
+func canonicalizeCodeLine(s string, keepIndent bool) string {
+	lead, rest := splitLeadingHSpace(s)
+	var b strings.Builder
+	b.Grow(len(s) + 4)
+	if keepIndent {
+		for i := 0; i < len(lead); i++ {
+			if lead[i] == '\t' {
+				b.WriteString("    ")
+			} else {
+				b.WriteByte(' ')
+			}
+		}
+		b.WriteString("::")
+	}
+	inQuote := rune(0)
+	escaped := false
+	inSpace := false
+	for _, r := range rest {
+		if inQuote != 0 {
+			b.WriteRune(r)
+			if inQuote != '`' && escaped {
+				escaped = false
+				continue
+			}
+			if inQuote != '`' && r == '\\' {
+				escaped = true
+				continue
+			}
+			if r == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		if r == '"' || r == '\'' || r == '`' {
+			if inSpace {
+				b.WriteByte(' ')
+				inSpace = false
+			}
+			inQuote = r
+			b.WriteRune(r)
+			continue
+		}
+		if r == ' ' || r == '\t' {
+			inSpace = true
+			continue
+		}
+		if inSpace {
+			b.WriteByte(' ')
+			inSpace = false
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// matchWhitespaceNormalized attempts a quote-aware horizontal whitespace / indent normalized line-block
+// match inside windowText. It succeeds ONLY if target contains substantive code tokens (>=6 alnum/CJK runes)
+// and matches strictly 1 unique location (or returns >1 line numbers so caller reports KindAmbiguous).
+func matchWhitespaceNormalized(windowText, normTarget, normRepl, relPath string, winStart int, lineStarts []int) (start, end int, adjustedRepl string, matchedLineNums []int) {
+	trimmedTarget := strings.TrimSuffix(normTarget, "\n")
+	hasTrailingNL := strings.HasSuffix(normTarget, "\n")
+	if trimmedTarget == "" {
+		return 0, 0, "", nil
+	}
+	identRunes := 0
+	for _, r := range trimmedTarget {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			identRunes++
+		}
+	}
+	if identRunes < 6 {
+		return 0, 0, "", nil
+	}
+
+	keepIndent := isIndentSensitivePath(relPath)
+	tLines := strings.Split(trimmedTarget, "\n")
+	k := len(tLines)
+	wLines := splitWindowLines(windowText)
+	if len(wLines) < k {
+		return 0, 0, "", nil
+	}
+
+	tCanon := make([]string, k)
+	for i, tl := range tLines {
+		tCanon[i] = canonicalizeCodeLine(tl, keepIndent)
+	}
+
+	var hitIndices []int
+	for i := 0; i <= len(wLines)-k; i++ {
+		ok := true
+		for j := 0; j < k; j++ {
+			if canonicalizeCodeLine(wLines[i+j].raw, keepIndent) != tCanon[j] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			hitIndices = append(hitIndices, i)
+			matchedLineNums = append(matchedLineNums, offsetToLineNumber(lineStarts, winStart+wLines[i].start))
+		}
+	}
+	if len(hitIndices) != 1 {
+		return 0, 0, "", matchedLineNums
+	}
+
+	idx := hitIndices[0]
+	start = wLines[idx].start
+	end = wLines[idx+k-1].end
+	if hasTrailingNL && end < len(windowText) && windowText[end] == '\n' {
+		end++
+	}
+
+	adjustedRepl = realignReplacementIndent(wLines[idx:idx+k], tLines, normRepl, keepIndent)
+	return start, end, adjustedRepl, matchedLineNums
+}
+
+// realignReplacementIndent adjusts uniform leading-indent drift between targetLines and matched fileLines
+// so over- or under-indented hunks land with the file's actual indentation.
+func realignReplacementIndent(matched []winLineSpan, tLines []string, normRepl string, keepIndent bool) string {
+	if keepIndent || len(matched) == 0 || len(matched) != len(tLines) {
+		return normRepl
+	}
+	hasTrailingNL := strings.HasSuffix(normRepl, "\n")
+	replBody := strings.TrimSuffix(normRepl, "\n")
+	rLines := strings.Split(replBody, "\n")
+
+	// Check if every non-empty target line is uniformly over-indented by extraPrefix relative to matched file lines,
+	// or uniformly under-indented by missingPrefix.
+	extraPrefix := ""
+	missingPrefix := ""
+	mode := 0 // 0=init, 1=target has extraPrefix, 2=target lacks missingPrefix, -1=mixed
+	for i := range tLines {
+		if strings.TrimSpace(tLines[i]) == "" {
+			continue
+		}
+		fLead, _ := splitLeadingHSpace(matched[i].raw)
+		tLead, _ := splitLeadingHSpace(tLines[i])
+		if fLead == tLead {
+			mode = -1
+			break
+		}
+		if strings.HasPrefix(tLead, fLead) {
+			diff := tLead[len(fLead):]
+			if mode == 0 {
+				mode = 1
+				extraPrefix = diff
+			} else if mode != 1 || diff != extraPrefix {
+				mode = -1
+				break
+			}
+		} else if strings.HasPrefix(fLead, tLead) {
+			diff := fLead[len(tLead):]
+			if mode == 0 {
+				mode = 2
+				missingPrefix = diff
+			} else if mode != 2 || diff != missingPrefix {
+				mode = -1
+				break
+			}
+		} else {
+			mode = -1
 			break
 		}
 	}
+
+	switch mode {
+	case 1:
+		// Strip extraPrefix if every non-empty replacement line also carries it.
+		allHave := true
+		for _, rl := range rLines {
+			if strings.TrimSpace(rl) != "" && !strings.HasPrefix(rl, extraPrefix) {
+				allHave = false
+				break
+			}
+		}
+		if allHave {
+			for i, rl := range rLines {
+				if strings.TrimSpace(rl) != "" {
+					rLines[i] = rl[len(extraPrefix):]
+				}
+			}
+		}
+	case 2:
+		for i, rl := range rLines {
+			if strings.TrimSpace(rl) != "" {
+				rLines[i] = missingPrefix + rl
+			}
+		}
+	default:
+		// Special case: caller omitted leading indent ONLY on line 0 of both target and replacement.
+		fLead0, _ := splitLeadingHSpace(matched[0].raw)
+		tLead0, _ := splitLeadingHSpace(tLines[0])
+		rLead0, _ := splitLeadingHSpace(rLines[0])
+		if fLead0 != "" && tLead0 == "" && rLead0 == "" && strings.TrimSpace(rLines[0]) != "" {
+			rLines[0] = fLead0 + rLines[0]
+		}
+	}
+
+	out := strings.Join(rLines, "\n")
+	if hasTrailingNL {
+		out += "\n"
+	}
+	return out
+}
+
+func isBoilerplateAnchorLine(trimmed string) bool {
+	low := strings.ToLower(trimmed)
+	switch low {
+	case "}", ")", "]", "} else {", "else {", "else", "return", "return nil", "return err",
+		"break", "continue", "default:", "try {", "} catch {", "finally {":
+		return true
+	}
+	return false
+}
+
+// selectBestAnchorLine picks the most distinctive line in targetLines (highest identifier/CJK content)
+// instead of blindly stopping at a leading '} else {' or closing brace.
+func selectBestAnchorLine(targetLines []string) (bestIdx int, bestAnchor string) {
+	bestIdx = -1
+	bestRank := -1
+	for idx, l := range targetLines {
+		t := strings.TrimSpace(l)
+		rc := utf8.RuneCountInString(t)
+		if rc < 3 {
+			continue
+		}
+		alnum := 0
+		for _, r := range t {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+				alnum++
+			}
+		}
+		rank := alnum*3 + minInt(rc, 80)
+		if isBoilerplateAnchorLine(t) {
+			rank = 1
+		}
+		if rank > bestRank {
+			bestRank = rank
+			bestIdx = idx
+			bestAnchor = t
+		}
+	}
+	return bestIdx, bestAnchor
+}
+
+// closestLineHint finds the closest matching anchor line in the file so the caller can self-correct without an extra read turn.
+func closestLineHint(fileText, target string) string {
+	targetLines := strings.Split(target, "\n")
+	anchorIdx, anchor := selectBestAnchorLine(targetLines)
 	if anchor == "" {
 		return ""
 	}
@@ -1060,6 +1357,24 @@ func closestLineHint(fileText, target string) string {
 				}
 			}
 		}
+		// Multi-line neighborhood tie-breaker when target has multiple lines.
+		if score >= 35 && len(targetLines) > 1 {
+			bonus := 0
+			for off := -3; off <= 3; off++ {
+				if off == 0 {
+					continue
+				}
+				ti := anchorIdx + off
+				fi := i + off
+				if ti >= 0 && ti < len(targetLines) && fi >= 0 && fi < len(fileLines) {
+					tt := strings.TrimSpace(targetLines[ti])
+					if tt != "" && strings.TrimSpace(fileLines[fi]) == tt {
+						bonus += 5
+					}
+				}
+			}
+			score += minInt(bonus, 25)
+		}
 		if score > bestScore {
 			bestScore = score
 			bestIdx = i
@@ -1068,8 +1383,9 @@ func closestLineHint(fileText, target string) string {
 	if bestIdx < 0 || bestScore < 35 {
 		return ""
 	}
-	from := maxInt(0, bestIdx-1)
-	to := minInt(len(fileLines)-1, bestIdx+minInt(len(targetLines), 5))
+	hunkTop := maxInt(0, bestIdx-anchorIdx)
+	from := maxInt(0, hunkTop-1)
+	to := minInt(len(fileLines)-1, maxInt(bestIdx+2, hunkTop+minInt(len(targetLines), 8)))
 	var snip []string
 	for i := from; i <= to; i++ {
 		line := fileLines[i]

@@ -16,7 +16,9 @@ import (
 	"time"
 
 	"github.com/aliothmoon/mcplex/pkg/capabilities"
+	"github.com/aliothmoon/mcplex/pkg/events"
 	ptcruntime "github.com/aliothmoon/mcplex/pkg/runtime"
+	"github.com/aliothmoon/mcplex/pkg/skill"
 	"github.com/aliothmoon/mcplex/pkg/tasks"
 	"github.com/aliothmoon/mcplex/pkg/version"
 )
@@ -58,6 +60,7 @@ type rpcError struct {
 type ToolSet struct {
 	Read  bool // expose standalone `read` tool (text ranges, tail, byteOffset, multimodal images)
 	Tasks bool // expose `spawn` + `task` background process & daemon toolset
+	Docs  bool // expose on-demand `docs` lookup tool (topic/keyword reference for exec APIs & patterns)
 }
 
 // ServerOptions customizes server identity, toolset, initialize instructions, exec description, and skill resources.
@@ -423,7 +426,11 @@ func (s *Server) handleSingle(ctx context.Context, req jsonRPCRequest) *jsonRPCR
 	switch req.Method {
 	case "initialize":
 		var params struct {
-			ProtocolVersion  string `json:"protocolVersion"`
+			ProtocolVersion string `json:"protocolVersion"`
+			ClientInfo      struct {
+				Name    string `json:"name"`
+				Version string `json:"version"`
+			} `json:"clientInfo"`
 			RootPath         string `json:"rootPath"`
 			RootURI          string `json:"rootUri"`
 			WorkspaceFolders []struct {
@@ -434,6 +441,11 @@ func (s *Server) handleSingle(ctx context.Context, req jsonRPCRequest) *jsonRPCR
 		_ = json.Unmarshal(req.Params, &params)
 		if ws := extractInitWorkspace(params.RootPath, params.RootURI, params.WorkspaceFolders); ws != "" && s.Engine != nil {
 			s.Engine.SetClientWorkspace(ws)
+		}
+		if sid != "" && s.Engine != nil && s.Engine.EventHub() != nil {
+			if name := strings.TrimSpace(params.ClientInfo.Name); name != "" {
+				s.Engine.EventHub().SetSessionLabel(sid, name)
+			}
 		}
 		proto := DefaultProtocolVersion
 		if supportedProtocols[strings.TrimSpace(params.ProtocolVersion)] {
@@ -472,6 +484,9 @@ func (s *Server) handleSingle(ctx context.Context, req jsonRPCRequest) *jsonRPCR
 		}
 		if s.opts.Tools.Tasks {
 			tools = append(tools, s.spawnToolDefinition(), s.taskToolDefinition())
+		}
+		if s.opts.Tools.Docs {
+			tools = append(tools, s.docsToolDefinition())
 		}
 		return &jsonRPCResponse{
 			JSONRPC: "2.0",
@@ -707,8 +722,71 @@ func (s *Server) dispatchToolCall(ctx context.Context, id json.RawMessage, name 
 		}
 		return toolTextResponse(id, formatted, false)
 
+	case "docs":
+		if !s.opts.Tools.Docs {
+			return unknownToolResponse(id, name)
+		}
+		var req struct {
+			Topic string `json:"topic"`
+			Query string `json:"query"`
+		}
+		if trimmed := bytes.TrimSpace(rawArgs); len(trimmed) > 0 {
+			if trimmed[0] == '"' {
+				_ = json.Unmarshal(trimmed, &req.Topic)
+			} else if err := json.Unmarshal(trimmed, &req); err != nil {
+				return toolTextResponse(id, "BadArgs: invalid docs arguments: "+err.Error(), true)
+			}
+		}
+		text := skill.Lookup(req.Topic, req.Query, s.opts.Tools.Read, s.opts.Tools.Tasks)
+		if s.Engine != nil && s.Engine.EventHub().Active() {
+			title := strings.TrimSpace(req.Topic)
+			if q := strings.TrimSpace(req.Query); q != "" {
+				if title != "" {
+					title += " · " + q
+				} else {
+					title = q
+				}
+			}
+			if title == "" {
+				title = "index"
+			}
+			preview, trunc := events.CapPreview(text, events.DefaultReadPreview)
+			s.Engine.EventHub().Emit(events.Event{
+				Kind:       events.KindSearch,
+				SessionID:  ptcruntime.SessionIDFromContext(ctx),
+				Tool:       "docs",
+				Title:      "docs:" + title,
+				Status:     "ok",
+				Summary:    fmt.Sprintf("%dB", len(text)),
+				Detail:     preview,
+				DetailKind: "text",
+				Truncated:  trunc,
+			})
+		}
+		return toolTextResponse(id, text, false)
+
 	default:
 		return unknownToolResponse(id, name)
+	}
+}
+
+func (s *Server) docsToolDefinition() map[string]any {
+	return map[string]any{
+		"name":        "docs",
+		"description": "Look up MCPlex API signatures, options, error fixes, and runnable examples on demand (zero sandbox overhead). Call with `{}` for the topic index, `{ topic }` for a specific namespace (overview, fs, search, ast, edit, tx, sh, git, tasks, state, mcp, globals, errors, patterns, all), or `{ query }` to search by keyword.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"topic": map[string]any{
+					"type":        "string",
+					"description": "Topic ID or alias (e.g. 'fs', 'search', 'ast', 'edit', 'tx', 'sh', 'git', 'tasks', 'state', 'mcp', 'globals', 'errors', 'patterns', 'all'). Omit for the topic index.",
+				},
+				"query": map[string]any{
+					"type":        "string",
+					"description": "Optional keyword search across all MCPlex docs (e.g. 'rollback', 'expect regex', 'tail', 'intraline').",
+				},
+			},
+		},
 	}
 }
 

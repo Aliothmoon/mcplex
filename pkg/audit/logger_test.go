@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/aliothmoon/mcplex/pkg/sandbox"
 )
 
 func TestAuditDisableEnvVar(t *testing.T) {
@@ -36,5 +38,22 @@ func TestClassifyErrorUpdatedPatterns(t *testing.T) {
 		if got := ClassifyError(tc.phase, tc.msg, nil); got != tc.want {
 			t.Errorf("ClassifyError(%q, %q) = %q, want %q", tc.phase, tc.msg, got, tc.want)
 		}
+	}
+}
+
+func TestClassifyErrorDistinguishesEditNoMatchFromASTSymbolNoMatch(t *testing.T) {
+	// Caught/trace NoMatch from ast.read must NOT be misclassified as edit_hunk_mismatch!
+	gotAST := ClassifyError("partial_op", "", []sandbox.OpTrace{
+		{Seq: 1, Capability: "ast.read", Status: "error", Kind: "NoMatch", Error: "pkg/tui/view.go: symbol buildCodeBoxRows not found"},
+	})
+	if gotAST != "not_found" {
+		t.Fatalf("expected ast.read NoMatch to classify as not_found, got %q", gotAST)
+	}
+
+	gotEdit := ClassifyError("runtime", "", []sandbox.OpTrace{
+		{Seq: 1, Capability: "t.edit", Status: "error", Kind: "NoMatch", Error: "pkg/tui/model.go hunk 1: target not found"},
+	})
+	if gotEdit != "edit_hunk_mismatch" {
+		t.Fatalf("expected t.edit NoMatch to classify as edit_hunk_mismatch, got %q", gotEdit)
 	}
 }

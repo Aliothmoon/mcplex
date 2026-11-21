@@ -38,33 +38,47 @@ const (
 	DefaultCodePreview  = 16 * 1024
 )
 
+// OpItem summarizes one host capability call inside an `exec` trace chain.
+type OpItem struct {
+	Seq        int    `json:"seq,omitempty"`
+	Wave       int    `json:"wave,omitempty"`
+	Capability string `json:"capability"`
+	Target     string `json:"target,omitempty"`
+	StartMs    int64  `json:"startMs,omitempty"`
+	DurationMs int64  `json:"durationMs"`
+	Status     string `json:"status"` // "ok" | "error"
+	Error      string `json:"error,omitempty"`
+}
+
 // Event represents a single real-time execution or file CRUD observation.
 type Event struct {
-	Seq        int64        `json:"seq"`
-	Timestamp  string       `json:"timestamp"`
-	Kind       Kind         `json:"kind"`
-	SessionID  string       `json:"sessionId,omitempty"`
-	RunID      string       `json:"runId,omitempty"`
-	StreamID   string       `json:"streamId,omitempty"`
-	TxID       string       `json:"txId,omitempty"`
-	TxPhase    string       `json:"txPhase,omitempty"` // "open" | "committed" | "rolled_back"
-	Tool       string       `json:"tool"`
-	Title      string       `json:"title,omitempty"`
-	Cwd        string       `json:"cwd,omitempty"`
-	Path       string       `json:"path,omitempty"`
-	AbsPath    string       `json:"absPath,omitempty"`
-	OldPath    string       `json:"oldPath,omitempty"`
-	OldAbsPath string       `json:"oldAbsPath,omitempty"`
-	Status     string       `json:"status,omitempty"` // "running" | "ok" | "error" | "denied" | "canceled" | "timeout"
-	DurationMs int64        `json:"durationMs,omitempty"`
-	HostOps    int          `json:"hostOps,omitempty"`
-	ExitCode   *int         `json:"exitCode,omitempty"`
-	Summary    string       `json:"summary,omitempty"`
-	Error      string       `json:"error,omitempty"`
-	Detail     string       `json:"detail,omitempty"`
-	DetailKind string       `json:"detailKind,omitempty"` // "text" | "code" | "shell" | "search" | "image"
-	Truncated  bool         `json:"truncated,omitempty"`
-	Diff       *diff.Result `json:"diff,omitempty"`
+	Seq          int64        `json:"seq"`
+	Timestamp    string       `json:"timestamp"`
+	Kind         Kind         `json:"kind"`
+	SessionID    string       `json:"sessionId,omitempty"`
+	SessionLabel string       `json:"sessionLabel,omitempty"`
+	RunID        string       `json:"runId,omitempty"`
+	StreamID     string       `json:"streamId,omitempty"`
+	TxID         string       `json:"txId,omitempty"`
+	TxPhase      string       `json:"txPhase,omitempty"` // "open" | "committed" | "rolled_back"
+	Tool         string       `json:"tool"`
+	Title        string       `json:"title,omitempty"`
+	Cwd          string       `json:"cwd,omitempty"`
+	Path         string       `json:"path,omitempty"`
+	AbsPath      string       `json:"absPath,omitempty"`
+	OldPath      string       `json:"oldPath,omitempty"`
+	OldAbsPath   string       `json:"oldAbsPath,omitempty"`
+	Status       string       `json:"status,omitempty"` // "running" | "ok" | "error" | "denied" | "canceled" | "timeout"
+	DurationMs   int64        `json:"durationMs,omitempty"`
+	HostOps      int          `json:"hostOps,omitempty"`
+	Ops          []OpItem     `json:"ops,omitempty"`
+	ExitCode     *int         `json:"exitCode,omitempty"`
+	Summary      string       `json:"summary,omitempty"`
+	Error        string       `json:"error,omitempty"`
+	Detail       string       `json:"detail,omitempty"`
+	DetailKind   string       `json:"detailKind,omitempty"` // "text" | "code" | "shell" | "search" | "image"
+	Truncated    bool         `json:"truncated,omitempty"`
+	Diff         *diff.Result `json:"diff,omitempty"`
 }
 
 type subscriber struct {
@@ -83,6 +97,7 @@ type Hub struct {
 	mu             sync.RWMutex
 	ring           []Event
 	subs           map[int64]*subscriber
+	sessionLabels  map[string]string
 	droppedDeliver atomic.Int64
 }
 
@@ -92,10 +107,30 @@ func NewHub(capacity int) *Hub {
 		capacity = DefaultHubCapacity
 	}
 	return &Hub{
-		capacity: capacity,
-		ring:     make([]Event, 0, min(capacity, 64)),
-		subs:     map[int64]*subscriber{},
+		capacity:      capacity,
+		ring:          make([]Event, 0, min(capacity, 64)),
+		subs:          map[int64]*subscriber{},
+		sessionLabels: map[string]string{},
 	}
+}
+
+// SetSessionLabel associates a human-readable client name (e.g. from MCP initialize clientInfo)
+// with a SessionID so all subsequent events from that session carry SessionLabel automatically.
+func (h *Hub) SetSessionLabel(sessionID, label string) {
+	if h == nil {
+		return
+	}
+	sid := strings.TrimSpace(sessionID)
+	lbl := strings.TrimSpace(label)
+	if sid == "" || lbl == "" {
+		return
+	}
+	h.mu.Lock()
+	if len(h.sessionLabels) > 256 {
+		h.sessionLabels = map[string]string{}
+	}
+	h.sessionLabels[sid] = lbl
+	h.mu.Unlock()
 }
 
 // SetAlwaysRecord forces event capture even before any subscriber connects (useful in HTTP mode so
@@ -127,6 +162,11 @@ func (h *Hub) Emit(ev Event) Event {
 	}
 
 	h.mu.Lock()
+	if ev.SessionID != "" && ev.SessionLabel == "" {
+		if lbl := h.sessionLabels[ev.SessionID]; lbl != "" {
+			ev.SessionLabel = lbl
+		}
+	}
 	h.recordRingLocked(ev)
 	for _, sub := range h.subs {
 		if sub.sessionFilter != "" && ev.SessionID != sub.sessionFilter {

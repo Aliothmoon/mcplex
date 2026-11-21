@@ -13,9 +13,11 @@ import (
 const (
 	colorCanvas     = "#0C0D10" // deep neutral obsidian canvas
 	colorSurface    = "#13151A" // top bar, footer, floating modal body
-	colorSurfaceHi  = "#181B22" // modal header strip, hover subtle fill
-	colorSurfaceSel = "#1D212B" // selected feed row fill
+	colorSurfaceHi  = "#181B22" // modal header strip, section headers, hover subtle fill
+	colorCodeWell   = "#0E1016" // recessed code/output box surface inside feed & modal
+	colorSurfaceSel = "#1D212B" // selected feed/modal cursor row fill
 	colorHoverRow   = "#151820" // hovered feed row fill
+	colorTextSelBg  = "#2B3F66" // crisp cobalt text drag-selection highlight
 	colorBackdrop   = "#07080A" // dimmed modal scrim
 	colorShadow     = "#050608" // subtle modal drop shadow
 	colorDiffAddBg  = "#0F2419" // restrained dark emerald diff strip
@@ -210,6 +212,58 @@ var (
 
 	// Empty-state landing card border
 	styleCardBorder = lipgloss.NewStyle().Foreground(lipgloss.Color("#252936"))
+
+	// Distinct GrokNight pastel accents for multi-session badges & session picker dots
+	sessionAccentStyles = []lipgloss.Style{
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#D88BFF")).Bold(true), // lavender
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#7DD3FC")).Bold(true), // sky
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#4ADE80")).Bold(true), // emerald
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#FBBF24")).Bold(true), // amber
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#FB923C")).Bold(true), // tangerine
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#F472B6")).Bold(true), // rose
+	}
+
+	// Recessed Code / Output syntax highlighting palette (GrokNight balanced tones)
+	styleCodeLineNum = lipgloss.NewStyle().Foreground(lipgloss.Color("#454C61"))
+	styleCodeBorder  = lipgloss.NewStyle().Foreground(lipgloss.Color("#262B38"))
+	styleCodeHeader  = lipgloss.NewStyle().Foreground(lipgloss.Color("#9AA1B2")).Bold(true)
+	styleSynKeyword  = lipgloss.NewStyle().Foreground(lipgloss.Color("#D88BFF")).Bold(true)
+	styleSynGlobal   = lipgloss.NewStyle().Foreground(lipgloss.Color("#7DD3FC"))
+	styleSynFunc     = lipgloss.NewStyle().Foreground(lipgloss.Color("#A5B4FC"))
+	styleSynProp     = lipgloss.NewStyle().Foreground(lipgloss.Color("#CBD5E1"))
+	styleSynString   = lipgloss.NewStyle().Foreground(lipgloss.Color("#86EFAC"))
+	styleSynNumber   = lipgloss.NewStyle().Foreground(lipgloss.Color("#FBBF24"))
+	styleSynComment  = lipgloss.NewStyle().Foreground(lipgloss.Color("#5A6275"))
+	styleSynPunct    = lipgloss.NewStyle().Foreground(lipgloss.Color("#6E768A"))
+	styleSynURL      = lipgloss.NewStyle().Foreground(lipgloss.Color("#67E8F9"))
+
+	// Clean section pills inside floating modal (CODE / OUTPUT)
+	styleSectionPillCode = lipgloss.NewStyle().
+				Background(lipgloss.Color("#231D30")).
+				Foreground(lipgloss.Color("#D88BFF")).
+				Bold(true)
+	styleSectionPillOk = lipgloss.NewStyle().
+				Background(lipgloss.Color("#10291D")).
+				Foreground(lipgloss.Color("#4ADE80")).
+				Bold(true)
+	styleSectionPillErr = lipgloss.NewStyle().
+				Background(lipgloss.Color("#31151B")).
+				Foreground(lipgloss.Color("#F87171")).
+				Bold(true)
+	styleTextSel = lipgloss.NewStyle().
+			Background(lipgloss.Color(colorTextSelBg)).
+			Foreground(lipgloss.Color("#F8FAFC"))
+	styleCopyToast = lipgloss.NewStyle().
+			Background(lipgloss.Color("#10291D")).
+			Foreground(lipgloss.Color("#4ADE80")).
+			Bold(true)
+	styleCopyToastErr = lipgloss.NewStyle().
+				Background(lipgloss.Color("#31151B")).
+				Foreground(lipgloss.Color("#F87171")).
+				Bold(true)
+	styleGanttOk    = lipgloss.NewStyle().Foreground(lipgloss.Color("#34A874"))
+	styleGanttErr   = lipgloss.NewStyle().Foreground(lipgloss.Color("#D46A6A"))
+	styleGanttTrack = lipgloss.NewStyle().Foreground(lipgloss.Color("#262B38"))
 )
 
 // bgEscapeSeq asks lipgloss for the exact profile-appropriate ANSI background SGR prefix
@@ -224,20 +278,55 @@ func bgEscapeSeq(hex string) string {
 }
 
 // paintLineBg renders styled onto a solid edge-to-edge background of exact width,
-// re-applying bgHex immediately after every inner ANSI reset (\x1b[0m / \x1b[m]).
+// sanitizing any raw tabs/control chars/non-SGR escapes and re-applying bgHex after inner ANSI resets.
 func paintLineBg(styled string, bgHex string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	clamped := clampLineWidth(styled, width)
+	clean := sanitizeStyledLine(styled)
+	clamped := clampLineWidth(clean, width)
 	pad := max(0, width-ansi.StringWidth(clamped))
 	bg := bgEscapeSeq(bgHex)
 	if bg == "" {
 		return clamped + strings.Repeat(" ", pad)
 	}
-	filled := strings.ReplaceAll(clamped, "\x1b[0m", "\x1b[0m"+bg)
-	filled = strings.ReplaceAll(filled, "\x1b[m", "\x1b[m"+bg)
+	filled := reapplyBgAfterResets(clamped, bg)
 	return bg + filled + strings.Repeat(" ", pad) + "\x1b[0m"
+}
+
+// reapplyBgAfterResets re-applies bg immediately after SGR reset sequences (\x1b[0m, \x1b[m, \x1b[49m)
+// unless the immediately following sequence already sets an explicit background (\x1b[48;).
+func reapplyBgAfterResets(s, bg string) string {
+	if !strings.Contains(s, "\x1b[") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 64)
+	i := 0
+	for i < len(s) {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			var tokLen int
+			switch {
+			case strings.HasPrefix(s[i:], "\x1b[0m"):
+				tokLen = 4
+			case strings.HasPrefix(s[i:], "\x1b[m"):
+				tokLen = 3
+			case strings.HasPrefix(s[i:], "\x1b[49m"):
+				tokLen = 5
+			}
+			if tokLen > 0 {
+				b.WriteString(s[i : i+tokLen])
+				i += tokLen
+				if !strings.HasPrefix(s[i:], "\x1b[48;") {
+					b.WriteString(bg)
+				}
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
 
 // paintDiffStrip tints a full diff line strip across exact width without leaking background outside it.

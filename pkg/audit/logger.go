@@ -144,7 +144,7 @@ func ClassifyError(phase, msg string, traces []sandbox.OpTrace) string {
 		strings.Contains(low, "approval_required") || strings.Contains(low, "policy_denied"):
 		return "policy_gate"
 	case strings.Contains(low, "target not found") || strings.Contains(low, "matched multiple locations") ||
-		strings.Contains(low, "overlapping hunks") || strings.Contains(low, "overlap") ||
+		strings.Contains(low, "overlapping hunks") || (strings.Contains(low, "hunk") && strings.Contains(low, "overlap")) ||
 		(strings.Contains(low, "matches ") && strings.Contains(low, " places")):
 		return "edit_hunk_mismatch"
 	case strings.Contains(low, "opbudgeterror") || strings.Contains(low, "operation budget") || strings.Contains(low, "op budget"):
@@ -156,7 +156,13 @@ func ClassifyError(phase, msg string, traces []sandbox.OpTrace) string {
 			case "NeedsApproval", "Denied":
 				return "policy_gate"
 			case "NoMatch", "Ambiguous":
-				return "edit_hunk_mismatch"
+				if isEditCapability(t.Capability) {
+					return "edit_hunk_mismatch"
+				}
+				if t.Kind == "NoMatch" {
+					return "not_found"
+				}
+				return "capability_error:" + t.Capability
 			case "NotFound":
 				return "not_found"
 			case "Timeout":
@@ -180,6 +186,11 @@ func ClassifyError(phase, msg string, traces []sandbox.OpTrace) string {
 		return phase + "_error"
 	}
 	return "runtime_error"
+}
+
+func isEditCapability(capName string) bool {
+	return capName == "t.edit" || capName == "tx._edit" ||
+		strings.HasPrefix(capName, "edit.") || strings.HasPrefix(capName, "tx.")
 }
 
 // PayloadKeyLengths extracts only key names and byte sizes so sensitive file contents aren't duplicated in telemetry.
@@ -457,7 +468,7 @@ func FormatStats(entries []Entry) string {
 				if _, exists := capFailSample[tr.Capability]; !exists && tr.Error != "" {
 					s := tr.Error
 					if len(s) > 90 {
-						s = s[:90] + "..."
+						s = output.SliceUTF8Bytes(s, 90) + "..."
 					}
 					capFailSample[tr.Capability] = s
 				}

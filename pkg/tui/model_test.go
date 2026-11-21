@@ -215,7 +215,13 @@ func TestExactViewportGeometryAcrossSizesAndModal(t *testing.T) {
 		})
 		m.ingestEvent(events.Event{
 			Seq: 3, Kind: events.KindExecEnd, RunID: "r1", Tool: "exec",
-			Title: "Refactor auth handler", Status: "ok", DurationMs: 68, HostOps: 3,
+			Title: "Refactor auth handler", Status: "ok", DurationMs: 68, HostOps: 4,
+			Ops: []events.OpItem{
+				{Seq: 1, Wave: 1, Capability: "fs.stat", Target: "pkg/auth.go", StartMs: 0, DurationMs: 2, Status: "ok"},
+				{Seq: 2, Wave: 2, Capability: "sh.exec", Target: "go vet ./...", StartMs: 3, DurationMs: 2236, Status: "ok"},
+				{Seq: 3, Wave: 2, Capability: "sh.exec", Target: "go test ./...", StartMs: 3, DurationMs: 11877, Status: "error"},
+				{Seq: 4, Wave: 3, Capability: "edit.replace", Target: "pkg/auth.go", StartMs: 11882, DurationMs: 4, Status: "ok"},
+			},
 		})
 		m.ingestEvent(events.Event{
 			Seq: 4, Kind: events.KindTask, RunID: "task-1", StreamID: "task-1",
@@ -224,8 +230,22 @@ func TestExactViewportGeometryAcrossSizesAndModal(t *testing.T) {
 			Timestamp: "2026-11-21T20:55:04+08:00",
 		})
 		checkFrame("feed")
+		feedPlain := ansi.Strip(m.View())
+		if !strings.Contains(feedPlain, "‖[") || !strings.Contains(feedPlain, "✓sh.exec(2236ms)") || !strings.Contains(feedPlain, "→") {
+			t.Fatalf("expected parallel ‖[...] Ops summary in feed view, got:\n%s", feedPlain)
+		}
 
-		// 3. Floating overlay modal on diff
+		// 3. Floating overlay modal on exec group (must display Fork-Join parallel flowchart!)
+		m.selectedID = "grp:r1"
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+		checkFrame("modal-exec-ops")
+		execModalPlain := ansi.Strip(m.View())
+		if !strings.Contains(execModalPlain, "Ops Flow") || !strings.Contains(execModalPlain, "parallel ×2") || !strings.Contains(execModalPlain, "✓sh.exec(2236ms)") || !strings.Contains(execModalPlain, "✗sh.exec(11877ms)") || !strings.Contains(execModalPlain, "━") {
+			t.Fatalf("expected Fork-Join parallel flowchart in exec detail popup, got:\n%s", execModalPlain)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+		// 4. Floating overlay modal on diff
 		m.selectedID = "ev:2"
 		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
 		checkFrame("modal-diff")
@@ -235,5 +255,571 @@ func TestExactViewportGeometryAcrossSizesAndModal(t *testing.T) {
 		m.selectedID = "solo:4"
 		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
 		checkFrame("modal-live")
+	}
+}
+
+func TestSessionPickerModalSelectsAndDistinguishesSessions(t *testing.T) {
+	m := NewModel(Config{Endpoint: "http://127.0.0.1:8787/mcp", Version: "0.3.0"}, nil)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+
+	m.ingestEvent(events.Event{
+		Seq: 1, Kind: events.KindExecStart, SessionID: "aaaa1111bbbb2222", SessionLabel: "claude-code",
+		RunID: "r1", Tool: "exec", Cwd: "F:/Project/AgyPTC", Title: "Claude refactor", Timestamp: "2026-11-22T00:30:01+08:00",
+	})
+	m.ingestEvent(events.Event{
+		Seq: 2, Kind: events.KindExecEnd, SessionID: "aaaa1111bbbb2222", SessionLabel: "claude-code",
+		RunID: "r1", Tool: "exec", Title: "Claude refactor", Status: "ok", DurationMs: 42, HostOps: 2,
+	})
+	m.ingestEvent(events.Event{
+		Seq: 3, Kind: events.KindExecStart, SessionID: "cccc3333dddd4444", SessionLabel: "cursor",
+		RunID: "r2", Tool: "exec", Cwd: "F:/Project/MCPlex", Title: "Cursor inspect", Timestamp: "2026-11-22T00:31:02+08:00",
+	})
+	m.ingestEvent(events.Event{
+		Seq: 4, Kind: events.KindExecEnd, SessionID: "cccc3333dddd4444", SessionLabel: "cursor",
+		RunID: "r2", Tool: "exec", Title: "Cursor inspect", Status: "ok", DurationMs: 18, HostOps: 1,
+	})
+
+	// Multi-session All view shows distinct client labels in feed
+	allPlain := ansi.Strip(m.View())
+	if !strings.Contains(allPlain, "claude-code") || !strings.Contains(allPlain, "cursor") {
+		t.Fatalf("expected distinct session badges in All Sessions feed, got:\n%s", allPlain)
+	}
+
+	// Press 's' to open floating Session Picker Modal
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if !m.sessPicker.open {
+		t.Fatal("expected 's' to open floating session picker modal")
+	}
+	pickerView := m.View()
+	lines := strings.Split(pickerView, "\n")
+	if len(lines) != 30 {
+		t.Fatalf("expected 30 lines, got %d", len(lines))
+	}
+	for i, l := range lines {
+		if w := ansi.StringWidth(l); w != 120 {
+			t.Fatalf("picker modal line %d width mismatch: want 120 got %d (%q)", i, w, ansi.Strip(l))
+		}
+	}
+	pickerPlain := ansi.Strip(pickerView)
+	if !strings.Contains(pickerPlain, "Sessions") || !strings.Contains(pickerPlain, "All Sessions") || !strings.Contains(pickerPlain, "claude-code") || !strings.Contains(pickerPlain, "cursor") {
+		t.Fatalf("session picker missing expected entries:\n%s", pickerPlain)
+	}
+
+	// Move down twice (0=All -> 1=claude-code -> 2=cursor) and press Enter
+	m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.sessPicker.open {
+		t.Fatal("Enter should close session picker after selecting")
+	}
+	if m.activeSessionID != "cccc3333dddd4444" {
+		t.Fatalf("expected cursor session selected, got %q", m.activeSessionID)
+	}
+	filteredPlain := ansi.Strip(m.View())
+	if !strings.Contains(filteredPlain, "Cursor inspect") || strings.Contains(filteredPlain, "Claude refactor") {
+		t.Fatalf("expected feed filtered to cursor session only:\n%s", filteredPlain)
+	}
+
+	// Re-open with 's' and click outside backdrop to dismiss
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m.View()
+	m.Update(tea.MouseMsg{X: 0, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	if m.sessPicker.open {
+		t.Fatal("clicking backdrop outside session picker should dismiss modal")
+	}
+}
+
+func TestDetailModalCursorHorizontalPanAndWrapToggle(t *testing.T) {
+	m := NewModel(Config{Endpoint: "http://127.0.0.1:8787/mcp", Version: "0.3.0"}, nil)
+	m.Update(tea.WindowSizeMsg{Width: 90, Height: 24})
+
+	longTail := "TAIL_END_MARKER_999"
+	longLine := strings.Repeat("abcdefghij", 14) + longTail // 159 chars wide, overflows 90-col modal
+	m.ingestEvent(events.Event{
+		Seq: 1, Kind: events.KindFileRead, RunID: "r_long", Tool: "read",
+		Cwd: "F:/Demo", Path: "wide.log", AbsPath: "F:/Demo/wide.log",
+		Detail: "first short line\n" + longLine + "\nthird line\n", DetailKind: "text",
+	})
+
+	// Open floating detail modal on the wide file
+	m.selectedID = "solo:1"
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	if !m.detail.open || m.detail.focus != modalFocusBody || m.detail.wrap {
+		t.Fatalf("expected open modal in body focus with wrap=false, got open=%v focus=%v wrap=%v", m.detail.open, m.detail.focus, m.detail.wrap)
+	}
+
+	// 1. Move cursor down to line 2 (the long line)
+	m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if m.detail.cursor != 1 {
+		t.Fatalf("expected cursor at visual row 1, got %d", m.detail.cursor)
+	}
+	v0 := ansi.Strip(m.View())
+	if strings.Contains(v0, longTail) {
+		t.Fatalf("expected long tail hidden before horizontal scroll:\n%s", v0)
+	}
+
+	// 2. Press Right / '$' to horizontally pan the entire file body block and reveal TAIL_END_MARKER_999
+	m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	if m.activeDetailHScroll() <= 0 {
+		t.Fatalf("expected Right arrow to increase active block hScroll, got %d", m.activeDetailHScroll())
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'$'}})
+	vPan := m.View()
+	for i, l := range strings.Split(vPan, "\n") {
+		if w := ansi.StringWidth(l); w != 90 {
+			t.Fatalf("panned modal line %d width mismatch: want 90 got %d (%q)", i, w, ansi.Strip(l))
+		}
+	}
+	vPanPlain := ansi.Strip(vPan)
+	if !strings.Contains(vPanPlain, longTail) {
+		t.Fatalf("expected horizontal pan '$' to reveal %q:\n%s", longTail, vPanPlain)
+	}
+	// All lines in the same file block pan together (short lines scroll off-left with the block).
+	if strings.Contains(vPanPlain, "first short line") {
+		t.Fatalf("expected lines in the same file block to pan together:\n%s", vPanPlain)
+	}
+
+	// 3. Press 'w' to toggle automatic soft word-wrap ON -> groupHScroll resets, longLine splits into multiple visual rows, tail visible!
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	if !m.detail.wrap || len(m.detail.groupHScroll) != 0 {
+		t.Fatalf("expected wrap=true and cleared groupHScroll after 'w', got wrap=%v groupHScroll=%v", m.detail.wrap, m.detail.groupHScroll)
+	}
+	vWrap := m.View()
+	if m.detail.totalVis <= len(m.detail.lines) {
+		t.Fatalf("expected wrapped visual row count (%d) > logical lines (%d)", m.detail.totalVis, len(m.detail.lines))
+	}
+	for i, l := range strings.Split(vWrap, "\n") {
+		if w := ansi.StringWidth(l); w != 90 {
+			t.Fatalf("wrapped modal line %d width mismatch: want 90 got %d (%q)", i, w, ansi.Strip(l))
+		}
+	}
+	if !strings.Contains(ansi.Strip(vWrap), longTail) || !strings.Contains(ansi.Strip(vWrap), "Wrap:ON") {
+		t.Fatalf("expected wrapped modal to display full tail and Wrap:ON badge:\n%s", ansi.Strip(vWrap))
+	}
+
+	// 4. Tab switches focus between Body and Bottom Action Bar cleanly
+	m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if m.detail.focus != modalFocusBar {
+		t.Fatalf("expected Tab to switch modal focus to action bar")
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if m.detail.focus != modalFocusBody {
+		t.Fatalf("expected second Tab to switch modal focus back to body")
+	}
+}
+
+func TestCodeAndOutputBoxFramingDedentAndGeometry(t *testing.T) {
+	m := NewModel(Config{Endpoint: "http://127.0.0.1:8787/mcp", Version: "0.3.0"}, nil)
+	m.Update(tea.WindowSizeMsg{Width: 110, Height: 30})
+
+	m.ingestEvent(events.Event{
+		Seq: 1, Kind: events.KindExecStart, RunID: "r_box", Tool: "exec",
+		Cwd: "F:/Demo", Title: "Inspect code & output boxes", Status: "running",
+		Detail: "\n        const res = await fs.read(\"demo.go\");\n        return { ok: true, size: res.length };\n", DetailKind: "code",
+	})
+	m.ingestEvent(events.Event{
+		Seq: 2, Kind: events.KindExecEnd, RunID: "r_box", Tool: "exec",
+		Title: "Inspect code & output boxes", Status: "ok", DurationMs: 25, HostOps: 1,
+		Ops:    []events.OpItem{{Seq: 1, Wave: 1, Capability: "fs.read", DurationMs: 4, Status: "ok"}},
+		Detail: "[ptc ok | 1 host ops | 25ms]\n\nResult:\n{\n  \"ok\": true,\n  \"size\": 42\n}",
+	})
+
+	// Expand Code and Result children in feed and check exact geometry + framed boxes
+	for _, ch := range m.groups[0].children {
+		ch.expanded = true
+	}
+	feedView := m.View()
+	for i, l := range strings.Split(feedView, "\n") {
+		if w := ansi.StringWidth(l); w != 110 {
+			t.Fatalf("feed line %d width mismatch: want 110 got %d (%q)", i, w, ansi.Strip(l))
+		}
+	}
+	feedPlain := ansi.Strip(feedView)
+	if !strings.Contains(feedPlain, "╭─") || !strings.Contains(feedPlain, "typescript") || !strings.Contains(feedPlain, "output") {
+		t.Fatalf("expected framed inline code/output boxes in feed:\n%s", feedPlain)
+	}
+	if strings.Contains(feedPlain, "│         const res") {
+		t.Fatalf("expected dedented TypeScript code in inline card:\n%s", feedPlain)
+	}
+
+	// Open exec popup -> must show clean CODE + OUTPUT sections with exact 110-col geometry
+	m.selectedID = "grp:r_box"
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	modalView := m.View()
+	for i, l := range strings.Split(modalView, "\n") {
+		if w := ansi.StringWidth(l); w != 110 {
+			t.Fatalf("exec modal line %d width mismatch: want 110 got %d (%q)", i, w, ansi.Strip(l))
+		}
+	}
+	modalPlain := ansi.Strip(modalView)
+	if !strings.Contains(modalPlain, "CODE") || !strings.Contains(modalPlain, "OUTPUT") || !strings.Contains(modalPlain, "TypeScript") {
+		t.Fatalf("expected structured CODE and OUTPUT sections in exec modal:\n%s", modalPlain)
+	}
+}
+
+func TestDetailModalBlockScopedHorizontalPan(t *testing.T) {
+	m := NewModel(Config{Endpoint: "http://127.0.0.1:8787/mcp", Version: "0.3.0"}, nil)
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	codeTail := "CODE_TAIL_MARKER_111"
+	outTail := "OUTPUT_TAIL_MARKER_222"
+	codeBody := "const codeTopShort = 1;\n" +
+		"const wideCode = \"" + strings.Repeat("c", 120) + codeTail + "\";\n" +
+		"const codeBottomShort = 3;"
+	outBody := "OUTPUT_START_MARKER\n" +
+		"wide_output=" + strings.Repeat("o", 120) + outTail
+
+	m.ingestEvent(events.Event{
+		Seq: 1, Kind: events.KindExecStart, RunID: "r_secpan", Tool: "exec",
+		Cwd: "F:/Demo", Title: "Section scoped pan", Status: "running",
+		Detail: codeBody, DetailKind: "code",
+	})
+	m.ingestEvent(events.Event{
+		Seq: 2, Kind: events.KindExecEnd, RunID: "r_secpan", Tool: "exec",
+		Title: "Section scoped pan", Status: "ok", DurationMs: 42, HostOps: 2,
+		Ops: []events.OpItem{
+			{Seq: 1, Wave: 1, Capability: "fs.read", Target: "a.go", DurationMs: 5, Status: "ok"},
+			{Seq: 2, Wave: 1, Capability: "fs.read", Target: "b.go", DurationMs: 6, Status: "ok"},
+		},
+		Detail: outBody,
+	})
+
+	m.selectedID = "grp:r_secpan"
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	if !m.detail.open {
+		t.Fatalf("expected exec modal to open")
+	}
+
+	// Cursor starts at row 0 (Ops Flow, panGroup=0): pressing Right must NOT scroll anything.
+	m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	if len(m.detail.groupHScroll) != 0 {
+		t.Fatalf("expected Ops Flow row not to scroll horizontally, got %v", m.detail.groupHScroll)
+	}
+
+	// Locate first CODE line (short line!) and first OUTPUT line
+	codeLineIdx, outLineIdx := -1, -1
+	for i, dl := range m.detail.lines {
+		if dl.panGroup == 1 && codeLineIdx == -1 {
+			codeLineIdx = i
+		}
+		if dl.panGroup == 2 && outLineIdx == -1 {
+			outLineIdx = i
+		}
+	}
+	if codeLineIdx < 0 || outLineIdx < 0 {
+		t.Fatalf("expected CODE (panGroup=1) and OUTPUT (panGroup=2) lines, got code=%d out=%d", codeLineIdx, outLineIdx)
+	}
+
+	// Place cursor on the SHORT first line of CODE and press '$' -> entire CODE block pans together,
+	// revealing codeTail and scrolling codeTopShort off-left, while Ops Flow + headers + OUTPUT stay stationary!
+	m.detail.cursor = codeLineIdx
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'$'}})
+	vCodePan := m.View()
+	for i, l := range strings.Split(vCodePan, "\n") {
+		if w := ansi.StringWidth(l); w != 100 {
+			t.Fatalf("code-panned modal line %d width mismatch: want 100 got %d (%q)", i, w, ansi.Strip(l))
+		}
+	}
+	p1 := ansi.Strip(vCodePan)
+	if !strings.Contains(p1, codeTail) {
+		t.Fatalf("expected CODE block pan to reveal %q:\n%s", codeTail, p1)
+	}
+	if strings.Contains(p1, "const codeTopShort") {
+		t.Fatalf("expected short line inside CODE to scroll together with CODE block:\n%s", p1)
+	}
+	if !strings.Contains(p1, "Ops Flow") || !strings.Contains(p1, "CODE") || !strings.Contains(p1, "OUTPUT") {
+		t.Fatalf("expected Ops Flow and section headers to remain stationary:\n%s", p1)
+	}
+	if !strings.Contains(p1, "OUTPUT_START_MARKER") || strings.Contains(p1, outTail) {
+		t.Fatalf("expected OUTPUT block to remain completely unpanned while CODE is panned:\n%s", p1)
+	}
+
+	// Now move cursor into OUTPUT and pan with '$' -> OUTPUT block pans independently while CODE keeps its offset!
+	m.detail.cursor = outLineIdx
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'$'}})
+	vBothPan := m.View()
+	p2 := ansi.Strip(vBothPan)
+	if !strings.Contains(p2, outTail) || strings.Contains(p2, "OUTPUT_START_MARKER") {
+		t.Fatalf("expected OUTPUT block to pan together and reveal %q:\n%s", outTail, p2)
+	}
+	if !strings.Contains(p2, codeTail) {
+		t.Fatalf("expected CODE block to preserve its own horizontal scroll offset:\n%s", p2)
+	}
+
+	// Press '0' inside OUTPUT -> resets ONLY OUTPUT, leaving CODE panned!
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'0'}})
+	p3 := ansi.Strip(m.View())
+	if !strings.Contains(p3, "OUTPUT_START_MARKER") || strings.Contains(p3, outTail) {
+		t.Fatalf("expected '0' to reset OUTPUT block back to col 0:\n%s", p3)
+	}
+	if !strings.Contains(p3, codeTail) {
+		t.Fatalf("expected CODE block to stay panned when OUTPUT resets:\n%s", p3)
+	}
+
+	// Shift+WheelDown while hovering OUTPUT pans OUTPUT block without moving CODE
+	m.detail.hoverRow = outLineIdx
+	m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown, Shift: true})
+	if m.detailGroupHScroll(2) <= 0 {
+		t.Fatalf("expected Shift+WheelDown on OUTPUT to pan OUTPUT block, got %d", m.detailGroupHScroll(2))
+	}
+}
+
+func assertTerminalSafeView(t *testing.T, view string, wantW, wantH int, label string) {
+	t.Helper()
+	lines := strings.Split(view, "\n")
+	if len(lines) != wantH {
+		t.Fatalf("%s: expected exact height %d, got %d", label, wantH, len(lines))
+	}
+	for row, line := range lines {
+		if w := ansi.StringWidth(line); w != wantW {
+			t.Fatalf("%s row %d: width mismatch want %d got %d (%q)", label, row, wantW, w, ansi.Strip(line))
+		}
+		// Walk raw string: only valid CSI SGR (\x1b[...m) escapes are allowed; zero raw tabs/CR/controls!
+		for i := 0; i < len(line); {
+			c := line[i]
+			if c == '\x1b' {
+				end := matchSGRSeq(line, i)
+				if end < 0 {
+					t.Fatalf("%s row %d: non-SGR escape sequence leaked at byte %d: %q", label, row, i, line)
+				}
+				i = end
+				continue
+			}
+			if c == '\t' || c == '\r' || c < 0x20 || c == 0x7f {
+				t.Fatalf("%s row %d: unsafe control byte 0x%02x leaked at byte %d (%q)", label, row, c, i, ansi.Strip(line))
+			}
+			i++
+		}
+	}
+}
+
+func TestTerminalSafetyNoRawTabsOrControlCharsInGoCodeDiffsAndShell(t *testing.T) {
+	m := NewModel(Config{Endpoint: "http://127.0.0.1:8787/mcp", Version: "0.3.0"}, nil)
+	m.Update(tea.WindowSizeMsg{Width: 110, Height: 28})
+
+	// Exact Go code scenario with literal tabs and a wide URL comment line (previously caused ConPTY wrap & shadows)
+	goSrc := "package main\n\nimport (\n\t\"context\"\n\t\"time\"\n)\n\ntype ServerConfig struct {\n\tAddr      string `json:\"addr\"`\n\tTimeoutMs int    `json:\"timeoutMs\"`\n}\n\nfunc DefaultConfig() ServerConfig {\n\treturn ServerConfig{\n\t\tAddr:      \"127.0.0.1:8787\", // hardened loopback bind (https://edge.mcplex.internal/v3/streamable-mcp?region=ap-east-1&mode=strict&retry=3)\n\t\tTimeoutMs: 15000,\n\t}\n}\n"
+	goNew := strings.Replace(goSrc, "15000", "30000", 1)
+	d := diff.Compute([]byte(goSrc), []byte(goNew), true, true, 3)
+
+	m.ingestEvent(events.Event{
+		Seq: 1, Kind: events.KindFileRead, RunID: "r_go", Tool: "read",
+		Cwd: "F:/Demo", Path: "server.go", AbsPath: "F:/Demo/server.go",
+		Summary: "18 lines\t(tabbed)\nignored", Detail: goSrc, DetailKind: "text",
+	})
+	m.ingestEvent(events.Event{
+		Seq: 2, Kind: events.KindFileUpdate, RunID: "r_diff", Tool: "edit",
+		Cwd: "F:/Demo", Path: "server.go", AbsPath: "F:/Demo/server.go",
+		Diff: &d, Summary: "+1 -1",
+	})
+	m.ingestEvent(events.Event{
+		Seq: 3, Kind: events.KindShell, RunID: "r_sh", Tool: "sh.exec",
+		Title: "build\t&&\ttest", Status: "ok", DetailKind: "shell",
+		Detail: "\x1b[2K\x1b[1A\x1b[31mFAIL\x1b[0m\tprogress\r100%\x07\tdone\n",
+	})
+
+	// Expand all groups in feed so tabbed Go code box, tabbed Go diff, and raw-ANSI shell output all render inline
+	for _, g := range m.groups {
+		g.expanded = true
+	}
+	feedView := m.View()
+	assertTerminalSafeView(t, feedView, 110, 28, "expanded feed with tabbed Go/diff/shell")
+	feedLines := strings.Split(feedView, "\n")
+	if !strings.Contains(ansi.Strip(feedLines[0]), "MCPlex") {
+		t.Fatalf("expected fixed header bar on row 0, got %q", ansi.Strip(feedLines[0]))
+	}
+	if !strings.Contains(ansi.Strip(feedLines[27]), "FEED") && !strings.Contains(ansi.Strip(feedLines[27]), "BAR") {
+		t.Fatalf("expected fixed footer bar on last row, got %q", ansi.Strip(feedLines[27]))
+	}
+
+	// Open floating detail modal on tabbed Go file -> test unwrapped, panned '$', and wrapped 'w'
+	m.selectedID = "solo:1"
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	assertTerminalSafeView(t, m.View(), 110, 28, "modal tabbed Go unwrapped")
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'$'}})
+	assertTerminalSafeView(t, m.View(), 110, 28, "modal tabbed Go panned")
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	assertTerminalSafeView(t, m.View(), 110, 28, "modal tabbed Go wrapped")
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	// Open floating detail modal on tabbed Go diff
+	m.selectedID = "solo:2"
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	assertTerminalSafeView(t, m.View(), 110, 28, "modal tabbed Go diff")
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	// Open floating detail modal on raw-ANSI shell output
+	m.selectedID = "solo:3"
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	modalSh := m.View()
+	assertTerminalSafeView(t, modalSh, 110, 28, "modal raw-ANSI shell")
+	if !strings.Contains(ansi.Strip(modalSh), "FAIL") || !strings.Contains(ansi.Strip(modalSh), "done") {
+		t.Fatalf("expected sanitized shell text preserved:\n%s", ansi.Strip(modalSh))
+	}
+}
+
+func TestMouseDragSelectToCopyAndKeyboardVisualCopy(t *testing.T) {
+	var copied []string
+	origClip := writeClipboard
+	writeClipboard = func(s string) error {
+		copied = append(copied, s)
+		return nil
+	}
+	defer func() { writeClipboard = origClip }()
+
+	m := NewModel(Config{Endpoint: "http://127.0.0.1:8787/mcp", Version: "0.3.0"}, nil)
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 28})
+
+	m.ingestEvent(events.Event{
+		Seq: 1, Kind: events.KindExecStart, RunID: "r_cp", Tool: "exec",
+		Cwd: "F:/Demo", Title: "Copy test", Status: "running",
+		Detail: "const alpha = 123;\nconst beta = \"hello world\";\nreturn alpha;", DetailKind: "code",
+	})
+	m.ingestEvent(events.Event{
+		Seq: 2, Kind: events.KindExecEnd, RunID: "r_cp", Tool: "exec",
+		Title: "Copy test", Status: "ok", DurationMs: 12, HostOps: 1,
+		Detail: "OUTPUT_LINE_1\nOUTPUT_LINE_2",
+	})
+
+	// 1. Feed drag across expanded code card must auto-copy on release WITHOUT folding the card!
+	m.groups[0].expanded = true
+	m.groups[0].children[0].expanded = true
+	_ = m.View() // populate m.lastFeedPlain & m.rowTargets
+
+	codeRow := -1
+	for i, pl := range m.lastFeedPlain {
+		if strings.Contains(pl, "const alpha = 123;") {
+			codeRow = i
+			break
+		}
+	}
+	if codeRow < 0 {
+		t.Fatalf("expected expanded code line in feed")
+	}
+	byteIdx := strings.Index(m.lastFeedPlain[codeRow], "alpha")
+	startCol := ansi.StringWidth(m.lastFeedPlain[codeRow][:byteIdx])
+	screenY := m.bodyTopY + (codeRow - m.scroll)
+	m.Update(tea.MouseMsg{X: startCol, Y: screenY, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	m.Update(tea.MouseMsg{X: startCol + 4, Y: screenY, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
+	assertTerminalSafeView(t, m.View(), 100, 28, "feed live drag selection")
+	m.Update(tea.MouseMsg{X: startCol + 4, Y: screenY, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
+
+	if len(copied) != 1 || copied[0] != "alpha" {
+		t.Fatalf("expected feed drag release to auto-copy %q, got %v", "alpha", copied)
+	}
+	if !m.groups[0].children[0].expanded {
+		t.Fatalf("dragging inside expanded card must not accidentally fold it")
+	}
+	if !strings.Contains(m.copyToast, "Copied") {
+		t.Fatalf("expected copy toast after drag-copy, got %q", m.copyToast)
+	}
+
+	// 2. Open exec detail modal -> drag across 2 CODE lines (starting in gutter!) -> auto-copies pure code without line numbers!
+	m.selectedID = "grp:r_cp"
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	_ = m.View() // compute m.detail.rect
+
+	codeStart := -1
+	for i, dl := range m.detail.lines {
+		if dl.panGroup == 1 {
+			codeStart = i
+			break
+		}
+	}
+	if codeStart < 0 {
+		t.Fatalf("expected CODE section in exec modal")
+	}
+	r := m.detail.rect
+	y1 := r.y + 4 + (codeStart - m.detail.scroll)
+	y2 := y1 + 1
+	// Press in gutter (r.x+3), drag down to end of next line (r.x+50), release -> auto-copy!
+	m.Update(tea.MouseMsg{X: r.x + 3, Y: y1, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	m.Update(tea.MouseMsg{X: r.x + 50, Y: y2, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
+	assertTerminalSafeView(t, m.View(), 100, 28, "modal live drag selection")
+	m.Update(tea.MouseMsg{X: r.x + 50, Y: y2, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
+
+	wantTwoLines := "const alpha = 123;\nconst beta = \"hello world\";"
+	if len(copied) != 2 || copied[1] != wantTwoLines {
+		t.Fatalf("expected modal multi-line drag to auto-copy clean code:\nwant: %q\ngot:  %q", wantTwoLines, copied[len(copied)-1])
+	}
+
+	// 3. Clear selection with Esc (modal stays open!), then press 'y' while cursor is in CODE -> copies entire CODE section!
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if !m.detail.open || m.sel.active {
+		t.Fatalf("expected first Esc to clear selection while keeping modal open")
+	}
+	m.detail.cursor = codeStart
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	wantFullCode := "const alpha = 123;\nconst beta = \"hello world\";\nreturn alpha;"
+	if len(copied) != 3 || copied[2] != wantFullCode {
+		t.Fatalf("expected 'y' in CODE block to copy full CODE section:\nwant: %q\ngot:  %q", wantFullCode, copied[len(copied)-1])
+	}
+
+	// 4. Visual line-select mode ('v' + Down + 'y') copies exact 2 selected lines cleanly
+	m.detail.cursor = codeStart
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+	m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	vVis := m.View()
+	assertTerminalSafeView(t, vVis, 100, 28, "modal visual line selection")
+	if !strings.Contains(ansi.Strip(vVis), "VISUAL 2L") {
+		t.Fatalf("expected VISUAL 2L badge in modal status bar:\n%s", ansi.Strip(vVis))
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if len(copied) != 4 || copied[3] != wantTwoLines {
+		t.Fatalf("expected visual mode 'y' to copy 2 selected lines:\nwant: %q\ngot:  %q", wantTwoLines, copied[len(copied)-1])
+	}
+
+	// 5. Click [ Copy ] pill directly on the CODE and OUTPUT section headers in the exec modal (works in both Wrap:OFF & Wrap:ON!)
+	_ = m.View()
+	if len(m.detail.copyZones) < 2 {
+		t.Fatalf("expected clickable Copy buttons on both CODE and OUTPUT section headers, got %d", len(m.detail.copyZones))
+	}
+	var codeBtn, outBtn modalCopyZone
+	for _, cz := range m.detail.copyZones {
+		if cz.group == 1 {
+			codeBtn = cz
+		} else if cz.group == 2 {
+			outBtn = cz
+		}
+	}
+	m.Update(tea.MouseMsg{X: codeBtn.x1 + 1, Y: codeBtn.y, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	if len(copied) != 5 || copied[4] != wantFullCode {
+		t.Fatalf("expected clicking CODE header [ Copy ] to copy full CODE:\nwant: %q\ngot:  %q", wantFullCode, copied[len(copied)-1])
+	}
+	// Toggle Wrap:ON and verify OUTPUT header [ Copy ] still renders and copies OUTPUT!
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	assertTerminalSafeView(t, m.View(), 100, 28, "modal wrapped with section Copy pills")
+	for _, cz := range m.detail.copyZones {
+		if cz.group == 2 {
+			outBtn = cz
+		}
+	}
+	m.Update(tea.MouseMsg{X: outBtn.x1 + 1, Y: outBtn.y, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	wantOut := "OUTPUT_LINE_1\nOUTPUT_LINE_2"
+	if len(copied) != 6 || copied[5] != wantOut {
+		t.Fatalf("expected clicking OUTPUT header [ Copy ] under Wrap:ON to copy OUTPUT:\nwant: %q\ngot:  %q", wantOut, copied[len(copied)-1])
+	}
+
+	// 6. Close modal and click inline card [ Copy ] pill on the feed Code card top border -> copies full code without folding!
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	feedV := m.View()
+	assertTerminalSafeView(t, feedV, 100, 28, "feed with inline card Copy button")
+	cardRow := -1
+	for i, rt := range m.rowTargets {
+		if rt.copyX2 > rt.copyX1 {
+			cardRow = i
+			break
+		}
+	}
+	if cardRow < 0 {
+		t.Fatalf("expected inline card Copy hit zone in feed")
+	}
+	rt := m.rowTargets[cardRow]
+	m.Update(tea.MouseMsg{X: rt.copyX1 + 1, Y: m.bodyTopY + (cardRow - m.scroll), Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	if len(copied) != 7 || copied[6] != wantFullCode {
+		t.Fatalf("expected clicking feed inline card [ Copy ] to copy full dedented code:\nwant: %q\ngot:  %q", wantFullCode, copied[len(copied)-1])
+	}
+	if !m.groups[0].children[0].expanded {
+		t.Fatalf("clicking feed card Copy button must not fold the card")
 	}
 }
