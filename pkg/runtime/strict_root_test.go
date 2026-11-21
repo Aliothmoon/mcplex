@@ -156,3 +156,34 @@ func TestDataDirPolicyJSONIsWriteProtectedBeforeItExists(t *testing.T) {
 		t.Fatalf("policy.json was created: %v", err)
 	}
 }
+
+// The OAuth server state (hashed tokens, client secrets) must be unreadable and unwritable from the sandbox even
+// without --strict-root: writing it would let code mint its own access-token hashes.
+func TestSandboxCannotTouchOAuthServerState(t *testing.T) {
+	dataDir := t.TempDir()
+	stateDir := filepath.Join(dataDir, "oauth-server")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(stateDir, "state.json")
+	if err := os.WriteFile(statePath, []byte(`{"version":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eng := NewEngineWithOptions(EngineOptions{DataDir: dataDir, DefaultCwd: t.TempDir(), EnableTasks: true})
+	defer eng.Close()
+	p := filepath.ToSlash(statePath)
+	for name, code := range map[string]string{
+		"read":   `return await fs.read("` + p + `");`,
+		"write":  `await fs.write("` + p + `", "{}"); return "written";`,
+		"sh":     `return (await sh.exec("cat ` + p + `")).output;`,
+		"rename": `await fs.rename("` + p + `", "` + p + `.bak"); return "moved";`,
+	} {
+		out, isErr := eng.RunMCPExec(context.Background(), ExecInput{Code: code})
+		if !isErr || strings.Contains(out, "written") || strings.Contains(out, "moved") || strings.Contains(out, `"version"`) {
+			t.Fatalf("%s: sandbox reached OAuth state: %s", name, out)
+		}
+	}
+	if raw, _ := os.ReadFile(statePath); string(raw) != `{"version":1}` {
+		t.Fatalf("OAuth state modified: %s", raw)
+	}
+}

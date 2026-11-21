@@ -107,7 +107,7 @@ var rawCommandRules = []commandRule{
 	rule("infra change", `(?i)\b(?:kubectl\s+delete|terraform\s+(?:apply|destroy)|helm\s+uninstall)\b`),
 
 	// --- credentials & self-escalation via shell ---
-	rule("credential access", `(?i)(?:^|[\s"'=:/\\])\.(?:ssh|gnupg|aws|kube)(?:[/\\]|["']|\s|$)|\.git-credentials\b|(?:^|[\s"'/\\])[._]netrc\b|\.docker[/\\]config\.json|\b(?:oauth_creds|mcp_oauth_tokens)\.json\b`),
+	rule("credential access", `(?i)(?:^|[\s"'=:/\\])\.(?:ssh|gnupg|aws|kube)(?:[/\\]|["']|\s|$)|\.git-credentials\b|(?:^|[\s"'/\\])[._]netrc\b|\.docker[/\\]config\.json|\b(?:oauth_creds|mcp_oauth_tokens)\.json\b|\boauth-server(?:[/\\]|["']|\s|$)`),
 	rule("shell startup file", `(?i)(?:>>?\s*|\btee\s+(?:-a\s+)?|\b(?:cp|mv|ln|copy|move|set-content|add-content|out-file)\b`+seg+`*\s)["']?\S*\.(?:bashrc|bash_profile|bash_login|zshrc|zprofile|zshenv|zlogin|profile)\b`),
 	rule("shell startup file", `(?i)(?:>>?\s*|\b(?:set-content|add-content|out-file|copy-item|move-item)\b`+seg+`*\s)["']?\$profile\b`),
 	rule("agent config", `(?i)(?:>>?\s*|\btee\s+(?:-a\s+)?|\b(?:cp|mv|ln|copy|move|set-content|add-content|out-file|copy-item|move-item)\b`+seg+`*\s)["']?\S*[/\\]\.(?:gemini|claude|agents|codex|cursor)[/\\]\S*(?:settings(?:\.local)?\.json|mcp_config\.json|mcp\.json|policy\.json|hooks\.json|config\.toml)`),

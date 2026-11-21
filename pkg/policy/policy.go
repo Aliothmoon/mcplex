@@ -108,6 +108,7 @@ type Options struct {
 	ProtectedFiles        []string // additional config files (e.g. --mcp-config) protected against sandbox writes
 	LoadAntigravityConfig bool     // load ~/.gemini/antigravity-cli/settings.json & ~/.gemini/config/agy-ptc/policy.json & PLUGIN_DATA/policy.json
 	NativeEscalationHint  bool     // include "; run it via native run_command" in DecisionAsk messages
+	SensitivePaths        []string // extra paths denied for BOTH read and write (e.g. <data-dir>/oauth-server token store)
 }
 
 type Engine struct {
@@ -191,6 +192,17 @@ func NewEngineWithOptions(workspaceDir string, opts Options) *Engine {
 	if opts.LoadAntigravityConfig {
 		if pd := strings.TrimSpace(os.Getenv("PLUGIN_DATA")); pd != "" {
 			e.loadSettingsFile(filepath.Join(pd, "policy.json"))
+		}
+	}
+	for _, sp := range opts.SensitivePaths {
+		if sp = strings.TrimSpace(sp); sp == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(sp); err == nil {
+			if real, rerr := evalSymlinksExisting(abs); rerr == nil {
+				abs = real
+			}
+			e.sensitiveDirs = append(e.sensitiveDirs, abs)
 		}
 	}
 	addProtected := func(p string) {

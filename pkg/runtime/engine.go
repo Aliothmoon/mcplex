@@ -19,6 +19,7 @@ import (
 	"github.com/aliothmoon/mcplex/pkg/audit"
 	"github.com/aliothmoon/mcplex/pkg/capabilities"
 	"github.com/aliothmoon/mcplex/pkg/events"
+	"github.com/aliothmoon/mcplex/pkg/oauthserver"
 	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/policy"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
@@ -244,7 +245,16 @@ func (e *Engine) newPolicyForCwd(cwd string) *policy.Engine {
 		ProtectedFiles:        protected,
 		LoadAntigravityConfig: e.antigravityMode,
 		NativeEscalationHint:  e.antigravityMode,
+		SensitivePaths:        e.sensitiveStatePaths(),
 	})
+}
+
+// sensitiveStatePaths lists MCPlex-owned secret stores the sandbox must never read or write (OAuth server tokens).
+func (e *Engine) sensitiveStatePaths() []string {
+	if e.dataDir == "" {
+		return nil
+	}
+	return []string{oauthserver.StateDir(e.dataDir)}
 }
 
 // EventHub returns the real-time event hub for TUI and HTTP SSE consumers.

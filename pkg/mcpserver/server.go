@@ -547,6 +547,9 @@ func (s *Server) handleSingle(ctx context.Context, req jsonRPCRequest) *jsonRPCR
 		if s.opts.Tools.Docs {
 			tools = append(tools, s.docsToolDefinition())
 		}
+		for _, t := range tools {
+			annotateTool(t.(map[string]any))
+		}
 		return &jsonRPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
@@ -1079,4 +1082,25 @@ func parseContentLength(hdr string) int64 {
 		}
 	}
 	return -1
+}
+
+// toolAnnotations are MCP tool behavior hints. Clients such as Gemini require them on every tool and ask the user
+// to confirm calls to tools that are not read-only.
+var toolAnnotations = map[string]map[string]any{
+	"exec":  {"title": "Run TypeScript code mode program", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+	"read":  {"title": "Read file", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+	"spawn": {"title": "Start background command", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+	"task":  {"title": "Manage background tasks", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false},
+	"docs":  {"title": "MCPlex API docs", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+}
+
+func annotateTool(def map[string]any) {
+	name, _ := def["name"].(string)
+	if ann, ok := toolAnnotations[name]; ok {
+		cp := make(map[string]any, len(ann))
+		for k, v := range ann {
+			cp[k] = v
+		}
+		def["annotations"] = cp
+	}
 }

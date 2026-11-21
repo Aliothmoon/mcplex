@@ -23,6 +23,7 @@ import (
 
 	"github.com/aliothmoon/mcplex/pkg/audit"
 	"github.com/aliothmoon/mcplex/pkg/mcpserver"
+	"github.com/aliothmoon/mcplex/pkg/oauthserver"
 	ptcruntime "github.com/aliothmoon/mcplex/pkg/runtime"
 	"github.com/aliothmoon/mcplex/pkg/skill"
 	"github.com/aliothmoon/mcplex/pkg/tui"
@@ -71,6 +72,8 @@ func runMain(argv []string) int {
 		return runLogs(args, true)
 	case "stats":
 		return runStats(args)
+	case "oauth":
+		return runOAuth(args)
 	case "-h", "--help", "help":
 		printUsage()
 		return 0
@@ -97,6 +100,7 @@ Commands:
   run [--code <ts> | file]   Run a TypeScript Code Mode script directly
   skill [--tools all|exec]   Print the Code Mode Skill guide (Markdown)
   logs / errors / stats      Inspect audit logs and execution metrics
+  oauth clients|revoke       List or revoke OAuth clients registered via serve --oauth
   version                    Print version
 
 Core serve flags:
@@ -108,9 +112,11 @@ Core serve flags:
   --strict-root              Confine host file, git, and cwd access strictly to --cwd (+ --allow-root)
   --mcp-config <file>        Downstream mcpServers JSON config (repeatable)
   --policy-file <file>       Custom JSON policy rules file (repeatable)
+  --public-url <url>         Public HTTPS origin when exposed via a tunnel (allowed Host; OAuth issuer)
+  --oauth                    Act as OAuth 2.1 server for OAuth-only clients (needs --public-url, --token)
 
 Advanced flags (run 'mcplex serve -h' for full list):
-  --allow-root, --data-dir, --max-output, --cors-origin, --insecure-no-token, --session-idle-ttl, --compact-schema, --trust-workspace-mcp`)
+  --allow-root, --data-dir, --max-output, --cors-origin, --insecure-no-token, --session-idle-ttl, --oauth-redirect-allow, --compact-schema, --trust-workspace-mcp`)
 }
 
 func parseToolSet(spec string) (mcpserver.ToolSet, error) {
@@ -201,11 +207,15 @@ func runServe(args []string) int {
 	insecureNoToken := fs.Bool("insecure-no-token", false, "Allow non-loopback HTTP bind or wildcard CORS without --token")
 	sessionIdleTTL := fs.Duration("session-idle-ttl", 30*time.Minute, "HTTP mode: close sessions idle this long (kills their background tasks incl. daemons; 0 disables)")
 	uiMode := fs.Bool("ui", false, "Launch interactive TUI console (defaults --http to 127.0.0.1:8787)")
+	publicURL := fs.String("public-url", "", "Public HTTPS origin of this server when exposed through a tunnel (e.g. https://mcp.example.com); allowed as Host and used as OAuth issuer")
+	oauthEnabled := fs.Bool("oauth", false, "HTTP mode: act as an OAuth 2.1 authorization server so OAuth-only MCP clients (e.g. Gemini custom apps) can connect; needs --public-url and --token (owner secret)")
 
 	var extraRoots, mcpConfigs, policyFiles stringListFlag
 	fs.Var(&extraRoots, "allow-root", "Additional allowed workspace root (repeatable)")
 	fs.Var(&mcpConfigs, "mcp-config", "Downstream mcpServers JSON config path (repeatable)")
 	fs.Var(&policyFiles, "policy-file", "Custom JSON policy file (repeatable)")
+	var oauthRedirects stringListFlag
+	fs.Var(&oauthRedirects, "oauth-redirect-allow", "Extra allowed OAuth redirect URI pattern (repeatable; trailing * = prefix, \"loopback\" = local native clients). Google redirect URIs are always allowed")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -241,6 +251,12 @@ func runServe(args []string) int {
 		return 1
 	}
 
+	allowedHosts, oauthSrv, oErr := buildPublicExposure(*httpAddr, *httpPath, *publicURL, *oauthEnabled, *token, *dataDir, oauthRedirects)
+	if oErr != nil {
+		fmt.Fprintf(os.Stderr, "mcplex oauth error: %v\n", oErr)
+		return 1
+	}
+
 	if strings.TrimSpace(*httpAddr) != "" {
 		preOpts := mcpserver.HTTPOptions{
 			Addr:                 *httpAddr,
@@ -249,6 +265,8 @@ func runServe(args []string) int {
 			AllowOrigin:          *corsOrigin,
 			AllowInsecureNoToken: *insecureNoToken,
 			SessionIdleTTL:       httpSessionTTL(*sessionIdleTTL),
+			AllowedHosts:         allowedHosts,
+			OAuth:                oauthSrv,
 		}
 		if vErr := mcpserver.ValidateHTTPOptions(preOpts); vErr != nil {
 			fmt.Fprintf(os.Stderr, "mcplex http security error: %v\n", vErr)
@@ -307,6 +325,14 @@ func runServe(args []string) int {
 			AllowOrigin:          *corsOrigin,
 			AllowInsecureNoToken: *insecureNoToken,
 			SessionIdleTTL:       httpSessionTTL(*sessionIdleTTL),
+			AllowedHosts:         allowedHosts,
+			OAuth:                oauthSrv,
+		}
+		if oauthSrv != nil {
+			fmt.Fprintf(os.Stderr, "mcplex OAuth enabled: add %s as a custom MCP app in your client and approve it with your --token on the consent page\n", oauthSrv.Resource())
+			if len(*token) < 16 {
+				fmt.Fprintln(os.Stderr, "[WARN] --token is the OAuth owner secret; use at least 16 random characters")
+			}
 		}
 		if *token == "" && !mcpserver.IsLoopbackBindAddr(*httpAddr) {
 			fmt.Fprintf(os.Stderr, "[WARN] mcplex HTTP is binding non-loopback address %q WITHOUT --token (--insecure-no-token enabled)!\n", *httpAddr)
@@ -534,4 +560,94 @@ func httpSessionTTL(flagVal time.Duration) time.Duration {
 		return -1
 	}
 	return flagVal
+}
+
+// buildPublicExposure validates --public-url / --oauth and returns the extra allowed Host header(s) plus the OAuth
+// authorization server (nil when --oauth is off).
+func buildPublicExposure(httpAddr, httpPath, publicURL string, oauthOn bool, token, dataDir string, redirects []string) ([]string, *oauthserver.Server, error) {
+	publicURL = strings.TrimSpace(publicURL)
+	if !oauthOn && publicURL == "" {
+		return nil, nil, nil
+	}
+	if strings.TrimSpace(httpAddr) == "" {
+		return nil, nil, errors.New("--public-url / --oauth require HTTP mode (--http or --ui)")
+	}
+	if !oauthOn {
+		u, err := url.Parse(publicURL)
+		if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+			return nil, nil, fmt.Errorf("invalid --public-url %q (expected e.g. https://mcp.example.com)", publicURL)
+		}
+		return []string{u.Host}, nil, nil
+	}
+	if strings.TrimSpace(token) == "" {
+		return nil, nil, errors.New("--oauth requires --token (or MCPLEX_TOKEN): it is the owner secret typed on the consent page")
+	}
+	srv, err := oauthserver.New(oauthserver.Config{
+		PublicURL:     publicURL,
+		MCPPath:       httpPath,
+		OwnerSecret:   token,
+		DataDir:       dataDir,
+		RedirectAllow: redirects,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return []string{srv.PublicHost()}, srv, nil
+}
+
+// runOAuth manages OAuth clients registered by `serve --oauth`: list them or revoke their grants/tokens.
+func runOAuth(args []string) int {
+	if len(args) == 0 || (args[0] != "clients" && args[0] != "revoke") {
+		fmt.Fprintln(os.Stderr, "usage: mcplex oauth clients [--data-dir dir] [--json]\n       mcplex oauth revoke <client-id...|all> [--data-dir dir]")
+		return 1
+	}
+	action := args[0]
+	fs := flag.NewFlagSet("oauth "+action, flag.ContinueOnError)
+	dataDir := fs.String("data-dir", defaultDataDir(), "Data directory used by `mcplex serve`")
+	asJSON := fs.Bool("json", false, "Output JSON")
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 1
+	}
+	switch action {
+	case "clients":
+		list, err := oauthserver.ListClients(*dataDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "oauth clients error: %v\n", err)
+			return 1
+		}
+		if *asJSON {
+			raw, _ := json.MarshalIndent(list, "", "  ")
+			fmt.Println(string(raw))
+			return 0
+		}
+		if len(list) == 0 {
+			fmt.Println("No OAuth clients registered.")
+			return 0
+		}
+		for _, c := range list {
+			name := c.Name
+			if name == "" {
+				name = "(unnamed)"
+			}
+			fmt.Printf("%s  %-20s  grants=%d  auth=%s  last-used=%s\n    redirect: %s\n",
+				c.ID, name, c.Grants, c.AuthMethod, c.LastUsedAt.Local().Format("2006-01-02 15:04"), strings.Join(c.Redirects, ", "))
+		}
+		return 0
+	default: // revoke
+		ids := fs.Args()
+		if len(ids) == 0 {
+			fmt.Fprintln(os.Stderr, "mcplex oauth revoke: pass client IDs (see `mcplex oauth clients`) or `all`")
+			return 1
+		}
+		n, err := oauthserver.RevokeClients(*dataDir, ids)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "oauth revoke error: %v\n", err)
+			return 1
+		}
+		fmt.Printf("Revoked %d client(s); their access and refresh tokens no longer work.\n", n)
+		return 0
+	}
 }

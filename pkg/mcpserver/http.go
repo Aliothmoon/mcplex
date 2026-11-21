@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/aliothmoon/mcplex/pkg/events"
+	"github.com/aliothmoon/mcplex/pkg/oauthserver"
 	ptcruntime "github.com/aliothmoon/mcplex/pkg/runtime"
 )
 
@@ -38,6 +39,12 @@ type HTTPOptions struct {
 	AllowOrigin          string        // optional CORS Access-Control-Allow-Origin value
 	AllowInsecureNoToken bool          // explicitly permit non-loopback bind or wildcard CORS without Token
 	SessionIdleTTL       time.Duration // idle session TTL before auto-reaping tasks/spills (0 -> 30m, <0 disables)
+	// AllowedHosts are extra Host header values accepted on a loopback bind, e.g. the public hostname of a
+	// Cloudflare tunnel (--public-url). DNS rebinding cannot make such a public name resolve to the victim loopback.
+	AllowedHosts []string
+	// OAuth, when set, serves the OAuth 2.1 authorization server + metadata endpoints and accepts its access tokens
+	// on the MCP endpoint (in addition to Token). Its public host is added to the Host-header allowlist.
+	OAuth *oauthserver.Server
 }
 
 // ValidateHTTPOptions enforces safe-by-default authentication invariants before exposing HTTP endpoints.
@@ -282,10 +289,36 @@ func (s *Server) httpHandlerWithRegistry(opts HTTPOptions, reg *httpSessionRegis
 	// legitimately send non-loopback Host headers, so the allowlist would only lock them out.
 	loopbackBind := strings.TrimSpace(opts.Addr) == "" || IsLoopbackBindAddr(opts.Addr)
 	enforceHostGuard := loopbackBind || (strings.TrimSpace(opts.Token) == "" && !opts.AllowInsecureNoToken)
+	// hostAllowed also admits AllowedHosts and the OAuth public host (e.g. a Cloudflare tunnel hostname forwarded to a
+	// loopback bind); DNS rebinding cannot point that public name at the victim's loopback.
+	hostAllowed := func(r *http.Request) bool {
+		if !enforceHostGuard || isAllowedHostHeader(r.Host, opts.Addr) {
+			return true
+		}
+		reqHost := extractHostname(r.Host)
+		for _, h := range opts.AllowedHosts {
+			if reqHost != "" && strings.EqualFold(reqHost, extractHostname(h)) {
+				return true
+			}
+		}
+		return opts.OAuth != nil && strings.EqualFold(reqHost, extractHostname(opts.OAuth.PublicHost()))
+	}
 
 	mux := http.NewServeMux()
+	if opts.OAuth != nil {
+		for path, h := range opts.OAuth.Routes() {
+			handler := h
+			mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+				if !hostAllowed(r) {
+					writeJSONHTTPError(w, http.StatusForbidden, "forbidden host")
+					return
+				}
+				handler(w, r)
+			})
+		}
+	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if enforceHostGuard && !isAllowedHostHeader(r.Host, opts.Addr) {
+		if !hostAllowed(r) {
 			writeJSONHTTPError(w, http.StatusForbidden, "forbidden host")
 			return
 		}
@@ -298,7 +331,7 @@ func (s *Server) httpHandlerWithRegistry(opts HTTPOptions, reg *httpSessionRegis
 	})
 
 	checkAuthAndOrigin := func(w http.ResponseWriter, r *http.Request) bool {
-		if enforceHostGuard && !isAllowedHostHeader(r.Host, opts.Addr) {
+		if !hostAllowed(r) {
 			writeJSONHTTPError(w, http.StatusForbidden, "forbidden host")
 			return false
 		}
@@ -456,7 +489,7 @@ func (s *Server) httpHandlerWithRegistry(opts HTTPOptions, reg *httpSessionRegis
 
 	mux.HandleFunc(mcpPath, func(w http.ResponseWriter, r *http.Request) {
 		reapIdle(false)
-		if enforceHostGuard && !isAllowedHostHeader(r.Host, opts.Addr) {
+		if !hostAllowed(r) {
 			writeJSONHTTPError(w, http.StatusForbidden, "forbidden host")
 			return
 		}
@@ -475,9 +508,8 @@ func (s *Server) httpHandlerWithRegistry(opts HTTPOptions, reg *httpSessionRegis
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		if opts.Token != "" && !validBearerToken(r.Header.Get("Authorization"), opts.Token) {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="mcplex"`)
-			writeJSONHTTPError(w, http.StatusUnauthorized, "unauthorized")
+		if !mcpAuthorized(r, opts) {
+			writeMCPUnauthorized(w, r, opts)
 			return
 		}
 		if r.Method == http.MethodDelete {
@@ -747,6 +779,45 @@ func isLoopbackHost(host string) bool {
 		return ip.IsLoopback()
 	}
 	return false
+}
+
+// mcpAuthorized accepts the static --token bearer and, when OAuth is enabled, access tokens issued by it.
+// With neither configured (loopback-only dev mode) the endpoint stays open, as before.
+func mcpAuthorized(r *http.Request, opts HTTPOptions) bool {
+	header := r.Header.Get("Authorization")
+	if opts.Token == "" && opts.OAuth == nil {
+		return true
+	}
+	if opts.Token != "" && validBearerToken(header, opts.Token) {
+		return true
+	}
+	if opts.OAuth != nil {
+		if tok, ok := bearerValue(header); ok && opts.OAuth.VerifyAccessToken(tok) {
+			return true
+		}
+	}
+	return false
+}
+
+// writeMCPUnauthorized answers 401 with an RFC 6750 challenge; with OAuth enabled it carries the RFC 9728
+// resource_metadata URL that MCP clients use to discover the authorization server.
+func writeMCPUnauthorized(w http.ResponseWriter, r *http.Request, opts HTTPOptions) {
+	if opts.OAuth != nil {
+		_, presented := bearerValue(r.Header.Get("Authorization"))
+		w.Header().Set("WWW-Authenticate", opts.OAuth.WWWAuthenticate(presented))
+	} else {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="mcplex"`)
+	}
+	writeJSONHTTPError(w, http.StatusUnauthorized, "unauthorized")
+}
+
+func bearerValue(header string) (string, bool) {
+	const prefix = "bearer "
+	if len(header) < len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return "", false
+	}
+	tok := strings.TrimSpace(header[len(prefix):])
+	return tok, tok != ""
 }
 
 func validBearerToken(header, expected string) bool {
