@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -59,18 +60,6 @@ func TestReadSSELineLargeAndOversizedDiscard(t *testing.T) {
 }
 
 func TestSSESourceInstanceRestartResetsLastSeqAndIdleWatchdog(t *testing.T) {
-	origIdle := sseIdleTimeout
-	origBackoff := sseInitialBackoff
-	origMaxBackoff := sseMaxBackoff
-	sseIdleTimeout = 60 * time.Millisecond
-	sseInitialBackoff = 10 * time.Millisecond
-	sseMaxBackoff = 20 * time.Millisecond
-	defer func() {
-		sseIdleTimeout = origIdle
-		sseInitialBackoff = origBackoff
-		sseMaxBackoff = origMaxBackoff
-	}()
-
 	var attempt atomic.Int32
 	gotThirdReqHeaders := make(chan http.Header, 1)
 
@@ -125,7 +114,11 @@ func TestSSESourceInstanceRestartResetsLastSeqAndIdleWatchdog(t *testing.T) {
 	defer cancel()
 
 	// Pass /mcp URL (printed by `mcplex serve`) to verify normalizeEventsURL strips /mcp end-to-end!
-	src := NewSSESource(ctx, srv.URL+"/mcp", "secret", "")
+	src := newSSESourceWithOptions(ctx, srv.URL+"/mcp", "secret", "", sseOptions{
+		idleTimeout:    60 * time.Millisecond,
+		initialBackoff: 10 * time.Millisecond,
+		maxBackoff:     20 * time.Millisecond,
+	})
 	defer src.Close()
 
 	var seenPaths []string
@@ -151,5 +144,52 @@ func TestSSESourceInstanceRestartResetsLastSeqAndIdleWatchdog(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for 3rd SSE reconnect request")
+	}
+}
+
+func TestEventSourcesCloseIdempotentAndJoinsGoroutine(t *testing.T) {
+	hub := events.NewHub(32)
+	for i := 0; i < 16; i++ {
+		hub.Emit(events.Event{Kind: events.KindFileRead, Tool: "fs.read", Path: "x.go"})
+	}
+	localSrc := NewLocalHubSource(hub, "")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	sseSrc := newSSESourceWithOptions(context.Background(), srv.URL, "", "", sseOptions{
+		idleTimeout:    time.Second,
+		initialBackoff: 5 * time.Millisecond,
+		maxBackoff:     10 * time.Millisecond,
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			localSrc.Close()
+		}()
+		go func() {
+			defer wg.Done()
+			sseSrc.Close()
+		}()
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() deadlocked or failed to join background goroutine")
 	}
 }

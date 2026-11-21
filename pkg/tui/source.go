@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -15,13 +16,26 @@ import (
 	"github.com/aliothmoon/mcplex/pkg/events"
 )
 
-const maxSSELineBytes = 16 * 1024 * 1024
-
-var (
-	sseIdleTimeout    = 60 * time.Second
-	sseInitialBackoff = 400 * time.Millisecond
-	sseMaxBackoff     = 3 * time.Second
+const (
+	maxSSELineBytes          = 16 * 1024 * 1024
+	defaultSSEIdleTimeout    = 60 * time.Second
+	defaultSSEInitialBackoff = 400 * time.Millisecond
+	defaultSSEMaxBackoff     = 3 * time.Second
 )
+
+type sseOptions struct {
+	idleTimeout    time.Duration
+	initialBackoff time.Duration
+	maxBackoff     time.Duration
+}
+
+func defaultSSEOptions() sseOptions {
+	return sseOptions{
+		idleTimeout:    defaultSSEIdleTimeout,
+		initialBackoff: defaultSSEInitialBackoff,
+		maxBackoff:     defaultSSEMaxBackoff,
+	}
+}
 
 type eventMsg struct {
 	Event events.Event
@@ -42,16 +56,20 @@ type EventSource interface {
 
 type localHubSource struct {
 	ch     chan tea.Msg
+	done   chan struct{}
+	once   sync.Once
 	cancel func()
 }
 
 // NewLocalHubSource attaches directly to an in-process events.Hub (zero network overhead for `--http ... --ui`).
 func NewLocalHubSource(hub *events.Hub, sessionFilter string) EventSource {
 	out := make(chan tea.Msg, 256)
+	done := make(chan struct{})
 	subCh, history, subCancel := hub.Subscribe(sessionFilter, 200, 0)
 	stopCh := make(chan struct{})
 
 	go func() {
+		defer close(done)
 		defer close(out)
 		for _, ev := range history {
 			select {
@@ -78,7 +96,8 @@ func NewLocalHubSource(hub *events.Hub, sessionFilter string) EventSource {
 	}()
 
 	return &localHubSource{
-		ch: out,
+		ch:   out,
+		done: done,
 		cancel: func() {
 			close(stopCh)
 			subCancel()
@@ -87,27 +106,44 @@ func NewLocalHubSource(hub *events.Hub, sessionFilter string) EventSource {
 }
 
 func (s *localHubSource) Messages() <-chan tea.Msg { return s.ch }
-func (s *localHubSource) Close()                   { s.cancel() }
+func (s *localHubSource) Close() {
+	s.once.Do(func() {
+		s.cancel()
+		<-s.done
+	})
+}
 
 type sseSource struct {
 	ch     chan tea.Msg
+	done   chan struct{}
+	once   sync.Once
 	cancel context.CancelFunc
 }
 
 // NewSSESource connects to a running `mcplex serve --http` instance's `GET /events` SSE stream
 // with automatic Last-Event-ID reconnection.
 func NewSSESource(parentCtx context.Context, baseURL, token, sessionFilter string) EventSource {
+	return newSSESourceWithOptions(parentCtx, baseURL, token, sessionFilter, defaultSSEOptions())
+}
+
+func newSSESourceWithOptions(parentCtx context.Context, baseURL, token, sessionFilter string, opts sseOptions) EventSource {
 	ctx, cancel := context.WithCancel(parentCtx)
 	out := make(chan tea.Msg, 256)
+	done := make(chan struct{})
 
 	endpoint := normalizeEventsURL(baseURL, sessionFilter)
-	go runSSELoop(ctx, endpoint, token, out)
+	go runSSELoop(ctx, endpoint, token, opts, out, done)
 
-	return &sseSource{ch: out, cancel: cancel}
+	return &sseSource{ch: out, done: done, cancel: cancel}
 }
 
 func (s *sseSource) Messages() <-chan tea.Msg { return s.ch }
-func (s *sseSource) Close()                   { s.cancel() }
+func (s *sseSource) Close() {
+	s.once.Do(func() {
+		s.cancel()
+		<-s.done
+	})
+}
 
 func normalizeEventsURL(rawURL, sessionFilter string) string {
 	u := strings.TrimSpace(rawURL)
@@ -207,12 +243,22 @@ func trimSSECRLF(b []byte) string {
 	return string(b)
 }
 
-func runSSELoop(ctx context.Context, endpoint, token string, out chan<- tea.Msg) {
+func runSSELoop(ctx context.Context, endpoint, token string, opts sseOptions, out chan<- tea.Msg, done chan<- struct{}) {
+	defer close(done)
 	defer close(out)
+	if opts.idleTimeout <= 0 {
+		opts.idleTimeout = defaultSSEIdleTimeout
+	}
+	if opts.initialBackoff <= 0 {
+		opts.initialBackoff = defaultSSEInitialBackoff
+	}
+	if opts.maxBackoff <= 0 {
+		opts.maxBackoff = defaultSSEMaxBackoff
+	}
 	client := &http.Client{Timeout: 0} // SSE stream has no overall request timeout; guarded by idle watchdog
 	var lastSeq int64
 	var lastInstance string
-	backoff := sseInitialBackoff
+	backoff := opts.initialBackoff
 
 	for {
 		if ctx.Err() != nil {
@@ -222,7 +268,10 @@ func runSSELoop(ctx context.Context, endpoint, token string, out chan<- tea.Msg)
 		req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			attemptCancel()
-			out <- connStatusMsg{Connected: false, Note: err.Error()}
+			select {
+			case out <- connStatusMsg{Connected: false, Note: err.Error()}:
+			case <-ctx.Done():
+			}
 			return
 		}
 		req.Header.Set("Accept", "text/event-stream")
@@ -253,7 +302,7 @@ func runSSELoop(ctx context.Context, endpoint, token string, out chan<- tea.Msg)
 				return
 			}
 		} else {
-			backoff = sseInitialBackoff
+			backoff = opts.initialBackoff
 			inst := strings.TrimSpace(resp.Header.Get("X-MCPlex-Instance"))
 			if inst != "" {
 				if lastInstance != "" && inst != lastInstance {
@@ -269,10 +318,7 @@ func runSSELoop(ctx context.Context, endpoint, token string, out chan<- tea.Msg)
 				return
 			}
 
-			idleDur := sseIdleTimeout
-			if idleDur <= 0 {
-				idleDur = 60 * time.Second
-			}
+			idleDur := opts.idleTimeout
 			idleTimer := time.AfterFunc(idleDur, func() {
 				attemptCancel()
 				_ = resp.Body.Close()
@@ -322,12 +368,17 @@ func runSSELoop(ctx context.Context, endpoint, token string, out chan<- tea.Msg)
 			}
 		}
 
+		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-time.After(backoff):
-			if backoff < sseMaxBackoff {
+		case <-timer.C:
+			if backoff < opts.maxBackoff {
 				backoff *= 2
+				if backoff > opts.maxBackoff {
+					backoff = opts.maxBackoff
+				}
 			}
 		}
 	}
