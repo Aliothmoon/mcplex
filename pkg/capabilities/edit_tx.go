@@ -10,7 +10,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
+	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/policy"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
 )
@@ -842,7 +845,7 @@ func closestLineHint(fileText, target string) string {
 	anchor := ""
 	for _, l := range targetLines {
 		t := strings.TrimSpace(l)
-		if len(t) >= 4 {
+		if utf8.RuneCountInString(t) >= 3 {
 			anchor = t
 			break
 		}
@@ -854,7 +857,9 @@ func closestLineHint(fileText, target string) string {
 	bestIdx := -1
 	bestScore := 0
 	anchorLower := strings.ToLower(anchor)
+	anchorRunes := utf8.RuneCountInString(anchorLower)
 	words := strings.Fields(anchorLower)
+	anchorBigrams := runeBigrams(anchorLower)
 
 	for i, fl := range fileLines {
 		ft := strings.TrimSpace(fl)
@@ -867,17 +872,57 @@ func closestLineHint(fileText, target string) string {
 			score = 100
 		} else if flLower == anchorLower {
 			score = 90
-		} else if strings.Contains(flLower, anchorLower) || strings.Contains(anchorLower, flLower) {
-			score = 70
-		} else if len(words) > 0 {
-			matched := 0
-			for _, w := range words {
-				if len(w) >= 3 && strings.Contains(flLower, w) {
-					matched++
+		} else {
+			if strings.Contains(flLower, anchorLower) {
+				s := 75
+				if len(flLower) > 0 {
+					s += (10 * len(anchorLower)) / len(flLower)
+				}
+				if s > score {
+					score = s
+				}
+			} else if strings.Contains(anchorLower, flLower) {
+				// Only reward candidate-inside-anchor containment when the candidate line
+				// is substantial (prevents 1-char punctuation lines like `]` or `}` from
+				// hijacking the closest hint for a long target line).
+				flRunes := utf8.RuneCountInString(flLower)
+				if flRunes >= 8 && flRunes*3 >= anchorRunes {
+					s := 30 + (45*flRunes)/anchorRunes
+					if s > score {
+						score = s
+					}
 				}
 			}
-			if matched > 0 {
-				score = (matched * 60) / len(words)
+			if len(words) > 0 {
+				matched := 0
+				for _, w := range words {
+					if utf8.RuneCountInString(w) >= 3 && strings.Contains(flLower, w) {
+						matched++
+					}
+				}
+				if matched > 0 {
+					ws := (matched * 65) / len(words)
+					if ws > score {
+						score = ws
+					}
+				}
+			}
+			if len(anchorBigrams) > 0 {
+				flBigrams := runeBigrams(flLower)
+				if len(flBigrams) > 0 {
+					overlap := 0
+					for bg := range anchorBigrams {
+						if _, ok := flBigrams[bg]; ok {
+							overlap++
+						}
+					}
+					if overlap > 0 {
+						bs := (2 * overlap * 80) / (len(anchorBigrams) + len(flBigrams))
+						if bs > score {
+							score = bs
+						}
+					}
+				}
 			}
 		}
 		if score > bestScore {
@@ -894,11 +939,34 @@ func closestLineHint(fileText, target string) string {
 	for i := from; i <= to; i++ {
 		line := fileLines[i]
 		if len(line) > 120 {
-			line = line[:120] + "…"
+			line = output.SliceUTF8Bytes(line, 120) + "…"
 		}
 		snip = append(snip, fmt.Sprintf("    %d: %s", i+1, line))
 	}
 	return fmt.Sprintf("; closest L%d-%d:\n%s", from+1, to+1, strings.Join(snip, "\n"))
+}
+
+// runeBigrams builds a bounded set of non-whitespace Unicode character bigrams for
+// language-agnostic line similarity (especially effective on CJK/unspaced text).
+func runeBigrams(s string) map[string]struct{} {
+	runes := make([]rune, 0, minInt(len(s), 256))
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			continue
+		}
+		runes = append(runes, r)
+		if len(runes) >= 256 {
+			break
+		}
+	}
+	if len(runes) < 2 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(runes)-1)
+	for i := 0; i < len(runes)-1; i++ {
+		out[string(runes[i:i+2])] = struct{}{}
+	}
+	return out
 }
 
 func parseEditApplyArgs(args []any) (specs []FileEditSpec, dryRun bool, bestEffort bool, verifyCmd string, err error) {

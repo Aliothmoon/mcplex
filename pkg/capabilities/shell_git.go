@@ -442,7 +442,7 @@ func (b *ShellGitBinder) RunChecksBatch(ctx context.Context, baseCwd string, arg
 			if nm == "" {
 				nm = cmdStr
 				if len(nm) > 36 {
-					nm = nm[:36] + "..."
+					nm = output.SliceUTF8Bytes(nm, 36) + "..."
 				}
 			}
 			specs = append(specs, checkSpec{
