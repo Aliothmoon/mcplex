@@ -578,7 +578,7 @@ func (m *Manager) lookup(taskID, sessionID string) (*managedTask, error) {
 	if !ok {
 		return nil, fmt.Errorf("task %q not found", id)
 	}
-	if sid != "" && tk.sessionID != "" && tk.sessionID != sid {
+	if tk.sessionID != sid {
 		return nil, fmt.Errorf("task %q not found in current session", id)
 	}
 	return tk, nil
@@ -590,7 +590,7 @@ func (m *Manager) listSummaries(sessionID string) []TaskSummary {
 	ordered := make([]*managedTask, 0, len(m.order))
 	for _, id := range m.order {
 		if tk, ok := m.tasks[id]; ok {
-			if sid != "" && tk.sessionID != "" && tk.sessionID != sid {
+			if tk.sessionID != sid {
 				continue
 			}
 			ordered = append(ordered, tk)
@@ -619,7 +619,7 @@ func (m *Manager) killMatching(sessionID string) int {
 	m.mu.Lock()
 	var targets []*managedTask
 	for _, tk := range m.tasks {
-		if sid != "" && tk.sessionID != sid {
+		if tk.sessionID != sid {
 			continue
 		}
 		if tk.currentStatus() == StatusRunning {
@@ -797,22 +797,36 @@ func (tk *managedTask) waitFor(ctx context.Context, waitMs int, expectPattern st
 	matchLine := ""
 	timedOut := false
 
+	var scanFrom int64
 	for {
+		var chunk []byte
 		tk.mu.Lock()
-		if re != nil {
-			if line, ok := findMatchingLine(tk.memBuf, re); ok {
+		if re != nil && tk.totalBytes > scanFrom {
+			relStart := int(max(int64(0), scanFrom-tk.memBaseOff))
+			if relStart > len(tk.memBuf) {
+				relStart = len(tk.memBuf)
+			}
+			// Back up to the start of the line so patterns split across writes still match.
+			for relStart > 0 && tk.memBuf[relStart-1] != '\n' {
+				relStart--
+			}
+			chunk = append([]byte(nil), tk.memBuf[relStart:]...)
+			scanFrom = tk.totalBytes
+		}
+		running := tk.status == StatusRunning
+		ch := tk.wakeCh
+		tk.mu.Unlock()
+
+		if re != nil && len(chunk) > 0 {
+			if line, ok := findMatchingLine(chunk, re); ok {
 				matched = true
 				matchLine = line
-				tk.mu.Unlock()
 				break
 			}
 		}
-		if tk.status != StatusRunning {
-			tk.mu.Unlock()
+		if !running {
 			break
 		}
-		ch := tk.wakeCh
-		tk.mu.Unlock()
 
 		select {
 		case <-ch:

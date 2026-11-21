@@ -69,7 +69,7 @@ func (b *FSSearchBinder) fileOps(env *sandbox.ExecutionEnv) map[string]sandbox.A
 			return nil, os.MkdirAll(abs, 0o755)
 		},
 		// fs.rm(path, { force? }): removes a file, symlink or empty dir. Non-empty dirs need approval (recursive delete).
-		"rm": func(_ context.Context, args []any) (any, error) {
+		"rm": func(ctx context.Context, args []any) (any, error) {
 			p, err := requireStringArg(args, 0, "path")
 			if err != nil {
 				return nil, err
@@ -78,6 +78,13 @@ func (b *FSSearchBinder) fileOps(env *sandbox.ExecutionEnv) map[string]sandbox.A
 			abs, err := b.Policy.ResolveAndCheckWrite(env.Cwd, p)
 			if err != nil {
 				return nil, err
+			}
+			if b.Locks != nil {
+				relLock, lockErr := b.Locks.AcquireIn(ctx, env.Cwd, lockOwnerForEnv(env), abs)
+				if lockErr != nil {
+					return nil, lockErr
+				}
+				defer relLock()
 			}
 			info, err := os.Lstat(abs)
 			if err != nil {
@@ -97,7 +104,7 @@ func (b *FSSearchBinder) fileOps(env *sandbox.ExecutionEnv) map[string]sandbox.A
 			return nil, os.Remove(abs)
 		},
 		// fs.rename(from, to): moves/renames a file or dir, creating the target's parent; overwrites files like Node.
-		"rename": func(_ context.Context, args []any) (any, error) {
+		"rename": func(ctx context.Context, args []any) (any, error) {
 			from, err := requireStringArg(args, 0, "from")
 			if err != nil {
 				return nil, err
@@ -114,6 +121,13 @@ func (b *FSSearchBinder) fileOps(env *sandbox.ExecutionEnv) map[string]sandbox.A
 			if err != nil {
 				return nil, err
 			}
+			if b.Locks != nil {
+				relLock, lockErr := b.Locks.AcquireIn(ctx, env.Cwd, lockOwnerForEnv(env), absFrom, absTo)
+				if lockErr != nil {
+					return nil, lockErr
+				}
+				defer relLock()
+			}
 			if _, err := os.Lstat(absFrom); err != nil {
 				return nil, err
 			}
@@ -123,7 +137,7 @@ func (b *FSSearchBinder) fileOps(env *sandbox.ExecutionEnv) map[string]sandbox.A
 			return nil, os.Rename(absFrom, absTo)
 		},
 		// fs.cp(from, to, { recursive? }): copies a file, or a directory tree with { recursive: true } (like Node fs.cp).
-		"cp": func(_ context.Context, args []any) (any, error) {
+		"cp": func(ctx context.Context, args []any) (any, error) {
 			from, err := requireStringArg(args, 0, "from")
 			if err != nil {
 				return nil, err
@@ -146,6 +160,13 @@ func (b *FSSearchBinder) fileOps(env *sandbox.ExecutionEnv) map[string]sandbox.A
 				if err != nil {
 					return nil, err
 				}
+				if b.Locks != nil {
+					relLock, lockErr := b.Locks.AcquireIn(ctx, env.Cwd, lockOwnerForEnv(env), absTo)
+					if lockErr != nil {
+						return nil, lockErr
+					}
+					defer relLock()
+				}
 				return nil, copyFile(absFrom, absTo)
 			}
 			if !optBool(opts, "recursive", false) {
@@ -167,13 +188,27 @@ func (b *FSSearchBinder) fileOps(env *sandbox.ExecutionEnv) map[string]sandbox.A
 			if walkErr != nil {
 				return nil, walkErr
 			}
+			type copyPair struct{ src, dst string }
+			pairs := make([]copyPair, 0, len(files))
+			dstPaths := make([]string, 0, len(files))
 			for _, src := range files {
 				rel, _ := filepath.Rel(absFrom, src)
 				dst, err := b.Policy.ResolveAndCheckWrite(env.Cwd, filepath.Join(to, rel))
 				if err != nil {
 					return nil, err
 				}
-				if err := copyFile(src, dst); err != nil {
+				pairs = append(pairs, copyPair{src: src, dst: dst})
+				dstPaths = append(dstPaths, dst)
+			}
+			if b.Locks != nil && len(dstPaths) > 0 {
+				relLock, lockErr := b.Locks.AcquireIn(ctx, env.Cwd, lockOwnerForEnv(env), dstPaths...)
+				if lockErr != nil {
+					return nil, lockErr
+				}
+				defer relLock()
+			}
+			for _, pair := range pairs {
+				if err := copyFile(pair.src, pair.dst); err != nil {
 					return nil, err
 				}
 			}

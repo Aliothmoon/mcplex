@@ -14,7 +14,8 @@ func TestWindowsAlternateDataStreamDetection(t *testing.T) {
 		`C:\repo\.git\config::$DATA`,
 		`foo.txt:hidden`,
 		`\\.\PhysicalDrive0`,
-		`\\?\C:\Windows\win.ini`,
+		`\\?\GLOBALROOT\Device\Harddisk0`,
+		`\\?\C:\repo\.git\config::$DATA`,
 	}
 	for _, p := range blocked {
 		if !hasWindowsAlternateDataStream(p) {

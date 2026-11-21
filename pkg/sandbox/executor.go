@@ -125,8 +125,11 @@ type inFlightEntry struct {
 	startedAt  time.Time
 }
 
+var sandboxExecSeq atomic.Int64
+
 // ExecutionEnv represents one isolated VM run and provides safe host binding helpers.
 type ExecutionEnv struct {
+	ExecID     string
 	Ctx        context.Context
 	Cwd        string
 	VM         *goja.Runtime
@@ -492,6 +495,7 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 	vm.SetFieldNameMapper(goja.TagFieldNameMapper("json", true))
 
 	env := &ExecutionEnv{
+		ExecID:    fmt.Sprintf("exec:%d", sandboxExecSeq.Add(1)),
 		Ctx:       ctx,
 		Cwd:       req.Cwd,
 		VM:        vm,

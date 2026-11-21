@@ -788,17 +788,47 @@ func (e *Engine) isProtectedSystemRoot(realPath string) bool {
 	if runtime.GOOS == "windows" {
 		return isProtectedWindowsSystemRoot(realPath)
 	}
-	// On Unix/macOS, allow explicitly configured workspace roots (e.g. Docker WORKDIR /usr/src/app).
-	if e.isInsideWorkspace(realPath) {
-		return false
-	}
+	return e.isProtectedUnixSystemRoot(realPath)
+}
+
+func (e *Engine) isProtectedUnixSystemRoot(realPath string) bool {
 	norm := strings.TrimSuffix(strings.ToLower(filepath.ToSlash(filepath.Clean(realPath))), "/")
+	matchedSys := ""
 	for _, sys := range []string{"/etc", "/usr", "/bin", "/sbin", "/boot", "/system", "/lib", "/lib64"} {
 		if norm == sys || strings.HasPrefix(norm, sys+"/") {
-			return true
+			matchedSys = sys
+			break
 		}
 	}
-	return false
+	if matchedSys == "" {
+		return false
+	}
+	// Never exempt /etc, /bin, /sbin, /boot, /system, /lib, /lib64 — even if cwd is "/" or "/etc".
+	// Only allow explicitly configured workspace roots strictly nested under /usr/ (e.g. Docker WORKDIR /usr/src/app)
+	// and outside core /usr system subdirectories.
+	if matchedSys != "/usr" {
+		return true
+	}
+	for _, root := range e.workspaceRoots {
+		nr := strings.TrimSuffix(strings.ToLower(filepath.ToSlash(filepath.Clean(root))), "/")
+		if !strings.HasPrefix(nr, "/usr/") {
+			continue
+		}
+		protectedUsrSub := false
+		for _, sub := range []string{"/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/libexec", "/usr/share", "/usr/include"} {
+			if nr == sub || strings.HasPrefix(nr, sub+"/") {
+				protectedUsrSub = true
+				break
+			}
+		}
+		if protectedUsrSub {
+			continue
+		}
+		if norm == nr || strings.HasPrefix(norm, nr+"/") {
+			return false
+		}
+	}
+	return true
 }
 
 func isProtectedWindowsSystemRoot(realPath string) bool {
@@ -822,13 +852,37 @@ func isProtectedWindowsSystemRoot(realPath string) bool {
 	return false
 }
 
+// normalizeWindowsExtendedPath safely strips legitimate Win32 extended-length prefixes
+// (`\\?\C:\...` and `\\?\UNC\server\share\...`, commonly returned by Rust std::fs::canonicalize)
+// while blocking raw device namespaces (`\\.\...`, `\\?\Volume{...}`, `\\?\GLOBALROOT\...`).
+func normalizeWindowsExtendedPath(p string) (cleaned string, blockedDevice bool) {
+	trimmed := strings.TrimSpace(p)
+	normSlash := strings.ReplaceAll(trimmed, "\\", "/")
+	if strings.HasPrefix(normSlash, "//./") {
+		return "", true
+	}
+	if strings.HasPrefix(normSlash, "//?/") {
+		rest := trimmed[4:]
+		restSlash := normSlash[4:]
+		if len(restSlash) >= 4 && strings.EqualFold(restSlash[:4], "unc/") {
+			return `\\` + rest[4:], false
+		}
+		if len(restSlash) >= 3 && ((restSlash[0] >= 'a' && restSlash[0] <= 'z') || (restSlash[0] >= 'A' && restSlash[0] <= 'Z')) && restSlash[1] == ':' && restSlash[2] == '/' {
+			return rest, false
+		}
+		return "", true
+	}
+	return trimmed, false
+}
+
 // hasWindowsAlternateDataStream detects NTFS Alternate Data Stream suffixes (e.g. ".git/config::$DATA",
-// "file.txt:stream") or raw device namespaces ("\\.\", "\\?\") that can bypass suffix/name checks on Windows.
+// "file.txt:stream") or raw device namespaces ("\\.\", "\\?\Volume{...}") that can bypass suffix/name checks on Windows.
 func hasWindowsAlternateDataStream(p string) bool {
-	s := strings.ReplaceAll(strings.TrimSpace(p), "\\", "/")
-	if strings.HasPrefix(s, "//./") || strings.HasPrefix(s, "//?/") {
+	cleaned, blocked := normalizeWindowsExtendedPath(p)
+	if blocked {
 		return true
 	}
+	s := strings.ReplaceAll(cleaned, "\\", "/")
 	// Skip valid leading drive prefix "C:" (ASCII letter + ':').
 	if len(s) >= 2 && ((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z')) && s[1] == ':' {
 		s = s[2:]
@@ -841,13 +895,17 @@ func resolveWithSymlinks(baseDir, p string) (absPath string, realPath string, er
 	if p == "" {
 		return "", "", errors.New("path cannot be empty")
 	}
-	if runtime.GOOS == "windows" && hasWindowsAlternateDataStream(p) {
-		return "", "", &PolicyError{
-			Decision: DecisionDeny,
-			Action:   "path",
-			Target:   p,
-			Reason:   "Windows alternate data stream or device path is not allowed",
+	if runtime.GOOS == "windows" {
+		cleaned, blocked := normalizeWindowsExtendedPath(p)
+		if blocked || hasWindowsAlternateDataStream(cleaned) {
+			return "", "", &PolicyError{
+				Decision: DecisionDeny,
+				Action:   "path",
+				Target:   p,
+				Reason:   "Windows alternate data stream or device path is not allowed",
+			}
 		}
+		p = cleaned
 	}
 	if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) || p == "~" {
 		if h := userHomeDir(); h != "" {

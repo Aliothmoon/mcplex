@@ -149,8 +149,19 @@ func (b *limitedSyncBuffer) droppedBytes() int {
 }
 
 func trimTrailingPartialUTF8(b []byte) []byte {
-	for len(b) > 0 && !utf8.Valid(b[max(0, len(b)-4):]) {
-		b = b[:len(b)-1]
+	if len(b) == 0 {
+		return b
+	}
+	i := len(b) - 1
+	limit := max(0, len(b)-utf8.UTFMax)
+	for i > limit && !utf8.RuneStart(b[i]) {
+		i--
+	}
+	if !utf8.RuneStart(b[i]) {
+		return b[:i]
+	}
+	if !utf8.FullRune(b[i:]) {
+		return b[:i]
 	}
 	return b
 }

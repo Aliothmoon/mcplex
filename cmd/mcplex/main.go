@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -218,6 +219,17 @@ func runServe(args []string) {
 	})
 
 	if strings.TrimSpace(*httpAddr) != "" {
+		if *token == "" {
+			host, _, splitErr := net.SplitHostPort(*httpAddr)
+			if splitErr != nil {
+				host = *httpAddr
+			}
+			h := strings.ToLower(strings.TrimSpace(host))
+			isLoopback := h == "localhost" || (net.ParseIP(h) != nil && net.ParseIP(h).IsLoopback())
+			if !isLoopback {
+				fmt.Fprintf(os.Stderr, "[WARN] mcplex HTTP is binding non-loopback address %q WITHOUT --token authentication! Pass --token <secret> or bind to 127.0.0.1.\n", *httpAddr)
+			}
+		}
 		fmt.Fprintf(os.Stderr, "mcplex v%s listening on http://%s%s (auth=%v, strict-root=%v)\n",
 			version.Version, *httpAddr, *httpPath, *token != "", *strictRoot)
 		err := srv.ServeHTTP(ctx, mcpserver.HTTPOptions{

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -156,26 +157,43 @@ func relDisplayPath(cwd, absPath string) string {
 }
 
 func writeFilePreserveMode(absPath string, data []byte) error {
-	return writeFileWithMode(absPath, data, 0)
+	return writeFileAtomic(absPath, data, 0, false)
 }
 
 // writeFileWithMode writes data atomically via temp file + rename in the target directory
-// so a crash or kill never leaves a half-truncated file, preserving existing or explicit file mode bits.
+// so a crash or kill never leaves a half-truncated file, preserving existing or explicit file mode bits
+// while respecting existing read-only permissions on Unix.
 func writeFileWithMode(absPath string, data []byte, explicitMode os.FileMode) error {
+	return writeFileAtomic(absPath, data, explicitMode, false)
+}
+
+// writeFileForRollback restores a transaction snapshot atomically, allowing restoration even if the
+// target currently has read-only mode bits on Unix.
+func writeFileForRollback(absPath string, data []byte, explicitMode os.FileMode) error {
+	return writeFileAtomic(absPath, data, explicitMode, true)
+}
+
+func writeFileAtomic(absPath string, data []byte, explicitMode os.FileMode, allowOverwriteReadOnly bool) error {
 	mode := explicitMode
 	writeTarget := absPath
 	if info, err := os.Lstat(absPath); err == nil {
+		targetPerm := info.Mode().Perm()
 		if info.Mode()&os.ModeSymlink != 0 {
 			if resolved, rErr := filepath.EvalSymlinks(absPath); rErr == nil {
 				writeTarget = resolved
-				if mode == 0 {
-					if tInfo, sErr := os.Stat(resolved); sErr == nil {
-						mode = tInfo.Mode().Perm()
+				if tInfo, sErr := os.Stat(resolved); sErr == nil {
+					targetPerm = tInfo.Mode().Perm()
+					if mode == 0 {
+						mode = targetPerm
 					}
 				}
 			}
 		} else if mode == 0 {
-			mode = info.Mode().Perm()
+			mode = targetPerm
+		}
+		// On Unix, os.Rename would silently clobber an existing read-only file where O_WRONLY would return EACCES.
+		if runtime.GOOS != "windows" && !allowOverwriteReadOnly && targetPerm&0o222 == 0 {
+			return &os.PathError{Op: "open", Path: writeTarget, Err: os.ErrPermission}
 		}
 	}
 	if mode == 0 {

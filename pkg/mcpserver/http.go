@@ -74,8 +74,11 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 			return
 		}
 		if r.Method == http.MethodDelete {
-			if sid := strings.TrimSpace(r.Header.Get("Mcp-Session-Id")); sid != "" && s.Engine != nil {
-				s.Engine.CloseSession(sid)
+			if sid := strings.TrimSpace(r.Header.Get("Mcp-Session-Id")); sid != "" {
+				s.cancelSessionInFlight(sid)
+				if s.Engine != nil {
+					s.Engine.CloseSession(sid)
+				}
 			}
 			w.WriteHeader(http.StatusNoContent)
 			return

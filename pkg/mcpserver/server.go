@@ -297,8 +297,16 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 	}
 }
 
-func (s *Server) registerInFlight(id json.RawMessage, cancel context.CancelFunc) string {
-	key := canonicalIDKey(id)
+func scopedInFlightKey(sessionID string, id json.RawMessage) string {
+	idKey := canonicalIDKey(id)
+	if idKey == "" {
+		return ""
+	}
+	return sessionID + "\x00" + idKey
+}
+
+func (s *Server) registerInFlight(sessionID string, id json.RawMessage, cancel context.CancelFunc) string {
+	key := scopedInFlightKey(sessionID, id)
 	if key == "" {
 		return ""
 	}
@@ -320,8 +328,8 @@ func (s *Server) unregisterInFlight(key string) {
 	s.inFlightMu.Unlock()
 }
 
-func (s *Server) cancelInFlight(id json.RawMessage) bool {
-	key := canonicalIDKey(id)
+func (s *Server) cancelInFlight(sessionID string, id json.RawMessage) bool {
+	key := scopedInFlightKey(sessionID, id)
 	if key == "" {
 		return false
 	}
@@ -333,6 +341,24 @@ func (s *Server) cancelInFlight(id json.RawMessage) bool {
 		return true
 	}
 	return false
+}
+
+func (s *Server) cancelSessionInFlight(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	prefix := sessionID + "\x00"
+	s.inFlightMu.Lock()
+	var cancels []context.CancelFunc
+	for k, c := range s.inFlight {
+		if strings.HasPrefix(k, prefix) && c != nil {
+			cancels = append(cancels, c)
+		}
+	}
+	s.inFlightMu.Unlock()
+	for _, c := range cancels {
+		c()
+	}
 }
 
 func (s *Server) cancelAllInFlight() {
@@ -366,20 +392,21 @@ func canonicalIDKey(raw json.RawMessage) string {
 }
 
 func (s *Server) handleSingle(ctx context.Context, req jsonRPCRequest) *jsonRPCResponse {
-	// Notifications (missing ID) must not emit a response, but notifications/cancelled aborts in-flight calls (#12).
+	// Notifications (missing ID) must not emit a response, but notifications/cancelled aborts in-flight calls scoped to session.
+	sid := ptcruntime.SessionIDFromContext(ctx)
 	if len(req.ID) == 0 {
 		if req.Method == "notifications/cancelled" {
 			var cancelParams struct {
 				RequestID json.RawMessage `json:"requestId"`
 			}
 			if json.Unmarshal(req.Params, &cancelParams) == nil && len(cancelParams.RequestID) > 0 {
-				s.cancelInFlight(cancelParams.RequestID)
+				s.cancelInFlight(sid, cancelParams.RequestID)
 			}
 		}
 		return nil
 	}
 	reqCtx, reqCancel := context.WithCancel(ctx)
-	key := s.registerInFlight(req.ID, reqCancel)
+	key := s.registerInFlight(sid, req.ID, reqCancel)
 	defer func() {
 		s.unregisterInFlight(key)
 		reqCancel()

@@ -61,11 +61,21 @@ type fileSnapshot struct {
 type activeTx struct {
 	id         string
 	lockOwner  string
+	releases   []func()
 	snapshots  map[string]fileSnapshot
 	touched    []string
 	committed  bool
 	rolledBack bool
 	lastVerify map[string]any
+}
+
+func (tx *activeTx) releaseLocks() {
+	for _, rel := range tx.releases {
+		if rel != nil {
+			rel()
+		}
+	}
+	tx.releases = nil
 }
 
 var txOwnerSeq atomic.Int64
@@ -95,11 +105,11 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 		for _, id := range ids {
 			tx := txMap[id]
 			if tx.committed || tx.rolledBack {
-				b.Locks.ReleaseOwner(tx.lockOwner)
+				tx.releaseLocks()
 				continue
 			}
 			restored, failed := rollbackSnapshots(tx)
-			b.Locks.ReleaseOwner(tx.lockOwner)
+			tx.releaseLocks()
 			if len(restored) > 0 {
 				env.AddWarning(fmt.Sprintf("%s was never committed — auto-rolled back %d file(s): %s (call `await t.commit()` to keep tx edits)", id, len(restored), joinLimited(restored, 10)))
 			}
@@ -107,6 +117,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 				env.AddWarning(fmt.Sprintf("ROLLBACK FAILED for %s: %s — these files may still contain uncommitted tx edits; inspect them before retrying", id, formatRollbackFailures(failed)))
 			}
 		}
+		b.Locks.ReleaseOwner(env.ExecID)
 	})
 
 	editAsync := map[string]sandbox.AsyncHostFunc{
@@ -118,7 +129,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
-			res, err := b.applyFileSpecs(ctx, env.Cwd, specs, dryRun, bestEffort, nil)
+			res, err := b.applyFileSpecsWithOwner(ctx, env.Cwd, env.ExecID, specs, dryRun, bestEffort, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -154,7 +165,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 					Symbol:      firstString(opts, "symbol", "in"),
 				}},
 			}
-			return b.applyFileSpecs(ctx, env.Cwd, []FileEditSpec{spec}, false, false, nil)
+			return b.applyFileSpecsWithOwner(ctx, env.Cwd, env.ExecID, []FileEditSpec{spec}, false, false, nil)
 		},
 	}
 
@@ -168,7 +179,10 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			defer txMu.Unlock()
 			txSeq++
 			id := fmt.Sprintf("tx_%d", txSeq)
-			owner := fmt.Sprintf("tx:%d:%s", txOwnerSeq.Add(1), id)
+			owner := env.ExecID
+			if owner == "" {
+				owner = fmt.Sprintf("tx:%d:%s", txOwnerSeq.Add(1), id)
+			}
 			txMap[id] = &activeTx{
 				id:        id,
 				lockOwner: owner,
@@ -191,7 +205,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			txMu.Lock()
 			defer txMu.Unlock()
-			return b.applyFileSpecs(ctx, env.Cwd, specs, false, false, tx)
+			return b.applyFileSpecsWithOwner(ctx, env.Cwd, env.ExecID, specs, false, false, tx)
 		},
 		"_write": func(ctx context.Context, args []any) (any, error) {
 			id, _ := requireStringArg(args, 0, "id")
@@ -209,7 +223,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			defer txMu.Unlock()
 			spec := FileEditSpec{Path: p, Create: &content, Overwrite: true, EOL: eol}
-			return b.applyFileSpecs(ctx, env.Cwd, []FileEditSpec{spec}, false, false, tx)
+			return b.applyFileSpecsWithOwner(ctx, env.Cwd, env.ExecID, []FileEditSpec{spec}, false, false, tx)
 		},
 		"_verify": func(ctx context.Context, args []any) (any, error) {
 			id, _ := requireStringArg(args, 0, "id")
@@ -251,7 +265,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 				return nil, fmt.Errorf("transaction '%s' cannot be committed (not open)", id)
 			}
 			tx.committed = true
-			b.Locks.ReleaseOwner(tx.lockOwner)
+			tx.releaseLocks()
 			return map[string]any{
 				"ok":           true,
 				"id":           id,
@@ -271,7 +285,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 				return map[string]any{"ok": true, "id": id, "status": "already_rolled_back"}, nil
 			}
 			restored, failed := rollbackSnapshots(tx)
-			b.Locks.ReleaseOwner(tx.lockOwner)
+			tx.releaseLocks()
 			res := map[string]any{
 				"ok":            len(failed) == 0,
 				"id":            id,
@@ -302,9 +316,11 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
-			if err := b.Locks.Acquire(ctx, tx.lockOwner, abs); err != nil {
-				return nil, err
+			relLock, lockErr := b.Locks.AcquireIn(ctx, env.Cwd, tx.lockOwner, abs)
+			if lockErr != nil {
+				return nil, lockErr
 			}
+			tx.releases = append(tx.releases, relLock)
 			info, err := os.Stat(abs)
 			if err != nil {
 				return nil, err
@@ -348,9 +364,11 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
-			if err := b.Locks.Acquire(ctx, tx.lockOwner, absFrom, absTo); err != nil {
-				return nil, err
+			relLock, lockErr := b.Locks.AcquireIn(ctx, env.Cwd, tx.lockOwner, absFrom, absTo)
+			if lockErr != nil {
+				return nil, lockErr
 			}
+			tx.releases = append(tx.releases, relLock)
 			info, err := os.Stat(absFrom)
 			if err != nil {
 				return nil, err
@@ -453,7 +471,7 @@ func restoreSnapshot(snap fileSnapshot) error {
 			time.Sleep(time.Duration(attempt*75) * time.Millisecond)
 		}
 		if snap.existed {
-			err = writeFileWithMode(snap.absPath, snap.origBytes, snap.mode)
+			err = writeFileForRollback(snap.absPath, snap.origBytes, snap.mode)
 		} else {
 			err = os.Remove(snap.absPath)
 			if errors.Is(err, os.ErrNotExist) {
@@ -545,6 +563,10 @@ func joinLimited(items []string, limit int) string {
 }
 
 func (b *EditTxBinder) applyFileSpecs(ctx context.Context, cwd string, specs []FileEditSpec, dryRun, bestEffort bool, tx *activeTx) (map[string]any, error) {
+	return b.applyFileSpecsWithOwner(ctx, cwd, "", specs, dryRun, bestEffort, tx)
+}
+
+func (b *EditTxBinder) applyFileSpecsWithOwner(ctx context.Context, cwd, execOwner string, specs []FileEditSpec, dryRun, bestEffort bool, tx *activeTx) (map[string]any, error) {
 	if len(specs) == 0 {
 		return nil, errors.New("edits list cannot be empty")
 	}
@@ -588,25 +610,28 @@ func (b *EditTxBinder) applyFileSpecs(ctx context.Context, cwd string, specs []F
 		merged = append(merged, resolvedSpec{absPath: absPath, rel: rel, spec: spec})
 	}
 
-	// Acquire per-file locks BEFORE reading/planning so concurrent exec calls never interleave dirty reads or clobber rollbacks (#8).
-	var lockOwner string
-	releaseOnReturn := false
+	// Acquire per-file locks BEFORE reading/planning so concurrent exec calls never interleave dirty reads or clobber rollbacks.
+	// Same-exec operations share execOwner and are ref-counted re-entrant so tx + edit/fs.write never self-deadlock.
 	if !dryRun && b.Locks != nil && len(merged) > 0 {
 		paths := make([]string, len(merged))
 		for i, m := range merged {
 			paths[i] = m.absPath
 		}
-		if tx != nil {
+		lockOwner := execOwner
+		if tx != nil && tx.lockOwner != "" {
 			lockOwner = tx.lockOwner
-		} else {
+		}
+		if lockOwner == "" {
 			lockOwner = fmt.Sprintf("edit:%d", txOwnerSeq.Add(1))
-			releaseOnReturn = true
 		}
-		if err := b.Locks.Acquire(ctx, lockOwner, paths...); err != nil {
-			return nil, err
+		relLock, lockErr := b.Locks.AcquireIn(ctx, cwd, lockOwner, paths...)
+		if lockErr != nil {
+			return nil, lockErr
 		}
-		if releaseOnReturn {
-			defer b.Locks.ReleaseOwner(lockOwner)
+		if tx != nil {
+			tx.releases = append(tx.releases, relLock)
+		} else {
+			defer relLock()
 		}
 	}
 

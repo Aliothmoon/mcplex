@@ -633,29 +633,32 @@ func (m *MCPBridge) ensureHTTPSession(ctx context.Context, serverName, endpoint 
 
 	initCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	_, sid, err := m.httpRPCRaw(initCtx, serverName, endpoint, headers, "", "initialize", map[string]any{
-		"protocolVersion": "2025-03-26",
+	_, sid, _, err := m.httpRPCRaw(initCtx, serverName, endpoint, headers, "", "initialize", map[string]any{
+		"protocolVersion": "2025-11-25",
 		"capabilities":    map[string]any{},
 		"clientInfo":      map[string]any{"name": "mcplex-bridge", "version": version.Version},
 	}, false)
 
+	// Only cache initialization when handshake succeeds so transient startup failures retry on the next call.
+	if err != nil {
+		return ""
+	}
+
 	m.mu.Lock()
 	m.httpInited[endpoint] = true
-	if err == nil && sid != "" {
+	if sid != "" {
 		m.httpSessions[endpoint] = sid
 	}
 	stored := m.httpSessions[endpoint]
 	m.mu.Unlock()
 
-	if err == nil {
-		notifCtx, nCancel := context.WithTimeout(ctx, 3*time.Second)
-		_, _, _ = m.httpRPCRaw(notifCtx, serverName, endpoint, headers, stored, "notifications/initialized", nil, true)
-		nCancel()
-	}
+	notifCtx, nCancel := context.WithTimeout(ctx, 3*time.Second)
+	_, _, _, _ = m.httpRPCRaw(notifCtx, serverName, endpoint, headers, stored, "notifications/initialized", nil, true)
+	nCancel()
 	return stored
 }
 
-func (m *MCPBridge) httpRPCRaw(ctx context.Context, serverName, endpoint string, headers map[string]string, sessionID, method string, params map[string]any, isNotification bool) ([]byte, string, error) {
+func (m *MCPBridge) httpRPCRaw(ctx context.Context, serverName, endpoint string, headers map[string]string, sessionID, method string, params map[string]any, isNotification bool) ([]byte, string, int, error) {
 	payload := map[string]any{
 		"jsonrpc": "2.0",
 		"method":  method,
@@ -668,11 +671,11 @@ func (m *MCPBridge) httpRPCRaw(ctx context.Context, serverName, endpoint string,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return nil, "", err
+		return nil, "", 0, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, "", err
+		return nil, "", 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
@@ -684,23 +687,32 @@ func (m *MCPBridge) httpRPCRaw(ctx context.Context, serverName, endpoint string,
 	}
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("MCP HTTP %s %s failed: %w", serverName, method, err)
+		return nil, "", 0, fmt.Errorf("MCP HTTP %s %s failed: %w", serverName, method, err)
 	}
 	defer resp.Body.Close()
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
 	if err != nil {
-		return nil, "", err
+		return nil, "", resp.StatusCode, err
 	}
 	gotSID := strings.TrimSpace(resp.Header.Get("Mcp-Session-Id"))
 	if resp.StatusCode >= 400 {
-		return nil, gotSID, fmt.Errorf("MCP HTTP %s %s returned status %d", serverName, method, resp.StatusCode)
+		return nil, gotSID, resp.StatusCode, fmt.Errorf("MCP HTTP %s %s returned status %d", serverName, method, resp.StatusCode)
 	}
-	return respBytes, gotSID, nil
+	return respBytes, gotSID, resp.StatusCode, nil
 }
 
 func (m *MCPBridge) httpRPC(ctx context.Context, serverName, endpoint string, headers map[string]string, method string, params map[string]any) ([]byte, error) {
 	sid := m.ensureHTTPSession(ctx, serverName, endpoint, headers)
-	respBytes, gotSID, err := m.httpRPCRaw(ctx, serverName, endpoint, headers, sid, method, params, false)
+	respBytes, gotSID, statusCode, err := m.httpRPCRaw(ctx, serverName, endpoint, headers, sid, method, params, false)
+	// Per MCP Streamable HTTP spec, 404 with an existing session ID signals an expired/restarted session -> re-initialize once.
+	if statusCode == http.StatusNotFound && sid != "" {
+		m.mu.Lock()
+		delete(m.httpInited, endpoint)
+		delete(m.httpSessions, endpoint)
+		m.mu.Unlock()
+		sid = m.ensureHTTPSession(ctx, serverName, endpoint, headers)
+		respBytes, gotSID, _, err = m.httpRPCRaw(ctx, serverName, endpoint, headers, sid, method, params, false)
+	}
 	if gotSID != "" && gotSID != sid {
 		m.mu.Lock()
 		m.httpSessions[endpoint] = gotSID
@@ -787,10 +799,6 @@ func startStdioClient(cfg externalServerCfg) (*stdioClient, error) {
 		pending:   map[int64]chan []byte{},
 	}
 	go c.readLoop(stdout)
-	go func() {
-		_ = cmd.Wait()
-		c.closed.Store(true)
-	}()
 
 	initCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -811,15 +819,6 @@ func startStdioClient(cfg externalServerCfg) (*stdioClient, error) {
 }
 
 func (c *stdioClient) readLoop(r io.Reader) {
-	defer func() {
-		c.closed.Store(true)
-		c.pendingMu.Lock()
-		for _, ch := range c.pending {
-			close(ch)
-		}
-		c.pending = map[int64]chan []byte{}
-		c.pendingMu.Unlock()
-	}()
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 	for scanner.Scan() {
@@ -842,6 +841,30 @@ func (c *stdioClient) readLoop(r io.Reader) {
 			}
 			c.pendingMu.Unlock()
 		}
+	}
+	scanErr := scanner.Err()
+
+	// 1. Mark closed and wake every waiting RPC immediately so callers never hang while reaping.
+	c.closed.Store(true)
+	c.pendingMu.Lock()
+	for _, ch := range c.pending {
+		close(ch)
+	}
+	c.pending = map[int64]chan []byte{}
+	c.pendingMu.Unlock()
+
+	// 2. If the scanner exited due to a stream error (e.g. >8MB oversized line) while the child is still alive,
+	// terminate the child so cmd.Wait() cannot block indefinitely.
+	if scanErr != nil {
+		if c.stdin != nil {
+			_ = c.stdin.Close()
+		}
+		killCmdProcessTree(c.cmd)
+	}
+
+	// 3. Reap the child process AFTER stdout reading has finished (per os/exec.Cmd.StdoutPipe contract).
+	if c.cmd != nil {
+		_ = c.cmd.Wait()
 	}
 }
 

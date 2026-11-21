@@ -219,11 +219,15 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 				return nil, err
 			}
 			if b.Locks != nil {
-				owner := fmt.Sprintf("fswrite:%d", txOwnerSeq.Add(1))
-				if err := b.Locks.Acquire(ctx, owner, absPath); err != nil {
-					return nil, err
+				owner := env.ExecID
+				if owner == "" {
+					owner = fmt.Sprintf("fswrite:%d", txOwnerSeq.Add(1))
 				}
-				defer b.Locks.ReleaseOwner(owner)
+				relLock, lockErr := b.Locks.AcquireIn(ctx, env.Cwd, owner, absPath)
+				if lockErr != nil {
+					return nil, lockErr
+				}
+				defer relLock()
 			}
 			orig, rErr := os.ReadFile(absPath)
 			data, err := applyEOL(targetPath, orig, rErr == nil, []byte(content), eol)

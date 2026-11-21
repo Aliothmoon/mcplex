@@ -163,7 +163,7 @@ func readLineRangeDirect(absPath, targetPath string, fileSize int64, startLine, 
 	if sniffErr != nil && !errors.Is(sniffErr, io.EOF) {
 		return nil, sniffErr
 	}
-	if sn > 0 && bytes.IndexByte(sniff[:sn], 0) >= 0 {
+	if sn > 0 && looksBinaryBytes(sniff[:sn]) {
 		detected := http.DetectContentType(sniff[:sn])
 		return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s appears to be binary (%s, %s); use exec with fs.bytes/fs.hash", targetPath, detected, formatHumanBytes(fileSize))
 	}
@@ -201,8 +201,11 @@ func readLineRangeDirect(absPath, targetPath string, fileSize int64, startLine, 
 		if totalLines >= s && totalLines <= e {
 			line := strings.TrimSuffix(string(rawLine), "\n")
 			line = strings.TrimSuffix(line, "\r")
-			if bytes.IndexByte([]byte(line), 0) >= 0 || !utf8.ValidString(line) {
+			if bytes.IndexByte(rawLine, 0) >= 0 {
 				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s appears to be binary (%s); use exec with fs.bytes/fs.hash", targetPath, formatHumanBytes(fileSize))
+			}
+			if !utf8.ValidString(line) {
+				line = strings.ToValidUTF8(line, "\uFFFD")
 			}
 			formatted := line
 			if withNumbers {
@@ -264,6 +267,24 @@ func readLineRangeDirect(absPath, targetPath string, fileSize int64, startLine, 
 		fmt.Fprintf(&b, "\n\n... [more lines available; continue with startLine: %d]", lastShown+1)
 	}
 	return &DirectReadResult{Text: b.String()}, nil
+}
+
+// looksBinaryBytes returns true when data contains NUL bytes or a high ratio of non-text control bytes.
+// Valid non-UTF-8 text files (e.g. GBK, Shift-JIS, Latin-1) have no NULs and low control-byte ratio, so they pass.
+func looksBinaryBytes(data []byte) bool {
+	if bytes.IndexByte(data, 0) >= 0 {
+		return true
+	}
+	if len(data) < 16 {
+		return false
+	}
+	ctrl := 0
+	for _, c := range data {
+		if (c < 0x20 && c != '\t' && c != '\n' && c != '\r' && c != '\f' && c != '\v' && c != 0x1b) || c == 0x7f {
+			ctrl++
+		}
+	}
+	return ctrl*10 > len(data)
 }
 
 func formatHumanBytes(n int64) string {
