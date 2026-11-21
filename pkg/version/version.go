@@ -2,4 +2,4 @@
 package version
 
 // Version is the semantic version without the leading "v".
-const Version = "0.4.1"
+const Version = "0.5.0"
