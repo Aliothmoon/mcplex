@@ -80,6 +80,12 @@ cloudflared tunnel --name mcplex --hostname mcp.example.com --url http://127.0.0
 mcplex serve --http 127.0.0.1:8787 --oauth --public-url https://mcp.example.com \
   --token "$(openssl rand -hex 24)" --strict-root --cwd /path/to/workspace
 ```
+Before adding it to Gemini, verify the public URL end to end with the official MCP SDK client (discovery, DCR, PKCE, consent, tools, refresh, revocation):
+```bash
+cd scripts/oauth-interop && npm install
+MCPLEX_TOKEN="<your --token>" node check.mjs https://mcp.example.com
+```
+
 3. In Gemini: **Settings → Connected Apps → Add a custom app**, enter `https://mcp.example.com/mcp`. Your browser opens the MCPlex consent page; enter the `--token` value (the *owner secret*) and click **Approve**.
 
 - The token is the owner secret for the consent page and still works as a plain `Authorization: Bearer` token for header-capable clients (Claude Code, Cursor, `mcplex ui`).

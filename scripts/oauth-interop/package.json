@@ -1,0 +1,12 @@
+{
+  "name": "mcplex-oauth-interop-check",
+  "private": true,
+  "type": "module",
+  "description": "Self-check `mcplex serve --oauth` through its public URL with the official MCP TypeScript SDK client",
+  "scripts": {
+    "check": "node check.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2"
+  }
+}

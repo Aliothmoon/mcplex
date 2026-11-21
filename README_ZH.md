@@ -80,6 +80,12 @@ cloudflared tunnel --name mcplex --hostname mcp.example.com --url http://127.0.0
 mcplex serve --http 127.0.0.1:8787 --oauth --public-url https://mcp.example.com \
   --token "$(openssl rand -hex 24)" --strict-root --cwd /path/to/workspace
 ```
+在 Gemini 中添加之前，可以先用官方 MCP SDK 客户端对公网地址做一次端到端自检（发现、动态注册、PKCE、授权、工具调用、刷新、撤销）：
+```bash
+cd scripts/oauth-interop && npm install
+MCPLEX_TOKEN="<你的 --token>" node check.mjs https://mcp.example.com
+```
+
 3. 在 Gemini 中打开 **设置 → Connected Apps → 添加自定义应用**，填入 `https://mcp.example.com/mcp`。浏览器会跳到 MCPlex 的授权页，输入 `--token` 的值（主人口令）后点 **Approve**。
 
 - `--token` 既是授权页的主人口令，也仍可作为普通 `Authorization: Bearer` 令牌，供 Claude Code、Cursor、`mcplex ui` 等支持请求头的客户端使用。
