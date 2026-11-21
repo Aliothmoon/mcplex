@@ -1082,6 +1082,11 @@ func matchRuleSet(rules []parsedRule, action, target string, roots []string) boo
 			if !isRulePathAbs(rulePath) && len(roots) > 0 {
 				rulePath = filepath.Join(roots[0], filepath.FromSlash(rulePath))
 			}
+			if runtime.GOOS == "windows" && strings.Contains(rulePath, "~") && isRulePathAbs(rulePath) {
+				if resolved, err := evalSymlinksExisting(filepath.FromSlash(rulePath)); err == nil {
+					rulePath = resolved
+				}
+			}
 			targetDrive := extractWindowsDrive(target)
 			ruleDrive := extractWindowsDrive(rulePath)
 			if ruleDrive != "" && targetDrive != "" && ruleDrive != targetDrive {
@@ -1109,7 +1114,11 @@ func (e *Engine) isInsideWorkspace(realPath string) bool {
 
 func (e *Engine) isTempOrScratch(realPath string) bool {
 	norm := normalizeComparePath(realPath)
-	tmp := strings.TrimSuffix(normalizeComparePath(os.TempDir()), "/")
+	rawTmp := os.TempDir()
+	if resolvedTmp, err := evalSymlinksExisting(rawTmp); err == nil {
+		rawTmp = resolvedTmp
+	}
+	tmp := strings.TrimSuffix(normalizeComparePath(rawTmp), "/")
 	if tmp != "" && (norm == tmp || strings.HasPrefix(norm, tmp+"/")) {
 		return true
 	}
@@ -1393,14 +1402,28 @@ func isASCIIAlpha(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
+func canonicalizeExistingDir(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	if real, err := evalSymlinksExisting(p); err == nil {
+		return real
+	}
+	return filepath.Clean(p)
+}
+
 func userHomeDir() string {
 	if runtime.GOOS == "windows" {
 		if up := os.Getenv("USERPROFILE"); up != "" {
-			return up
+			return canonicalizeExistingDir(up)
 		}
 	}
 	if h, err := os.UserHomeDir(); err == nil {
-		return h
+		return canonicalizeExistingDir(h)
 	}
-	return os.Getenv("HOME")
+	return canonicalizeExistingDir(os.Getenv("HOME"))
 }

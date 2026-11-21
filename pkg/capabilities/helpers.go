@@ -191,6 +191,9 @@ func writeFileAtomic(absPath string, data []byte, explicitMode os.FileMode, allo
 	mode := explicitMode
 	writeTarget := absPath
 	if info, err := os.Lstat(absPath); err == nil {
+		if info.IsDir() {
+			return &os.PathError{Op: "open", Path: absPath, Err: fmt.Errorf("is a directory")}
+		}
 		targetPerm := info.Mode().Perm()
 		if info.Mode()&os.ModeSymlink != 0 {
 			if !followSymlink {
@@ -229,13 +232,13 @@ func writeFileAtomic(absPath string, data []byte, explicitMode os.FileMode, allo
 	tmp, err := os.CreateTemp(dir, ".mcplex-write-*")
 	if err != nil {
 		if allowOverwriteReadOnly {
-			_ = os.Chmod(writeTarget, 0o666)
+			chmodRegularWritable(writeTarget)
 		}
 		if wErr := os.WriteFile(writeTarget, data, mode); wErr != nil {
 			return wErr
 		}
 		if explicitMode != 0 {
-			_ = os.Chmod(writeTarget, mode)
+			chmodIfRegular(writeTarget, mode)
 		}
 		return nil
 	}
@@ -262,7 +265,7 @@ func writeFileAtomic(absPath string, data []byte, explicitMode os.FileMode, allo
 			time.Sleep(time.Duration(attempt*30) * time.Millisecond)
 		}
 		if allowOverwriteReadOnly && runtime.GOOS == "windows" {
-			_ = os.Chmod(writeTarget, 0o666)
+			chmodRegularWritable(writeTarget)
 		}
 		renameErr = os.Rename(tmpPath, writeTarget)
 		if renameErr == nil {
@@ -271,15 +274,27 @@ func writeFileAtomic(absPath string, data []byte, explicitMode os.FileMode, allo
 		}
 	}
 	if allowOverwriteReadOnly {
-		_ = os.Chmod(writeTarget, 0o666)
+		chmodRegularWritable(writeTarget)
 	}
 	if err := os.WriteFile(writeTarget, data, mode); err != nil {
 		return renameErr
 	}
 	if explicitMode != 0 {
-		_ = os.Chmod(writeTarget, mode)
+		chmodIfRegular(writeTarget, mode)
 	}
 	return nil
+}
+
+func chmodRegularWritable(p string) {
+	if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
+		_ = os.Chmod(p, 0o666)
+	}
+}
+
+func chmodIfRegular(p string, mode os.FileMode) {
+	if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
+		_ = os.Chmod(p, mode)
+	}
 }
 
 func minInt(a, b int) int {

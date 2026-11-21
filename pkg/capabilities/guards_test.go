@@ -98,6 +98,10 @@ func TestRollbackSnapshotsReportsUnrestorableFiles(t *testing.T) {
 	if len(failed) != 1 || failed[0]["path"] != "blocked.txt" || failed[0]["error"] == "" {
 		t.Fatalf("expected blocked.txt reported as failed, got: %v", failed)
 	}
+	// Regression check: failed rollback on a directory must NEVER strip directory execute/search permission bits on POSIX.
+	if entries, rdErr := os.ReadDir(blockedPath); rdErr != nil || len(entries) != 1 {
+		t.Fatalf("expected blocked.txt directory to remain traversable (inner preserved), got entries=%d err=%v", len(entries), rdErr)
+	}
 	if b, _ := os.ReadFile(okPath); string(b) != "original" {
 		t.Fatalf("ok.txt not restored: %q", b)
 	}
