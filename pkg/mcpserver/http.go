@@ -45,6 +45,16 @@ type HTTPOptions struct {
 	// OAuth, when set, serves the OAuth 2.1 authorization server + metadata endpoints and accepts its access tokens
 	// on the MCP endpoint (in addition to Token). Its public host is added to the Host-header allowlist.
 	OAuth *oauthserver.Server
+	// TokenFunc optionally returns the live bearer token (used by interactive --ui token generation/rotation).
+	// When non-nil, it supersedes Token on every request.
+	TokenFunc func() string
+}
+
+func (opts HTTPOptions) currentToken() string {
+	if opts.TokenFunc != nil {
+		return strings.TrimSpace(opts.TokenFunc())
+	}
+	return strings.TrimSpace(opts.Token)
 }
 
 // ValidateHTTPOptions enforces safe-by-default authentication invariants before exposing HTTP endpoints.
@@ -53,12 +63,15 @@ func ValidateHTTPOptions(opts HTTPOptions) error {
 	if addr == "" {
 		addr = "127.0.0.1:8787"
 	}
-	if strings.TrimSpace(opts.Token) == "" && !opts.AllowInsecureNoToken {
+	if opts.currentToken() == "" && !opts.AllowInsecureNoToken {
 		if strings.TrimSpace(opts.AllowOrigin) == "*" {
 			return errors.New(`refusing to serve HTTP with --cors-origin "*" without --token (any webpage could invoke exec); pass --token <secret> or --insecure-no-token`)
 		}
 		if !IsLoopbackBindAddr(addr) {
 			return fmt.Errorf("refusing to bind non-loopback HTTP address %q without --token; bind to 127.0.0.1, pass --token <secret>, or pass --insecure-no-token", addr)
+		}
+		if len(opts.AllowedHosts) > 0 && opts.OAuth == nil {
+			return errors.New("refusing to expose --public-url / AllowedHosts without --token; pass --token <secret>, run with --ui (auto-generates a token), or pass --insecure-no-token")
 		}
 	}
 	return nil
@@ -288,10 +301,10 @@ func (s *Server) httpHandlerWithRegistry(opts HTTPOptions, reg *httpSessionRegis
 	// the bearer token or was explicitly exposed with --insecure-no-token; in both cases LAN/container clients
 	// legitimately send non-loopback Host headers, so the allowlist would only lock them out.
 	loopbackBind := strings.TrimSpace(opts.Addr) == "" || IsLoopbackBindAddr(opts.Addr)
-	enforceHostGuard := loopbackBind || (strings.TrimSpace(opts.Token) == "" && !opts.AllowInsecureNoToken)
 	// hostAllowed also admits AllowedHosts and the OAuth public host (e.g. a Cloudflare tunnel hostname forwarded to a
 	// loopback bind); DNS rebinding cannot point that public name at the victim's loopback.
 	hostAllowed := func(r *http.Request) bool {
+		enforceHostGuard := loopbackBind || (opts.currentToken() == "" && !opts.AllowInsecureNoToken)
 		if !enforceHostGuard || isAllowedHostHeader(r.Host, opts.Addr) {
 			return true
 		}
@@ -350,7 +363,7 @@ func (s *Server) httpHandlerWithRegistry(opts HTTPOptions, reg *httpSessionRegis
 			w.WriteHeader(http.StatusNoContent)
 			return false
 		}
-		if opts.Token != "" && !validBearerToken(r.Header.Get("Authorization"), opts.Token) {
+		if tok := opts.currentToken(); tok != "" && !validBearerToken(r.Header.Get("Authorization"), tok) {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="mcplex"`)
 			writeJSONHTTPError(w, http.StatusUnauthorized, "unauthorized")
 			return false
@@ -785,14 +798,15 @@ func isLoopbackHost(host string) bool {
 // With neither configured (loopback-only dev mode) the endpoint stays open, as before.
 func mcpAuthorized(r *http.Request, opts HTTPOptions) bool {
 	header := r.Header.Get("Authorization")
-	if opts.Token == "" && opts.OAuth == nil {
+	tok := opts.currentToken()
+	if tok == "" && opts.OAuth == nil {
 		return true
 	}
-	if opts.Token != "" && validBearerToken(header, opts.Token) {
+	if tok != "" && validBearerToken(header, tok) {
 		return true
 	}
 	if opts.OAuth != nil {
-		if tok, ok := bearerValue(header); ok && opts.OAuth.VerifyAccessToken(tok) {
+		if bearer, ok := bearerValue(header); ok && opts.OAuth.VerifyAccessToken(bearer) {
 			return true
 		}
 	}

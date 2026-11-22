@@ -215,3 +215,55 @@ func TestAllowedHostsAdmitsTunnelHostname(t *testing.T) {
 		t.Fatalf("other host: %d", r.StatusCode)
 	}
 }
+
+func TestValidateHTTPOptionsRejectsUnauthenticatedPublicTunnelAndDynamicTokenFunc(t *testing.T) {
+	if err := ValidateHTTPOptions(HTTPOptions{Addr: "127.0.0.1:8787", AllowedHosts: []string{"x.trycloudflare.com"}}); err == nil {
+		t.Fatal("expected ValidateHTTPOptions to reject AllowedHosts without Token or AllowInsecureNoToken")
+	}
+
+	eng := ptcruntime.NewEngineWithOptions(ptcruntime.EngineOptions{DefaultCwd: t.TempDir()})
+	defer eng.Close()
+	srv := NewServerWithOptions(eng, ServerOptions{ServerName: "mcplex"})
+
+	curTok := ""
+	ts := httptest.NewServer(srv.HTTPHandler(HTTPOptions{
+		Addr:      "127.0.0.1:8787",
+		TokenFunc: func() string { return curTok },
+	}))
+	defer ts.Close()
+
+	ping := func(tok string) int {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+		req.Header.Set("Content-Type", "application/json")
+		if tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Starts passwordless on loopback -> 200 without token.
+	if got := ping(""); got != http.StatusOK {
+		t.Fatalf("passwordless loopback ping: %d", got)
+	}
+	// Live token generated in UI -> unauthenticated rejected, token accepted!
+	curTok = "live-secret-1"
+	if got := ping(""); got != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after enabling live token, got %d", got)
+	}
+	if got := ping("live-secret-1"); got != http.StatusOK {
+		t.Fatalf("expected 200 with live-secret-1, got %d", got)
+	}
+	// Live token rotated -> old token rejected, new token accepted!
+	curTok = "live-secret-2"
+	if got := ping("live-secret-1"); got != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for old rotated token, got %d", got)
+	}
+	if got := ping("live-secret-2"); got != http.StatusOK {
+		t.Fatalf("expected 200 for live-secret-2, got %d", got)
+	}
+}

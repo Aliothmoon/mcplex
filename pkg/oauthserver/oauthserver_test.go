@@ -557,3 +557,34 @@ func TestCLIStoreAccessDoesNotCreateDirectories(t *testing.T) {
 		t.Fatalf("CLI access created %s (err=%v)", StateDir(data), err)
 	}
 }
+
+func TestSetOwnerSecretLiveRotation(t *testing.T) {
+	h := newHarness(t)
+	if err := h.srv.SetOwnerSecret("   "); err == nil {
+		t.Fatal("expected empty SetOwnerSecret to fail")
+	}
+	status, reg := h.register(map[string]any{"redirect_uris": []string{googleRedir}, "client_name": "Gemini"})
+	if status != http.StatusCreated {
+		t.Fatalf("register: %d %v", status, reg)
+	}
+	clientID := reg["client_id"].(string)
+
+	const rotatedSecret = "rotated-owner-secret-abcdef123456"
+	if err := h.srv.SetOwnerSecret(rotatedSecret); err != nil {
+		t.Fatal(err)
+	}
+
+	form1 := h.consent(authorizeParams(clientID, googleRedir, "s1"))
+	oldResp := h.decide(form1, testSecret, "approve")
+	oldResp.Body.Close()
+	if oldResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected old owner secret rejected with 401 after rotation, got %d", oldResp.StatusCode)
+	}
+
+	form2 := h.consent(authorizeParams(clientID, googleRedir, "s2"))
+	newResp := h.decide(form2, rotatedSecret, "approve")
+	newResp.Body.Close()
+	if newResp.StatusCode != http.StatusFound || !strings.Contains(newResp.Header.Get("Location"), "code=") {
+		t.Fatalf("expected rotated owner secret to issue auth code, got %d %s", newResp.StatusCode, newResp.Header.Get("Location"))
+	}
+}

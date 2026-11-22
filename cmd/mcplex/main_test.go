@@ -26,6 +26,43 @@ func TestRunServeRejectsUnauthenticatedWildcardCORSWithoutExitingProcess(t *test
 	if code == 0 {
 		t.Fatal("expected non-zero exit code when --cors-origin '*' is passed without --token")
 	}
+
+	pubNoTok := runServe([]string{
+		"--http", "127.0.0.1:0",
+		"--public-url", "https://switched-final-sends-pre.trycloudflare.com",
+		"--data-dir", t.TempDir(),
+		"--cwd", t.TempDir(),
+	})
+	if pubNoTok == 0 {
+		t.Fatal("expected non-zero exit code when headless --http passes --public-url without --token")
+	}
+}
+
+func TestShouldAutoGenerateUITokenAndEntropy(t *testing.T) {
+	if shouldAutoGenerateUIToken(true, false, false, "", "", "127.0.0.1:8787", "") {
+		t.Fatal("plain local loopback --ui must stay passwordless by default")
+	}
+	if !shouldAutoGenerateUIToken(true, false, true, "", "https://mcp.example.com", "127.0.0.1:8787", "") {
+		t.Fatal("--ui --oauth without --token must auto-generate a token")
+	}
+	if !shouldAutoGenerateUIToken(true, false, false, "", "https://x.trycloudflare.com", "127.0.0.1:8787", "") {
+		t.Fatal("--ui --public-url without --token must auto-generate a token")
+	}
+	if !shouldAutoGenerateUIToken(true, false, false, "", "", "0.0.0.0:8787", "") {
+		t.Fatal("--ui on non-loopback bind without --token must auto-generate a token")
+	}
+	if shouldAutoGenerateUIToken(true, false, true, "explicit-user-secret", "https://mcp.example.com", "127.0.0.1:8787", "") {
+		t.Fatal("explicit --token must never be overwritten")
+	}
+	if shouldAutoGenerateUIToken(false, false, true, "", "https://mcp.example.com", "127.0.0.1:8787", "") {
+		t.Fatal("non-UI mode must not silently mint ephemeral tokens")
+	}
+
+	t1, err1 := generateRandomToken()
+	t2, err2 := generateRandomToken()
+	if err1 != nil || err2 != nil || len(t1) != 40 || t1 == t2 {
+		t.Fatalf("unexpected generated tokens: %q (%v), %q (%v)", t1, err1, t2, err2)
+	}
 }
 
 func TestBuildPublicExposureValidation(t *testing.T) {

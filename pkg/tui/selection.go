@@ -65,6 +65,26 @@ func (m *Model) performCopy(text string) tea.Cmd {
 	return copyToastTimerCmd(m.copyToastSeq)
 }
 
+func (m *Model) performLabeledCopy(text, okToast string, revealTokenOnErr bool) tea.Cmd {
+	if text == "" {
+		return nil
+	}
+	m.copyToastSeq++
+	if err := writeClipboard(text); err != nil {
+		if revealTokenOnErr {
+			m.tokenRevealed = true
+			m.copyToast = "✕ Clipboard unavailable — token shown"
+		} else {
+			m.copyToast = "✕ Copy failed: " + err.Error()
+		}
+		m.copyToastErr = true
+	} else {
+		m.copyToast = okToast
+		m.copyToastErr = false
+	}
+	return copyToastTimerCmd(m.copyToastSeq)
+}
+
 func (m *Model) toggleModalVisualSelect() {
 	if m.sel.active && m.sel.scope == selScopeModal && m.sel.lineMode {
 		m.clearSelection()

@@ -76,7 +76,7 @@ jobs:
             echo "### Quick Start"
             echo '```bash'
             echo "# Stdio MCP proxy"
-            echo "./mcplex serve --cwd /path/to/workspace --strict-root"
+            echo "./mcplex serve --cwd /path/to/workspace"
             echo
             echo "# Streamable HTTP MCP proxy"
             echo "./mcplex serve --http 127.0.0.1:8787 --token <secret> --cwd /path/to/workspace"

@@ -123,20 +123,50 @@ func (m *Model) renderEmptyState() []string {
 			bdr.Render("│")+paintLineBg("", colorSurface, innerW)+bdr.Render("│"),
 		)
 	} else {
-		titleRow := "  " + styleBrandMark.Render("◆") + "  " + styleBrand.Render("MCPlex Console") + "  " + styleDim.Render("v"+m.cfg.Version)
-		statusRow := "     " + styleLiveDot.Render("●") + " " + styleMuted.Render("Listening on ") + stylePath.Render(m.cfg.Endpoint)
-		subRow := "     " + styleDim.Render("Live diffs, file CRUD, search, shell & task streams appear here.")
+		oauthBadge := ""
+		if m.cfg.OAuthEnabled {
+			oauthBadge = "  " + styleTokenPill.Render(" OAuth 2.1 ")
+		}
+		titleRow := "  " + styleBrandMark.Render("◆") + "  " + styleBrand.Render("MCPlex Console") + "  " + styleDim.Render("v"+m.cfg.Version) + oauthBadge
+		var infoRows []string
+		if strings.TrimSpace(m.cfg.PublicEndpoint) != "" {
+			pubRow := "     " + styleLiveDot.Render("●") + " " + styleMuted.Render("Public MCP  ") + stylePath.Render(m.cfg.PublicEndpoint) + "  " + styleDim.Render("[u] copy")
+			locRow := "       " + styleDim.Render("Local HTTP  "+m.cfg.Endpoint)
+			infoRows = append(infoRows, pubRow, locRow)
+		} else {
+			statusRow := "     " + styleLiveDot.Render("●") + " " + styleMuted.Render("Listening on ") + stylePath.Render(m.cfg.Endpoint) + "  " + styleDim.Render("[u] copy")
+			infoRows = append(infoRows, statusRow)
+		}
+		if m.token != "" {
+			shownTok := maskTokenTail(m.token)
+			if m.tokenRevealed {
+				shownTok = m.token
+			}
+			hints := "[t] copy  [p] show/hide"
+			if m.cfg.RotateToken != nil {
+				hints += "  [T] new"
+			}
+			tokRow := "     " + styleAccent.Render("◆") + " " + styleMuted.Render("Owner Token ") + styleGroupText.Render(shownTok) + "  " + styleDim.Render(hints)
+			infoRows = append(infoRows, tokRow)
+		} else if m.cfg.RotateToken != nil {
+			tokRow := "     " + styleDim.Render("○ Auth Token  none (local loopback)  [t] generate token")
+			infoRows = append(infoRows, tokRow)
+		} else {
+			subRow := "     " + styleDim.Render("Live diffs, file CRUD, search, shell & task streams appear here.")
+			infoRows = append(infoRows, subRow)
+		}
 		sepRow := bdr.Render("├" + strings.Repeat("─", innerW) + "┤")
 
 		k1 := "  " + styleFooterKey.Render("↑ ↓") + styleDim.Render("  navigate feed        ") + styleFooterKey.Render("enter / click") + styleDim.Render("  fold & expand")
 		k2 := "  " + styleFooterKey.Render("← →") + styleDim.Render("  toolbar & tree       ") + styleFooterKey.Render("o / dbl-click") + styleDim.Render("  inspect modal")
-		k3 := "  " + styleFooterKey.Render("/") + styleDim.Render("    search & regex       ") + styleFooterKey.Render("f / G        ") + styleDim.Render("  live tail follow")
+		k3 := "  " + styleFooterKey.Render("/") + styleDim.Render("    search & regex       ") + styleFooterKey.Render("t / u        ") + styleDim.Render("  copy token / URL")
 
+		card = append(card, bdr.Render("│")+paintLineBg("", colorSurface, innerW)+bdr.Render("│"))
+		card = append(card, bdr.Render("│")+paintLineBg(titleRow, colorSurface, innerW)+bdr.Render("│"))
+		for _, ir := range infoRows {
+			card = append(card, bdr.Render("│")+paintLineBg(ir, colorSurface, innerW)+bdr.Render("│"))
+		}
 		card = append(card,
-			bdr.Render("│")+paintLineBg("", colorSurface, innerW)+bdr.Render("│"),
-			bdr.Render("│")+paintLineBg(titleRow, colorSurface, innerW)+bdr.Render("│"),
-			bdr.Render("│")+paintLineBg(statusRow, colorSurface, innerW)+bdr.Render("│"),
-			bdr.Render("│")+paintLineBg(subRow, colorSurface, innerW)+bdr.Render("│"),
 			bdr.Render("│")+paintLineBg("", colorSurface, innerW)+bdr.Render("│"),
 			sepRow,
 			bdr.Render("│")+paintLineBg("", colorSurface, innerW)+bdr.Render("│"),
@@ -172,11 +202,21 @@ func (m *Model) renderHeaderBar() string {
 		status = styleRunDot.Render(fmt.Sprintf("%s Running %d", m.currentSpinner(), n))
 	}
 
-	left := " " + styleBrandMark.Render("◆") + " " + styleBrand.Render("MCPlex") +
+	prefix := " " + styleBrandMark.Render("◆") + " " + styleBrand.Render("MCPlex") +
 		styleDim.Render(" v"+m.cfg.Version) +
-		styleFooterSep.Render("  ·  ") +
-		styleHeaderBar.Render(m.cfg.Endpoint) +
-		styleFooterSep.Render("  ·  ") + status
+		styleFooterSep.Render("  ·  ")
+	ep := m.primaryEndpoint()
+	epStyled := styleHeaderBar.Render(ep)
+	urlX1 := ansi.StringWidth(prefix)
+	m.headerURLZone = hitZone{x1: urlX1, x2: urlX1 + ansi.StringWidth(epStyled), action: "copy_url"}
+
+	authNote := ""
+	if m.cfg.OAuthEnabled {
+		authNote = styleFooterSep.Render("  ·  ") + styleAccent.Render("OAuth")
+	} else if m.token != "" || m.cfg.AuthEnabled {
+		authNote = styleFooterSep.Render("  ·  ") + styleMuted.Render("Auth")
+	}
+	left := prefix + epStyled + styleFooterSep.Render("  ·  ") + status + authNote
 
 	var metrics []string
 	metrics = append(metrics, fmt.Sprintf("%s %s", styleMuted.Render(fmt.Sprintf("%d", m.totalRuns)), styleDim.Render("runs")))
@@ -231,6 +271,8 @@ func (m *Model) renderTabBar() string {
 			rendered = styleTabActiveUnfocused.Render(padded)
 		case c.id == "follow" && m.follow:
 			rendered = styleFollowOn.Render(padded)
+		case c.id == "copy_token" || c.id == "gen_token" || c.id == "copy_url":
+			rendered = styleTokenPill.Render(padded)
 		default:
 			rendered = styleCtrlNormal.Render(padded)
 		}
@@ -307,9 +349,17 @@ func (m *Model) renderFooterBar() string {
 			styleDim.Render(fmt.Sprintf(" (%d/%d)", min(len(m.feedMatches), m.feedMatchAt+1), len(m.feedMatches))) +
 			sep + hint("n/N", "next/prev") + sep + hint("o", "inspect") + sep + hint("esc", "clear")
 	} else if m.focus == focusToolbar {
-		left = " " + hint("←→", "select") + sep + hint("enter", "apply") + sep + hint("↓/tab", "feed") + sep + hint("1-4", "filter") + sep + hint("q", "quit")
+		tokHint := ""
+		if m.token != "" || m.cfg.RotateToken != nil {
+			tokHint = sep + hint("t/T", "token")
+		}
+		left = " " + hint("←→", "select") + sep + hint("enter", "apply") + sep + hint("↓/tab", "feed") + tokHint + sep + hint("1-4", "filter") + sep + hint("q", "quit")
 	} else {
-		left = " " + hint("↑↓", "move") + sep + hint("enter", "fold") + sep + hint("o", "inspect") + sep + hint("drag/y", "copy") + sep + hint("s", "sessions") + sep + hint("/", "find") + sep + hint("q", "quit")
+		tokHint := ""
+		if m.token != "" || m.cfg.RotateToken != nil {
+			tokHint = sep + hint("t", "token")
+		}
+		left = " " + hint("↑↓", "move") + sep + hint("enter", "fold") + sep + hint("o", "inspect") + sep + hint("drag/y", "copy") + tokHint + sep + hint("/", "find") + sep + hint("q", "quit")
 	}
 
 	modeTag := styleFooterTag.Render("FEED")

@@ -38,7 +38,6 @@ Add to any MCP client (Claude Desktop, Cursor, Codex, Cline, etc.):
       "args": [
         "serve",
         "--cwd", "/path/to/your/workspace",
-        "--strict-root",
         "--mcp-config", "/path/to/downstream-mcp.json"
       ]
     }
@@ -52,7 +51,6 @@ mcplex serve \
   --http 127.0.0.1:8787 \
   --token "your-secret-token" \
   --cwd /path/to/workspace \
-  --strict-root \
   --mcp-config ./downstream-mcp.json
 ```
 - Endpoint: `POST http://127.0.0.1:8787/mcp` (`Authorization: Bearer your-secret-token`)
@@ -76,9 +74,13 @@ Clients such as the Gemini web app only connect to remote MCP servers over HTTPS
 cloudflared tunnel login   # once: authorize the Cloudflare zone that owns example.com
 cloudflared tunnel --name mcplex --hostname mcp.example.com --url http://127.0.0.1:8787
 
-# 2. Serve MCPlex as an OAuth-protected MCP server for that hostname
+# 2. Serve MCPlex with interactive TUI (auto-generates an owner token if --token is omitted!)
+mcplex serve --ui --oauth --public-url https://mcp.example.com \
+  --cwd /path/to/workspace
+
+# (Or headless without TUI — pass an explicit --token)
 mcplex serve --http 127.0.0.1:8787 --oauth --public-url https://mcp.example.com \
-  --token "$(openssl rand -hex 24)" --strict-root --cwd /path/to/workspace
+  --token "$(openssl rand -hex 24)" --cwd /path/to/workspace
 ```
 Before adding it to Gemini, verify the public URL end to end with the official MCP SDK client (discovery, DCR, PKCE, consent, tools, refresh, revocation):
 ```bash
@@ -86,13 +88,13 @@ cd scripts/oauth-interop && npm install
 MCPLEX_TOKEN="<your --token>" node check.mjs https://mcp.example.com
 ```
 
-3. In Gemini: **Settings → Connected Apps → Add a custom app**, enter `https://mcp.example.com/mcp`. Your browser opens the MCPlex consent page; enter the `--token` value (the *owner secret*) and click **Approve**.
+3. In Gemini: **Settings → Connected Apps → Add a custom app**, enter `https://mcp.example.com/mcp` (press `u` or click `URL ⧉` in `--ui` to copy). Your browser opens the MCPlex consent page; press `t` or click `Token ••••xxxx ⧉` in `--ui` to copy the owner secret (or `T` / `↻` to rotate it live), paste it, and click **Approve**.
 
 - The token is the owner secret for the consent page and still works as a plain `Authorization: Bearer` token for header-capable clients (Claude Code, Cursor, `mcplex ui`).
 - Only Google's account-linking redirect URIs are accepted by default; add more with `--oauth-redirect-allow <pattern>` (`loopback` allows local native clients).
 - Refresh tokens are long-lived for confidential clients (Gemini "persistent linking") and rotate for public clients. Clients/grants persist in `<data-dir>/oauth-server/` (hashed, unreadable from the sandbox). List or revoke them with `mcplex oauth clients` / `mcplex oauth revoke <client-id|all>` — revocation applies to a running server.
 - The OAuth issuer is bound to `--public-url`: a changing hostname (e.g. a random `*.trycloudflare.com` quick tunnel) breaks existing links, so prefer a named tunnel. For header-token clients only, `--public-url` without `--oauth` just allows the tunnel hostname.
-- Every tool declares MCP annotations (`read`/`docs` read-only; `exec`/`spawn`/`task` destructive) so clients ask for confirmation before running commands. Anyone who completes the consent step can run code on this machine: keep `--strict-root`, a long random token, and consider `--tools`.
+- Every tool declares MCP annotations (`read`/`docs` read-only; `exec`/`spawn`/`task` destructive) so clients ask for confirmation before running commands. Anyone who completes the consent step can run code on this machine: use a strong random token, and optionally pass `--strict-root` or `--tools` if you want to restrict scope.
 
 ---
 

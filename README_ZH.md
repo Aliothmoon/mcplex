@@ -38,7 +38,6 @@ go build -o mcplex ./cmd/mcplex
       "args": [
         "serve",
         "--cwd", "/path/to/your/workspace",
-        "--strict-root",
         "--mcp-config", "/path/to/downstream-mcp.json"
       ]
     }
@@ -52,7 +51,6 @@ mcplex serve \
   --http 127.0.0.1:8787 \
   --token "your-secret-token" \
   --cwd /path/to/workspace \
-  --strict-root \
   --mcp-config ./downstream-mcp.json
 ```
 - MCP 端点：`POST http://127.0.0.1:8787/mcp`（请求头携带 `Authorization: Bearer your-secret-token`）
@@ -76,9 +74,13 @@ Gemini 网页版这类客户端只能通过 HTTPS + **OAuth**（动态客户端�
 cloudflared tunnel login   # 仅首次：授权拥有 example.com 的 Cloudflare 站点
 cloudflared tunnel --name mcplex --hostname mcp.example.com --url http://127.0.0.1:8787
 
-# 2. 以 OAuth 保护模式启动 MCPlex
+# 2. 以交互式 UI + OAuth 保护模式启动（省略 --token 时会自动生成高强度随机口令，可在 UI 内一键复制/轮换）
+mcplex serve --ui --oauth --public-url https://mcp.example.com \
+  --cwd /path/to/workspace
+
+# （或无界面后台模式：需显式传入 --token）
 mcplex serve --http 127.0.0.1:8787 --oauth --public-url https://mcp.example.com \
-  --token "$(openssl rand -hex 24)" --strict-root --cwd /path/to/workspace
+  --token "$(openssl rand -hex 24)" --cwd /path/to/workspace
 ```
 在 Gemini 中添加之前，可以先用官方 MCP SDK 客户端对公网地址做一次端到端自检（发现、动态注册、PKCE、授权、工具调用、刷新、撤销）：
 ```bash
@@ -86,13 +88,13 @@ cd scripts/oauth-interop && npm install
 MCPLEX_TOKEN="<你的 --token>" node check.mjs https://mcp.example.com
 ```
 
-3. 在 Gemini 中打开 **设置 → Connected Apps → 添加自定义应用**，填入 `https://mcp.example.com/mcp`。浏览器会跳到 MCPlex 的授权页，输入 `--token` 的值（主人口令）后点 **Approve**。
+3. 在 Gemini 中打开 **设置 → Connected Apps → 添加自定义应用**，填入 `https://mcp.example.com/mcp`（在 `--ui` 中按 `u` 或点顶栏 `URL ⧉` 即可复制）。浏览器会跳到 MCPlex 的授权页，在 `--ui` 中按 `t` 或点 `Token ••••xxxx ⧉` 复制主人口令（按 `T` / 点 `↻` 可实时重新生成），粘贴后点 **Approve**。
 
 - `--token` 既是授权页的主人口令，也仍可作为普通 `Authorization: Bearer` 令牌，供 Claude Code、Cursor、`mcplex ui` 等支持请求头的客户端使用。
 - 默认只接受 Google 账号关联使用的回调地址；可用 `--oauth-redirect-allow <pattern>` 追加（`loopback` 表示允许本机原生客户端）。
 - 机密客户端（Gemini）的 refresh token 长期有效（持久关联），公共客户端的 refresh token 每次刷新都会轮换。客户端与授权记录以哈希形式保存在 `<data-dir>/oauth-server/`，沙箱无法读写；用 `mcplex oauth clients` / `mcplex oauth revoke <client-id|all>` 查看或撤销，撤销对运行中的服务立即生效。
 - OAuth issuer 绑定 `--public-url`：域名变化（如随机的 `*.trycloudflare.com` 临时隧道）会让已有关联失效，建议使用具名隧道。只用请求头令牌的客户端，可以单独加 `--public-url`（不开 `--oauth`），仅用于放行隧道域名。
-- 所有工具都声明了 MCP annotations（`read`/`docs` 只读；`exec`/`spawn`/`task` 有破坏性），客户端执行命令前会先请求确认。任何完成授权的人都能在本机执行代码：请保留 `--strict-root`、使用足够长的随机口令，并按需用 `--tools` 收窄工具。
+- 所有工具都声明了 MCP annotations（`read`/`docs` 只读；`exec`/`spawn`/`task` 有破坏性），客户端执行命令前会先请求确认。任何完成授权的人都能在本机执行代码：请使用足够长的随机口令，并可按需用 `--strict-root` 限制目录范围或用 `--tools` 收窄工具。
 
 ---
 

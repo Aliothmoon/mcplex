@@ -72,6 +72,11 @@ var (
 			Foreground(lipgloss.Color("#4ADE80")).
 			Bold(true)
 
+	styleTokenPill = lipgloss.NewStyle().
+			Background(lipgloss.Color("#231D30")).
+			Foreground(lipgloss.Color("#D88BFF")).
+			Bold(true)
+
 	// Hairline dividers & structural chrome
 	styleDivider        = lipgloss.NewStyle().Foreground(lipgloss.Color("#222631"))
 	styleDividerFocused = lipgloss.NewStyle().Foreground(lipgloss.Color("#D88BFF"))

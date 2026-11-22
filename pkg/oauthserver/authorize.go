@@ -148,7 +148,7 @@ func (s *Server) handleAuthorizeDecision(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	given := r.PostForm.Get("owner_secret")
-	if subtle.ConstantTimeCompare([]byte(hashSecret(given)), []byte(hashSecret(s.cfg.OwnerSecret))) != 1 {
+	if subtle.ConstantTimeCompare([]byte(hashSecret(given)), []byte(s.currentOwnerSecretHash())) != 1 {
 		s.loginLimiter.fail(key, now)
 		s.renderConsent(w, http.StatusUnauthorized, req, "Wrong owner secret.")
 		return

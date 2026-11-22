@@ -23,6 +23,9 @@ type Server struct {
 	codesMu sync.Mutex
 	codes   map[string]*authCode // key: sha256(code)
 
+	secretMu        sync.RWMutex
+	ownerSecretHash string
+
 	loginLimiter    *failureLimiter
 	registerLimiter *rateCounter
 }
@@ -70,9 +73,29 @@ func New(cfg Config) (*Server, error) {
 		store:           st,
 		formKey:         key,
 		codes:           map[string]*authCode{},
+		ownerSecretHash: hashSecret(cfg.OwnerSecret),
 		loginLimiter:    newFailureLimiter(),
 		registerLimiter: newRateCounter(30, time.Hour),
 	}, nil
+}
+
+// SetOwnerSecret rotates the owner secret checked on the authorization consent page at runtime.
+// Existing approved grants and access/refresh tokens remain valid until revoked.
+func (s *Server) SetOwnerSecret(secret string) error {
+	if len(strings.TrimSpace(secret)) == 0 {
+		return errOwnerSecretRequired
+	}
+	h := hashSecret(secret)
+	s.secretMu.Lock()
+	s.ownerSecretHash = h
+	s.secretMu.Unlock()
+	return nil
+}
+
+func (s *Server) currentOwnerSecretHash() string {
+	s.secretMu.RLock()
+	defer s.secretMu.RUnlock()
+	return s.ownerSecretHash
 }
 
 // Issuer returns the OAuth issuer (public origin).
