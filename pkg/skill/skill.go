@@ -132,7 +132,7 @@ Example:
 - ` + "`await git.log({ n?, grep?, since?, author?, format?, path?, cwd? })`" + ` (string flags also accepted)
 - ` + "`await git.show({ ref?, stat?, nameOnly?, cwd? })`" + `
 - ` + "`await git.blame(path, { cwd?, startLine?, endLine? })`" + `
-- ` + "`await git.query(\"rev-parse HEAD\", { cwd? })`" + ` (other read-only git subcommands; destructive git commands are blocked by policy)`,
+- ` + "`await git.query(\"rev-parse HEAD\", { cwd? })`" + ` (read-only git subcommands incl. ` + "`worktree list`" + `, ` + "`stash list`" + `, ` + "`branch`" + `, ` + "`tag`" + `, ` + "`remote -v`" + `; destructive git commands are blocked by policy)`,
 	},
 	{
 		ID:            "tasks",
@@ -169,7 +169,7 @@ Example (start dev server and wait for ready):
 		Body: `- ` + "`await tools.search(query)`" + ` -> discover available built-in and downstream MCP tools
 - ` + "`await tools.describe(ref)`" + ` -> inspect exact JSON input schema for a tool
 - ` + "`await mcp.servers()`" + ` -> list connected downstream MCP servers
-- ` + "`await mcp.<server>.<tool>(args)`" + ` or ` + "`await mcp.call(\"server.tool\", args)`" + ` -> call downstream MCP tools directly inside ` + "`exec`" + ` (safe for ` + "`Promise.all`" + ` multiplexing!).`,
+- ` + "`await mcp.<server>.<tool>(args)`" + ` or ` + "`await mcp.call(\"server.tool\", args)`" + ` -> ` + "`{ text, data? }`" + ` (` + "`res.data`" + ` holds auto-parsed JSON or ` + "`structuredContent`" + ` when the tool outputs JSON; ` + "`res.text`" + ` holds raw text; safe for ` + "`Promise.all`" + ` multiplexing!).`,
 	},
 	{
 		ID:      "globals",

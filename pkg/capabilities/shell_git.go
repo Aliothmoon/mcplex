@@ -34,6 +34,8 @@ var allowedGitReadSubcommands = map[string]bool{
 	"describe":  true,
 	"tag":       true,
 	"remote":    true,
+	"worktree":  true,
+	"stash":     true,
 }
 
 var shellStreamSeq atomic.Int64
@@ -668,7 +670,14 @@ var (
 		"--contains": true, "--no-contains": true, "--merged": true, "--no-merged": true, "--points-at": true,
 		"--sort": true, "--format": true,
 	}
-	gitTagListShort = "li"
+	gitTagListShort  = "li"
+	gitStashListOpts = map[string]bool{
+		"--oneline": false, "--stat": false, "--shortstat": false, "--numstat": false,
+		"--name-only": false, "--name-status": false, "--no-color": false, "--color": false,
+		"--abbrev-commit": false, "--no-abbrev-commit": false, "--quiet": false,
+		"--max-count": true, "--since": true, "--after": true, "--until": true, "--before": true,
+		"--grep": true, "--format": true, "--pretty": true,
+	}
 )
 
 // validateReadOnlyGitArgs rejects any git invocation that could mutate the repository, read outside the repo, or execute helpers.
@@ -722,6 +731,52 @@ func validateReadOnlyGitArgs(gitArgs []string) error {
 			return nil
 		}
 		return fmt.Errorf("only read-only 'git remote [-v]', 'git remote show' and 'git remote get-url' are allowed in git.* (got '%s')", rest[i])
+	case "worktree":
+		if len(rest) == 0 || rest[0] != "list" {
+			return fmt.Errorf("only read-only 'git worktree list' is allowed in git.* (use sh.exec for worktree mutations)")
+		}
+		for _, a := range rest[1:] {
+			switch a {
+			case "-v", "--verbose", "--porcelain", "-z":
+			default:
+				return fmt.Errorf("git worktree list option/argument '%s' is not allowed in read-only git.*", a)
+			}
+		}
+		return nil
+	case "stash":
+		if len(rest) == 0 || rest[0] != "list" {
+			return fmt.Errorf("only read-only 'git stash list' is allowed in git.* (use sh.exec for stash mutations)")
+		}
+		for i := 1; i < len(rest); i++ {
+			a := rest[i]
+			if a == "-q" {
+				continue
+			}
+			if (a == "-n" || a == "--max-count") && i+1 < len(rest) {
+				i++
+				continue
+			}
+			numPart := strings.TrimPrefix(a, "-")
+			if strings.HasPrefix(a, "-n") {
+				numPart = a[2:]
+			}
+			if strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && len(numPart) > 0 && strings.Trim(numPart, "0123456789") == "" {
+				continue
+			}
+			if strings.HasPrefix(a, "--") {
+				name, _, hasVal := strings.Cut(a, "=")
+				takesVal, ok := gitStashListOpts[name]
+				if !ok {
+					return fmt.Errorf("git stash list option '%s' is not allowed in read-only git.*", a)
+				}
+				if takesVal && !hasVal && i+1 < len(rest) && !strings.HasPrefix(rest[i+1], "-") {
+					i++
+				}
+				continue
+			}
+			return fmt.Errorf("git stash list option/argument '%s' is not allowed in read-only git.*", a)
+		}
+		return nil
 	}
 	return nil
 }
@@ -762,6 +817,17 @@ func (b *ShellGitBinder) validateGitReadPaths(repoDir string, gitArgs []string) 
 			if _, err := b.Policy.ResolveAndCheckRead(repoDir, p); err != nil {
 				return err
 			}
+		}
+	}
+	if (sub == "worktree" || sub == "stash") && len(preDash) > 0 && preDash[0] == "list" {
+		preDash = preDash[1:]
+	} else if sub == "remote" {
+		i := 0
+		for i < len(preDash) && (preDash[i] == "-v" || preDash[i] == "--verbose") {
+			i++
+		}
+		if i < len(preDash) && (preDash[i] == "show" || preDash[i] == "get-url") {
+			preDash = append(append([]string(nil), preDash[:i]...), preDash[i+1:]...)
 		}
 	}
 

@@ -666,15 +666,24 @@ func (b *StateBinder) Bind(env *sandbox.ExecutionEnv) error {
 				text = output.MarshalPretty(val)
 			}
 			pages := output.Paginate(text, size)
+			origN := n
 			if n < 0 {
 				n = len(pages) + n + 1
 			}
-			if n < 1 || n > len(pages) {
+			if n < 1 {
 				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "page out of range (1..%d)", len(pages))
 			}
 			footerKey := ""
 			if resolvedKey != "" && resolvedKey != lastResultKey {
 				footerKey = resolvedKey
+			}
+			displayKey := footerKey
+			if displayKey == "" {
+				displayKey = key
+			}
+			if n > len(pages) {
+				env.AddWarning(fmt.Sprintf("state.page: requested page %d exceeds total %d page(s) for '%s' (size=%d)", origN, len(pages), displayKey, size))
+				return fmt.Sprintf("[end of %s — requested page %d exceeds %d total page(s)]", displayKey, origN, len(pages)), nil
 			}
 			total := pages[len(pages)-1].LastLine
 			return pages[n-1].Text + "\n" + output.PageFooter(pages[n-1], n, len(pages), total, size, footerKey), nil

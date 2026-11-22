@@ -94,3 +94,37 @@ func TestStdioBridgeIgnoresServerRequestWithSameID(t *testing.T) {
 		t.Fatalf("expected real response, got server request collision: %q", got)
 	}
 }
+
+func TestDecodeMCPCallResponseUnifiesDataField(t *testing.T) {
+	// 1. Whitespace-padded JSON array in content[].text -> populates data
+	outArr, err := decodeMCPCallResponse("srv", "list", []byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"\n  [{\"id\":1},{\"id\":2}] \n"}]}}`))
+	if err != nil {
+		t.Fatalf("unexpected decode error: %v", err)
+	}
+	mArr := outArr.(map[string]any)
+	arr, ok := mArr["data"].([]any)
+	if !ok || len(arr) != 2 {
+		t.Fatalf("expected whitespace-padded JSON array unwrapped into data, got %+v", outArr)
+	}
+
+	// 2. structuredContent -> populates both data and structuredContent
+	outStruct, err := decodeMCPCallResponse("srv", "search", []byte(`{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"summary"}],"structuredContent":{"entries":["a","b"]}}}`))
+	if err != nil {
+		t.Fatalf("unexpected structuredContent decode error: %v", err)
+	}
+	mStruct := outStruct.(map[string]any)
+	scData, ok := mStruct["data"].(map[string]any)
+	if !ok || mStruct["structuredContent"] == nil || mStruct["text"] != "summary" || len(scData["entries"].([]any)) != 2 {
+		t.Fatalf("expected structuredContent mirrored to data, got %+v", outStruct)
+	}
+
+	// 3. Plain markdown/text -> text only, no data key
+	outPlain, err := decodeMCPCallResponse("srv", "doc", []byte(`{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"# Heading\nBody"}]}}`))
+	if err != nil {
+		t.Fatalf("unexpected plain decode error: %v", err)
+	}
+	mPlain := outPlain.(map[string]any)
+	if _, hasData := mPlain["data"]; hasData || mPlain["text"] != "# Heading\nBody" {
+		t.Fatalf("expected plain text without data key, got %+v", outPlain)
+	}
+}

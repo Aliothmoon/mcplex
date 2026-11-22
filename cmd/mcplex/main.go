@@ -554,13 +554,23 @@ func runLogs(args []string, forceErrors bool) int {
 		return 1
 	}
 
-	entries, files, err := audit.LoadEntries(*dataDir, *errorsOnly || *shortErr)
+	wantErrors := *errorsOnly || *shortErr
+	if *runID != "" {
+		wantErrors = false
+	}
+	entries, files, err := audit.LoadEntries(*dataDir, wantErrors)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "logs error: %v\n", err)
 		return 1
 	}
+	if *runID != "" && len(audit.FilterEntries(entries, 0, *runID)) == 0 && !wantErrors {
+		if errEntries, errFiles, err2 := audit.LoadEntries(*dataDir, true); err2 == nil && len(audit.FilterEntries(errEntries, 0, *runID)) > 0 {
+			entries, files = errEntries, errFiles
+		}
+	}
 	if *asJSON {
-		raw, _ := json.MarshalIndent(entries, "", "  ")
+		filtered := audit.FilterEntries(entries, *tail, *runID)
+		raw, _ := json.MarshalIndent(filtered, "", "  ")
 		fmt.Println(string(raw))
 		return 0
 	}

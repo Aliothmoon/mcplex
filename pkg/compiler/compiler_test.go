@@ -177,3 +177,15 @@ return { arrowParen: typeof arrowParen, arrowBare, objMethod: typeof objMethod, 
 		t.Fatalf("expected PayloadError only for realMissing after arrow scope ended, got: %v", err)
 	}
 }
+
+func TestCompileUnterminatedStringLiteralSuggestsPayloads(t *testing.T) {
+	code := "const cSnippet = \"int main(void) {\n  return 0;\n}\";\nreturn cSnippet;"
+	_, err := Compile(code, nil)
+	if err == nil {
+		t.Fatal("expected syntax error for multiline double-quoted string, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "Unterminated string literal") || !strings.Contains(msg, "payloads") || !strings.Contains(msg, "P.snippet") {
+		t.Fatalf("expected actionable payloads hint on Unterminated string literal, got:\n%s", msg)
+	}
+}

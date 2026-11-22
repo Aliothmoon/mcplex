@@ -405,6 +405,28 @@ func readJSONLFile(path string) ([]Entry, error) {
 	return out, nil
 }
 
+// FilterEntries slices recent entries according to `tail` (`tail <= 0` returns all entries)
+// or isolates the latest matching entry when `runID != ""` (exact ID or suffix match).
+// Always returns a non-nil slice so JSON callers serialize empty results as `[]` rather than `null`.
+func FilterEntries(entries []Entry, tail int, runID string) []Entry {
+	if len(entries) == 0 {
+		return []Entry{}
+	}
+	if runID != "" {
+		for i := len(entries) - 1; i >= 0; i-- {
+			e := entries[i]
+			if e.ID == runID || strings.HasSuffix(e.ID, runID) {
+				return []Entry{e}
+			}
+		}
+		return []Entry{}
+	}
+	if tail > 0 && len(entries) > tail {
+		return entries[len(entries)-tail:]
+	}
+	return entries
+}
+
 // FormatLogs renders recent entries or a full single-run diagnostic view (`runID != ""`).
 func FormatLogs(entries []Entry, usedFiles []string, tail int, runID string) string {
 	if len(entries) == 0 {

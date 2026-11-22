@@ -1244,14 +1244,14 @@ func decodeMCPCallResponse(serverName, toolName string, raw []byte) (any, error)
 	if rpcResp.Result.StructuredContent != nil {
 		return map[string]any{
 			"text":              joined,
+			"data":              rpcResp.Result.StructuredContent,
 			"structuredContent": rpcResp.Result.StructuredContent,
 		}, nil
 	}
-	// Auto-parse clean JSON text if possible, while keeping `.text` accessible if string expected?
-	// Returning `{ text, data? }` or parsed JSON when valid object/array is super ergonomic; let's return `{ text, json? }` when JSON parses, or plain map `{ text }`.
 	var parsedJSON any
-	if len(joined) > 0 && (joined[0] == '{' || joined[0] == '[') {
-		if json.Unmarshal([]byte(joined), &parsedJSON) == nil {
+	trimmedText := strings.TrimSpace(joined)
+	if len(trimmedText) > 0 && (trimmedText[0] == '{' || trimmedText[0] == '[') {
+		if json.Unmarshal([]byte(trimmedText), &parsedJSON) == nil {
 			return map[string]any{
 				"text": joined,
 				"data": parsedJSON,

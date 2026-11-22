@@ -61,8 +61,23 @@ func TestLongPrintIsPagedNotCutInTheMiddle(t *testing.T) {
 		t.Fatalf("last page must not offer a next page:\n%s", out3)
 	}
 
-	out4, _ := run(t, eng, ws, `try { state.page(99); } catch (e) { return e.name + ": " + e.message; }`)
+	// Requesting a positive page past the upper bound (e.g. batch-printing page 2 + page 3 with a custom size)
+	// returns a graceful end-of-output marker + warning instead of aborting the turn and discarding earlier prints!
+	outPastEnd, isErrPast := run(t, eng, ws, `
+state.set("two_pages", Array.from({ length: 500 }, (_, i) => "item_" + i).join("\n"));
+print(state.page("two_pages", 2, 3000));
+print(state.page("two_pages", 3, 3000));
+print(state.page("__result_1", 99));`)
+	if isErrPast {
+		t.Fatalf("positive page past end must not abort turn: %s", outPastEnd)
+	}
+	mustContainAll(t, outPastEnd, "item_499", "[end of two_pages — requested page 3 exceeds 2 total page(s)]", "[end of __result_1 — requested page 99 exceeds", "Warnings:", "state.page: requested page 3 exceeds total 2 page(s) for 'two_pages'")
+
+	// Invalid page <= 0 (or negative resolving < 1) still throws BadArgs.
+	out4, _ := run(t, eng, ws, `try { state.page(0); } catch (e) { return e.name + ": " + e.message; }`)
 	mustContainAll(t, out4, "BadArgs: state.page: page out of range (1..")
+	outNeg, _ := run(t, eng, ws, `try { state.page(-999); } catch (e) { return e.name + ": " + e.message; }`)
+	mustContainAll(t, outNeg, "BadArgs: state.page: page out of range (1..")
 }
 
 func TestLongStringResultIsPagedAndObjectsPageAsJSON(t *testing.T) {

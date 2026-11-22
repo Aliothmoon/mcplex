@@ -118,6 +118,12 @@ func Compile(code string, payloads map[string]string) (*CompileResult, error) {
 				details = append(details, "  "+msg.Text)
 			}
 		}
+		for _, msg := range res.Errors {
+			if strings.Contains(msg.Text, "Unterminated string literal") || strings.Contains(msg.Text, "Unterminated template") {
+				details = append(details, "  Hint: pass multiline code, C/SQL/HTML snippets, or replacement text in top-level 'payloads' (e.g. payloads: { snippet: \"...\" }) and reference P.snippet instead of inline string literals.")
+				break
+			}
+		}
 		return nil, &CompileError{
 			Message: "TypeScript syntax check failed (0 side effects executed):",
 			Details: details,

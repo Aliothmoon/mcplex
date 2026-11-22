@@ -1,9 +1,82 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestRunLogsJSONRespectsTailAndID(t *testing.T) {
+	dataDir := t.TempDir()
+	logsDir := filepath.Join(dataDir, "logs")
+	if err := os.MkdirAll(logsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var sb strings.Builder
+	for i := 1; i <= 25; i++ {
+		sb.WriteString(`{"id":"ptc_m_` + string(rune('a'+(i-1))) + `","timestamp":"2026-11-23T00:00:00Z","status":"runtime_error","errorMessage":"err"}` + "\n")
+	}
+	if err := os.WriteFile(filepath.Join(logsDir, "errors.jsonl"), []byte(sb.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	capture := func(args ...string) string {
+		t.Helper()
+		tmpPath := filepath.Join(t.TempDir(), "stdout.json")
+		f, err := os.Create(tmpPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		orig := os.Stdout
+		os.Stdout = f
+		defer func() { os.Stdout = orig }()
+		if code := runLogs(args, true); code != 0 {
+			_ = f.Close()
+			t.Fatalf("runLogs(%v) returned %d", args, code)
+		}
+		_ = f.Close()
+		out, err := os.ReadFile(tmpPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(out)
+	}
+
+	var def []map[string]any
+	if err := json.Unmarshal([]byte(capture("--data-dir", dataDir, "--json")), &def); err != nil {
+		t.Fatalf("unmarshal default json: %v", err)
+	}
+	if len(def) != 20 || def[0]["id"] != "ptc_m_f" || def[19]["id"] != "ptc_m_y" {
+		t.Fatalf("expected last 20 entries, got len=%d", len(def))
+	}
+
+	var custom []map[string]any
+	if err := json.Unmarshal([]byte(capture("--data-dir", dataDir, "--json", "--tail", "3")), &custom); err != nil {
+		t.Fatalf("unmarshal --tail 3: %v", err)
+	}
+	if len(custom) != 3 || custom[0]["id"] != "ptc_m_w" {
+		t.Fatalf("expected last 3 entries starting at ptc_m_w, got %+v", custom)
+	}
+
+	var all []map[string]any
+	if err := json.Unmarshal([]byte(capture("--data-dir", dataDir, "--json", "--tail", "0")), &all); err != nil {
+		t.Fatalf("unmarshal --tail 0: %v", err)
+	}
+	if len(all) != 25 {
+		t.Fatalf("expected all 25 entries for --tail 0, got %d", len(all))
+	}
+
+	var single []map[string]any
+	if err := json.Unmarshal([]byte(capture("--data-dir", dataDir, "--json", "--id", "m_b")), &single); err != nil {
+		t.Fatalf("unmarshal --id m_b: %v", err)
+	}
+	if len(single) != 1 || single[0]["id"] != "ptc_m_b" {
+		t.Fatalf("expected [ptc_m_b], got %+v", single)
+	}
+}
 
 func TestParseToolSetProfiles(t *testing.T) {
 	all, err := parseToolSet("all")
