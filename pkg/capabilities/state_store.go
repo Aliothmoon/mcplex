@@ -20,10 +20,10 @@ import (
 )
 
 const (
-	MaxStateEntryBytes = 512 * 1024      // 512 KB per persisted user key
-	MaxStateTotalBytes = 4 * 1024 * 1024 // 4 MB per workspace session (persisted user entries)
-	MaxSpillEntryBytes = 4 * 1024 * 1024 // 4 MB per in-memory auto-spill entry
-	MaxSpillTotalBytes = 4 * 1024 * 1024 // 4 MB in-memory cap per session for auto-spills
+	MaxStateEntryBytes = 2*1024*1024 + 128*1024 // ~2.125 MB per persisted user key (>= MaxSandboxReadBytes + JSON escaping)
+	MaxStateTotalBytes = 8 * 1024 * 1024        // 8 MB per workspace session (persisted user entries)
+	MaxSpillEntryBytes = 4 * 1024 * 1024        // 4 MB per in-memory auto-spill entry
+	MaxSpillTotalBytes = 4 * 1024 * 1024        // 4 MB in-memory cap per session for auto-spills
 	maxGlobalSpillPool = 32 * 1024 * 1024
 	lastResultKey      = "__last_result"
 	spillKeyPrefix     = "__result_"

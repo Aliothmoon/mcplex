@@ -128,11 +128,11 @@ Example:
 		Summary: "git.status, diff, log, show, blame, query",
 		Aliases: []string{"repo", "blame", "log"},
 		Body: `- ` + "`await git.status(repoDir?) -> { isRepo, branch, clean, staged, modified, untracked }`" + `
-- ` + "`await git.diff({ staged?, stat?, nameOnly?, ref?, path?, cwd? })`" + `
-- ` + "`await git.log({ n?, grep?, since?, author?, format?, path?, cwd? })`" + ` (string flags also accepted)
-- ` + "`await git.show({ ref?, stat?, nameOnly?, cwd? })`" + `
-- ` + "`await git.blame(path, { cwd?, startLine?, endLine? })`" + `
-- ` + "`await git.query(\"rev-parse HEAD\", { cwd? })`" + ` (read-only git subcommands incl. ` + "`worktree list`" + `, ` + "`stash list`" + `, ` + "`branch`" + `, ` + "`tag`" + `, ` + "`remote -v`" + `; destructive git commands are blocked by policy)`,
+- ` + "`await git.diff({ staged?, stat?, nameOnly?, ref?, path?, cwd? }) -> string`" + `
+- ` + "`await git.log({ n?, grep?, since?, author?, format?, path?, cwd? }) -> string`" + ` (string flags also accepted)
+- ` + "`await git.show({ ref?, stat?, nameOnly?, cwd? }) -> string`" + `
+- ` + "`await git.blame(path, { cwd?, startLine?, endLine? }) -> string`" + `
+- ` + "`await git.query(\"rev-parse HEAD\", { cwd? }) -> string`" + ` (read-only git subcommands incl. ` + "`worktree list`" + `, ` + "`stash list`" + `, ` + "`branch`" + `, ` + "`tag`" + `, ` + "`remote -v`" + `; destructive git commands are blocked by policy)`,
 	},
 	{
 		ID:            "tasks",

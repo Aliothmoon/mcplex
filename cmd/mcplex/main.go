@@ -547,6 +547,7 @@ func runLogs(args []string, forceErrors bool) int {
 	runID := fs.String("id", "", "Inspect a specific run ID")
 	dataDir := fs.String("data-dir", defaultDataDir(), "Data directory")
 	asJSON := fs.Bool("json", false, "Output JSON")
+	compact := fs.Bool("compact", false, "Omit full source/result bodies in JSON output")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -570,7 +571,7 @@ func runLogs(args []string, forceErrors bool) int {
 	}
 	if *asJSON {
 		filtered := audit.FilterEntries(entries, *tail, *runID)
-		raw, _ := json.MarshalIndent(filtered, "", "  ")
+		raw, _ := audit.MarshalEntriesJSON(filtered, *full || *runID != "", *compact)
 		fmt.Println(string(raw))
 		return 0
 	}

@@ -237,9 +237,20 @@ func ClassifyError(phase, msg string, traces []sandbox.OpTrace) string {
 
 	// 2. Scan host operation traces in reverse so the final uncaught failure determines the category
 	// rather than an earlier try/catch-recovered op, checking structured t.Kind BEFORE message substring heuristics.
+	// Skip secondary sibling `context canceled` traces caused by Promise.all teardown when an earlier primary error exists.
+	hasNonCancelErr := false
+	for _, tr := range traces {
+		if tr.Status == "error" && !isSecondaryCancelTrace(tr) {
+			hasNonCancelErr = true
+			break
+		}
+	}
 	for i := len(traces) - 1; i >= 0; i-- {
 		t := traces[i]
 		if t.Status != "error" {
+			continue
+		}
+		if hasNonCancelErr && isSecondaryCancelTrace(t) {
 			continue
 		}
 		switch t.Kind {
@@ -299,6 +310,10 @@ func ClassifyError(phase, msg string, traces []sandbox.OpTrace) string {
 func isEditCapability(capName string) bool {
 	return capName == "t.edit" || capName == "tx._edit" ||
 		strings.HasPrefix(capName, "edit.") || strings.HasPrefix(capName, "tx.")
+}
+
+func isSecondaryCancelTrace(t sandbox.OpTrace) bool {
+	return (t.Kind == "" || t.Kind == "Error") && strings.Contains(strings.ToLower(t.Error), "context canceled")
 }
 
 // PayloadKeyLengths extracts only key names and byte sizes so sensitive file contents aren't duplicated in telemetry.
@@ -425,6 +440,74 @@ func FilterEntries(entries []Entry, tail int, runID string) []Entry {
 		return entries[len(entries)-tail:]
 	}
 	return entries
+}
+
+const maxBulkJSONBytes = 180 * 1024 // Keep bulk `logs --json` safely below `sh.run`'s 256 KB maxShellOutputBytes cap
+
+// MarshalEntriesJSON serializes audit entries as indented JSON.
+// When `compact` is true, large `Code` and `ResultPreview` bodies are omitted and non-error traces are trimmed.
+// When `full` is false and multi-entry output would exceed 384 KB, large fields are progressively compacted so
+// callers invoking `logs --json --tail 80` via `sh.run` always receive valid, parseable JSON without middle-truncation.
+func MarshalEntriesJSON(entries []Entry, full bool, compact bool) ([]byte, error) {
+	if entries == nil {
+		entries = []Entry{}
+	}
+	if compact {
+		return json.MarshalIndent(compactEntries(entries, true), "", "  ")
+	}
+	raw, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil || full || len(entries) <= 1 || len(raw) <= maxBulkJSONBytes {
+		return raw, err
+	}
+	trimmed := compactEntries(entries, false)
+	raw, err = json.MarshalIndent(trimmed, "", "  ")
+	if err != nil || len(raw) <= maxBulkJSONBytes {
+		return raw, err
+	}
+	return json.MarshalIndent(compactEntries(entries, true), "", "  ")
+}
+
+func compactEntries(entries []Entry, dropBodies bool) []Entry {
+	out := make([]Entry, len(entries))
+	for i, e := range entries {
+		cp := e
+		if dropBodies {
+			cp.Code = ""
+			cp.ResultPreview = ""
+			cp.Logs = nil
+			if len(cp.ErrorMessage) > 600 {
+				cp.ErrorMessage = output.SliceUTF8Bytes(cp.ErrorMessage, 600) + "..."
+			}
+			var failedTraces []sandbox.OpTrace
+			for _, tr := range cp.Traces {
+				if tr.Status == "error" {
+					tCopy := tr
+					if len(tCopy.Error) > 240 {
+						tCopy.Error = output.SliceUTF8Bytes(tCopy.Error, 240) + "..."
+					}
+					failedTraces = append(failedTraces, tCopy)
+				}
+			}
+			cp.Traces = failedTraces
+		} else {
+			if len(cp.Code) > 300 {
+				cp.Code = output.SliceUTF8Bytes(cp.Code, 300) + "... [truncated; pass --full or --id " + cp.ID + "]"
+			}
+			if len(cp.ResultPreview) > 300 {
+				cp.ResultPreview = output.SliceUTF8Bytes(cp.ResultPreview, 300) + "..."
+			}
+			if len(cp.Logs) > 3 {
+				cp.Logs = append([]string{}, cp.Logs[:3]...)
+			}
+			for li, l := range cp.Logs {
+				if len(l) > 200 {
+					cp.Logs[li] = output.SliceUTF8Bytes(l, 200) + "..."
+				}
+			}
+		}
+		out[i] = cp
+	}
+	return out
 }
 
 // FormatLogs renders recent entries or a full single-run diagnostic view (`runID != ""`).

@@ -283,14 +283,32 @@ func (e *Engine) loadSettingsFile(path string) {
 	e.LoadSettingsJSON(raw)
 }
 
-// ResolveAndCheckRead resolves path against baseDir and checks read permissions.
-func (e *Engine) ResolveAndCheckRead(baseDir, targetPath string) (string, error) {
+// ResolveRealPath resolves targetPath against baseDir and evaluates any symlinks without checking rules.
+func (e *Engine) ResolveRealPath(baseDir, targetPath string) (absPath string, realPath string, err error) {
+	return resolveWithSymlinks(baseDir, targetPath)
+}
+
+// ResolveReadWithReal resolves targetPath against baseDir, evaluates symlinks, and checks read permissions,
+// returning both the clean absolute path and the symlink-resolved real path.
+func (e *Engine) ResolveReadWithReal(baseDir, targetPath string) (absPath string, realPath string, err error) {
 	abs, realPath, err := resolveWithSymlinks(baseDir, targetPath)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	if e.isSensitivePath(realPath) || e.isSensitivePath(abs) {
-		return "", &PolicyError{
+	if err := e.CheckResolvedRead(targetPath, abs, realPath); err != nil {
+		return "", "", err
+	}
+	return abs, realPath, nil
+}
+
+// CheckResolvedRead checks read permissions given an already canonicalized (absPath, realPath) pair.
+// Safe for concurrent lock-free calls across directory-walker workers when child entries are non-symlinks.
+func (e *Engine) CheckResolvedRead(targetPath, absPath, realPath string) error {
+	if e == nil {
+		return nil
+	}
+	if e.isSensitivePath(realPath) || e.isSensitivePath(absPath) {
+		return &PolicyError{
 			Decision: DecisionDeny,
 			Action:   "read_file",
 			Target:   targetPath,
@@ -299,19 +317,25 @@ func (e *Engine) ResolveAndCheckRead(baseDir, targetPath string) (string, error)
 	}
 	if dec, matched := e.evalRules("read_file", realPath); matched {
 		if dec != DecisionAllow {
-			return "", e.policyErr(dec, "read_file", targetPath, "settings rule")
+			return e.policyErr(dec, "read_file", targetPath, "settings rule")
 		}
-		return abs, nil
+		return nil
 	}
 	// Write implies read in Antigravity permission rules.
 	if dec, matched := e.evalRules("write_file", realPath); matched && dec == DecisionAllow {
-		return abs, nil
+		return nil
 	}
 	allowScratch := !e.strictConfinement && e.isTempOrScratch(realPath)
 	if !e.isInsideWorkspace(realPath) && !allowScratch && !e.allowNonWorkspaceAccess {
-		return "", e.policyErr(DecisionAsk, "read_file", targetPath, "outside workspace")
+		return e.policyErr(DecisionAsk, "read_file", targetPath, "outside workspace")
 	}
-	return abs, nil
+	return nil
+}
+
+// ResolveAndCheckRead resolves path against baseDir and checks read permissions.
+func (e *Engine) ResolveAndCheckRead(baseDir, targetPath string) (string, error) {
+	abs, _, err := e.ResolveReadWithReal(baseDir, targetPath)
+	return abs, err
 }
 
 // ResolveAndCheckStrictCwd resolves a working directory (`cwd`) when `--strict-root` is active,

@@ -172,3 +172,13 @@ func TestDiscoverLogDirsIncludesStandaloneMcplexConfigDir(t *testing.T) {
 		t.Fatalf("expected DiscoverLogDirs(\"\") to include standalone mcplex logs dir %q, got %v", mcplexLogs, dirs)
 	}
 }
+
+func TestClassifyErrorSkipsSecondaryContextCanceledTraceInPromiseAll(t *testing.T) {
+	got := ClassifyError("runtime", "NotFound: search.rg: missing/file.cc not found", []sandbox.OpTrace{
+		{Seq: 3, Capability: "search.rg", Status: "error", Kind: "NotFound", Error: "missing/file.cc not found"},
+		{Seq: 1, Capability: "git.log", Status: "error", Kind: "Error", Error: "git log timed out: context canceled"},
+	})
+	if got != "not_found" {
+		t.Fatalf("expected primary NotFound to win over sibling context canceled trace, got %q", got)
+	}
+}

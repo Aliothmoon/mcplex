@@ -202,4 +202,13 @@ func TestReservedSpillKeysRejectedAndDeleteKeysWork(t *testing.T) {
 	if store.Get(k2) != "spilled-2" {
 		t.Fatalf("%s should remain intact after deleting __last_result alias", k2)
 	}
+
+	// Verify >512KB files read via fs.read (up to 2MB, e.g. 1.2MB build.ninja) store cleanly in state.set.
+	largeNinja := strings.Repeat("build obj/foo.o: cc src/foo.c\n", 40000) // ~1.2 MB
+	if err := store.Set("ninja", largeNinja); err != nil {
+		t.Fatalf("expected 1.2MB build.ninja string to fit in state.set, got: %v", err)
+	}
+	if store.Get("ninja") != largeNinja {
+		t.Fatal("1.2MB state value round-trip mismatch")
+	}
 }

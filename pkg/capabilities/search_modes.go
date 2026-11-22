@@ -132,7 +132,7 @@ func runRgCounts(ctx context.Context, pol *policy.Engine, rgBin, workspaceCwd, s
 		return nil, false, err
 	}
 	var out []fileCount
-	permCache := map[string]bool{}
+	checker := newFastPathChecker(pol, workspaceCwd)
 	sc := bufio.NewScanner(strings.NewReader(stdout.String()))
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -146,7 +146,7 @@ func runRgCounts(ctx context.Context, pol *policy.Engine, rgBin, workspaceCwd, s
 			continue
 		}
 		fp := line[:i]
-		if !canSearchPath(pol, workspaceCwd, fp, permCache) {
+		if !checker.allowFile(fp) {
 			continue
 		}
 		out = append(out, fileCount{relDisplayPath(workspaceCwd, fp), n})

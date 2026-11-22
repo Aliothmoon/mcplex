@@ -138,6 +138,7 @@ type ExecutionEnv struct {
 	loopCh        chan loopAction
 	deliverFn     goja.Callable
 	makeErrFn     goja.Callable
+	hostObjProto  *goja.Object
 	opSeq         atomic.Int32
 	maxOps        int
 	onOpStart     func(capability, target string, seq int)
@@ -453,13 +454,44 @@ func (env *ExecutionEnv) toJSValue(v any) goja.Value {
 	if v == nil {
 		return goja.Null()
 	}
-	if om, ok := v.(*OrderedMap); ok {
-		return env.orderedToJS(om)
+	if gv, ok := v.(goja.Value); ok {
+		return gv
 	}
-	// Round-trip structs via JSON into clean plain JS objects/arrays so Object.keys, destructuring, and camelCase JSON tags work seamlessly in TS/JS.
-	switch v.(type) {
-	case string, bool, int, int64, float64, map[string]any, []any:
-		return env.VM.ToValue(v)
+	if om, ok := v.(*OrderedMap); ok {
+		val := env.orderedToJS(om)
+		if env.hostObjProto != nil {
+			if obj := val.ToObject(env.VM); obj != nil {
+				_ = obj.SetPrototype(env.hostObjProto)
+			}
+		}
+		return val
+	}
+	// Round-trip structs via JSON into clean JS objects/arrays so Object.keys, destructuring, camelCase JSON tags,
+	// and exact runtime receiver type hints (`object {isDir, name, size}`) work seamlessly in TS/JS.
+	switch x := v.(type) {
+	case string, bool, int, int64, float64:
+		return env.VM.ToValue(x)
+	case []string:
+		items := make([]any, len(x))
+		for i, s := range x {
+			items[i] = s
+		}
+		return env.VM.NewArray(items...)
+	case []any:
+		items := make([]any, len(x))
+		for i, item := range x {
+			items[i] = env.toJSValue(item)
+		}
+		return env.VM.NewArray(items...)
+	case map[string]any:
+		obj := env.VM.NewObject()
+		if env.hostObjProto != nil {
+			_ = obj.SetPrototype(env.hostObjProto)
+		}
+		for k, item := range x {
+			_ = obj.Set(k, env.toJSValue(item))
+		}
+		return obj
 	default:
 		raw, err := json.Marshal(v)
 		if err != nil {
@@ -469,7 +501,7 @@ func (env *ExecutionEnv) toJSValue(v any) goja.Value {
 		if err := json.Unmarshal(raw, &generic); err != nil {
 			return env.VM.ToValue(v)
 		}
-		return env.VM.ToValue(generic)
+		return env.toJSValue(generic)
 	}
 }
 
@@ -699,7 +731,7 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 		}
 	}
 
-	if err := installBootstrapWrappers(vm); err != nil {
+	if err := installBootstrapWrappers(env); err != nil {
 		return nil, err
 	}
 
@@ -850,7 +882,7 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 		}
 		formattedMsg := compiler.FormatRuntimeError(msg, cr)
 		formattedMsg = enrichUnknownMethodError(vm, formattedMsg, cr)
-		formattedMsg = addTypeHint(formattedMsg)
+		formattedMsg = enrichTypeHint(vm, formattedMsg, cr)
 		formattedMsg = compiler.CleanStack(formattedMsg, cr)
 		return nil, &ExecutionError{
 			Phase:      "runtime",
@@ -928,7 +960,7 @@ func (env *ExecutionEnv) wrapRuntimeErr(err error, cr *compiler.CompileResult, s
 	formattedMsg := compiler.FormatRuntimeError(safeErrString(err), cr)
 	if phase == "runtime" {
 		formattedMsg = enrichUnknownMethodError(env.VM, formattedMsg, cr)
-		formattedMsg = addTypeHint(formattedMsg)
+		formattedMsg = enrichTypeHint(env.VM, formattedMsg, cr)
 	}
 	formattedMsg = compiler.CleanStack(formattedMsg, cr)
 	return &ExecutionError{
@@ -1045,7 +1077,8 @@ func opBudgetMessage(maxOps int) string {
 // 1. `mcp.<server>.<tool>(args)` dynamic Proxy routing to `mcp.call("server/tool", args)`
 // 2. `tx.begin()` returning a first-class handle `{ id, edit, write, verify, commit, rollback }`
 // 3. Common LLM method aliases (`fs.readFile` -> `fs.read`, `search.grep` -> `search.rg`, etc.) + clear `UnknownMethodError` listing valid methods!
-func installBootstrapWrappers(vm *goja.Runtime) error {
+func installBootstrapWrappers(env *ExecutionEnv) error {
+	vm := env.VM
 	_, err := vm.RunString(`(function() {
 		if (typeof globalThis.mcp === "object" && globalThis.mcp !== null) {
 			const baseMcp = globalThis.mcp;
@@ -1103,6 +1136,92 @@ func installBootstrapWrappers(vm *goja.Runtime) error {
 		};
 
 		globalThis.__ptcLastMissingMethod = null;
+		globalThis.__ptcLastReceiverType = null;
+
+		function __ptcDescribeReceiver(v) {
+			if (v === null) return { kind: "null", label: "null" };
+			if (v === undefined) return { kind: "undefined", label: "undefined" };
+			const t = typeof v;
+			if (t === "string" || v instanceof String) {
+				const s = String(v);
+				const prev = s.length > 40 ? s.slice(0, 40) + "..." : s;
+				return { kind: "string", label: "string (len=" + s.length + ", " + JSON.stringify(prev) + ")" };
+			}
+			if (t === "number" || v instanceof Number) {
+				return { kind: "number", label: "number (" + String(Number(v)) + ")" };
+			}
+			if (t === "boolean" || v instanceof Boolean) {
+				return { kind: "boolean", label: "boolean (" + String(Boolean(v)) + ")" };
+			}
+			if (t === "bigint" || t === "symbol") {
+				return { kind: t, label: t + " (" + String(v) + ")" };
+			}
+			if (t === "function") {
+				return { kind: "function", label: "function" + (v.name ? " " + v.name : "") };
+			}
+			if (Array.isArray(v)) {
+				if (v.length === 0) return { kind: "array", label: "Array (len=0)" };
+				const first = v[0];
+				let elem = first === null ? "null" : Array.isArray(first) ? "Array" : typeof first;
+				if (elem === "object" && first) {
+					const ks = Object.keys(first).sort();
+					elem = ks.length > 0 ? "object {" + ks.slice(0, 6).join(", ") + (ks.length > 6 ? ", ..." : "") + "}" : "object {}";
+				}
+				return { kind: "array", label: "Array (len=" + v.length + ", item: " + elem + ")" };
+			}
+			if ((typeof Promise !== "undefined" && v instanceof Promise) || (t === "object" && typeof v.then === "function")) {
+				return { kind: "promise", label: "Promise" };
+			}
+			if (typeof Map !== "undefined" && v instanceof Map) {
+				return { kind: "map", label: "Map (size=" + v.size + ")" };
+			}
+			if (typeof Set !== "undefined" && v instanceof Set) {
+				return { kind: "set", label: "Set (size=" + v.size + ")" };
+			}
+			if (v instanceof RegExp) {
+				return { kind: "regexp", label: "RegExp (" + String(v) + ")" };
+			}
+			if (v instanceof Date) {
+				return { kind: "date", label: "Date" };
+			}
+			if (typeof Uint8Array !== "undefined" && v instanceof Uint8Array) {
+				return { kind: "bytes", label: "Buffer/Uint8Array (byteLength=" + v.byteLength + ")" };
+			}
+			if (t === "object") {
+				const ks = Object.keys(v).sort();
+				if (ks.length === 0) return { kind: "object", label: "object {}" };
+				return { kind: "object", label: "object {" + ks.slice(0, 8).join(", ") + (ks.length > 8 ? ", ..." : "") + "}" };
+			}
+			return { kind: t, label: t };
+		}
+
+		const __ptcProtoTap = new Proxy(Object.prototype, {
+			getPrototypeOf() { return Object.prototype; },
+			has(target, prop) { return Reflect.has(target, prop); },
+			get(target, prop, receiver) {
+				if (typeof prop !== "string" || prop === "then" || prop === "toJSON" || prop in target) {
+					return Reflect.get(target, prop, receiver);
+				}
+				try {
+					const info = __ptcDescribeReceiver(receiver);
+					globalThis.__ptcLastReceiverType = { prop, kind: info.kind, label: info.label };
+				} catch (_) {}
+				return undefined;
+			}
+		});
+		for (const Ctor of [String, Number, Boolean, Array, Function, RegExp, Date, Promise, Map, Set]) {
+			if (typeof Ctor === "function" && Ctor.prototype) {
+				try { Object.setPrototypeOf(Ctor.prototype, __ptcProtoTap); } catch (_) {}
+			}
+		}
+		if (typeof Uint8Array === "function" && Uint8Array.prototype) {
+			const taProto = Object.getPrototypeOf(Uint8Array.prototype);
+			if (taProto && taProto !== Object.prototype) {
+				try { Object.setPrototypeOf(taProto, __ptcProtoTap); } catch (_) {}
+			}
+		}
+		globalThis.__ptcHostObjProto = Object.create(__ptcProtoTap);
+
 		for (const ns of ["fs", "search", "ast", "edit", "tx", "git", "sh", "state", "tools"]) {
 			const base = globalThis[ns];
 			if (typeof base !== "object" || base === null) continue;
@@ -1121,7 +1240,14 @@ func installBootstrapWrappers(vm *goja.Runtime) error {
 			});
 		}
 	})()`)
-	return err
+	if err != nil {
+		return err
+	}
+	if protoVal := vm.Get("__ptcHostObjProto"); protoVal != nil && !goja.IsUndefined(protoVal) && !goja.IsNull(protoVal) {
+		env.hostObjProto = protoVal.ToObject(vm)
+	}
+	_, _ = vm.RunString(`delete globalThis.__ptcHostObjProto;`)
+	return nil
 }
 
 var (
@@ -1300,22 +1426,92 @@ var (
 	}
 )
 
-// addTypeHint explains the most common shape mistake: calling a string/array method on a plain object
-// (e.g. fs.list(p, { detail: true }) items treated as strings).
-func addTypeHint(msg string) string {
-	m := noMemberRegex.FindStringSubmatchIndex(msg)
+// enrichTypeHint reports the exact runtime type (and keys/preview) of the receiver when a non-existent
+// method is invoked (e.g. calling `.map()` on a `string` from `git.log()`, `.endsWith()` on an `{isDir, name, size}`
+// object from `fs.list({ detail: true })`, `.split()` on an `Array`, or `.filter()` on an un-awaited `Promise`).
+func enrichTypeHint(vm *goja.Runtime, formattedMsg string, cr *compiler.CompileResult) string {
+	if !strings.Contains(formattedMsg, "TypeError:") || strings.Contains(formattedMsg, "UnknownMethodError:") || strings.Contains(formattedMsg, "Cannot read property ") {
+		return formattedMsg
+	}
+
+	if vm != nil {
+		var exported any
+		_ = tryJS(vm, func() {
+			val := vm.Get("__ptcLastReceiverType")
+			if val != nil && !goja.IsUndefined(val) && !goja.IsNull(val) {
+				exported, _ = safeExportValue(vm, val)
+			}
+		})
+		if m, ok := exported.(map[string]any); ok {
+			prop, _ := m["prop"].(string)
+			kind, _ := m["kind"].(string)
+			label, _ := m["label"].(string)
+			if prop != "" && label != "" && matchesReceiverErrorForProp(formattedMsg, prop, cr) {
+				detail := formatReceiverTypeDetail(prop, kind, label)
+				header := fmt.Sprintf("TypeError: Object has no member '%s' (%s)", prop, detail)
+				if nl := strings.IndexByte(formattedMsg, '\n'); nl >= 0 {
+					return header + formattedMsg[nl:]
+				}
+				return header
+			}
+		}
+	}
+
+	m := noMemberRegex.FindStringSubmatchIndex(formattedMsg)
 	if m == nil {
-		return msg
+		return formattedMsg
 	}
-	name := msg[m[2]:m[3]]
-	var hint string
+	name := formattedMsg[m[2]:m[3]]
+	detail := formatReceiverTypeDetail(name, "plain_object", "plain object")
+	hint := " (" + detail + ")"
+	return formattedMsg[:m[1]] + hint + formattedMsg[m[1]:]
+}
+
+func matchesReceiverErrorForProp(formattedMsg, prop string, cr *compiler.CompileResult) bool {
+	matchedErr := false
+	if sub := gojaNoMemberRegex.FindStringSubmatch(formattedMsg); len(sub) >= 2 {
+		matchedErr = sub[1] == prop
+	} else if sub := gojaNotFuncRegex.FindStringSubmatch(formattedMsg); len(sub) >= 1 {
+		if sub[1] != "" {
+			matchedErr = sub[1] == prop
+		} else if sub[2] != "" {
+			matchedErr = sub[2] == prop || strings.HasSuffix(sub[2], "."+prop)
+		} else {
+			matchedErr = true
+		}
+	}
+	if !matchedErr {
+		return false
+	}
+	if cr != nil && len(cr.SourceLine) > 0 {
+		if loc := codeStackLineRegex.FindStringSubmatch(formattedMsg); len(loc) >= 2 {
+			if lineNo, err := strconv.Atoi(loc[1]); err == nil && lineNo >= 1 && lineNo <= len(cr.SourceLine) {
+				for idx := max(0, lineNo-2); idx <= min(len(cr.SourceLine)-1, lineNo); idx++ {
+					line := cr.SourceLine[idx]
+					if strings.Contains(line, "."+prop) || strings.Contains(line, `"`+prop+`"`) || strings.Contains(line, `'`+prop+`'`) {
+						return true
+					}
+				}
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func formatReceiverTypeDetail(prop, kind, label string) string {
+	if kind == "promise" {
+		return fmt.Sprintf("actual type: %s — did you forget 'await'?", label)
+	}
 	switch {
-	case stringOnlyMethods[name]:
-		hint = " (the value is an object, not a string; check the API's return shape)"
-	case arrayOnlyMethods[name]:
-		hint = " (the value is an object, not an array; check the API's return shape)"
+	case stringOnlyMethods[prop]:
+		return fmt.Sprintf("actual type: %s, expected string; check the API's return shape", label)
+	case arrayOnlyMethods[prop]:
+		if kind == "map" || kind == "set" {
+			return fmt.Sprintf("actual type: %s, expected Array; convert with Array.from(...) first", label)
+		}
+		return fmt.Sprintf("actual type: %s, expected Array; check the API's return shape", label)
 	default:
-		return msg
+		return fmt.Sprintf("actual type: %s", label)
 	}
-	return msg[:m[1]] + hint + msg[m[1]:]
 }

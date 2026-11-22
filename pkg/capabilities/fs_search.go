@@ -13,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -42,6 +43,9 @@ var skippedWalkDirs = map[string]bool{
 	"__pycache__":  true,
 	".venv":        true,
 	"venv":         true,
+	".gradle":      true,
+	".cxx":         true,
+	".cache":       true,
 }
 
 // SearchHit represents a single structured search match returned to guest TypeScript.
@@ -396,6 +400,9 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
+			if _, stErr := os.Stat(searchRoot); stErr != nil {
+				return nil, stErr
+			}
 			if q.mode != "" {
 				return b.runListSearch(ctx, env, searchRoot, q)
 			}
@@ -584,6 +591,71 @@ func canSearchPath(pol *policy.Engine, workspaceCwd, p string, cache map[string]
 	return allowed
 }
 
+type cachedRealDir struct {
+	realDir string
+	ok      bool
+}
+
+// fastPathChecker caches symlink-resolved parent directories (`ResolveRealPath` once per unique directory)
+// and evaluates `pol.CheckResolvedRead` in memory for regular non-symlink files, avoiding per-file
+// `EvalSymlinks` (`CreateFileW` + `GetFinalPathNameByHandleW`) syscall storms on large trees.
+type fastPathChecker struct {
+	pol          *policy.Engine
+	workspaceCwd string
+	fileCache    map[string]bool
+	dirCache     map[string]cachedRealDir
+}
+
+func newFastPathChecker(pol *policy.Engine, workspaceCwd string) *fastPathChecker {
+	return &fastPathChecker{
+		pol:          pol,
+		workspaceCwd: workspaceCwd,
+		fileCache:    map[string]bool{},
+		dirCache:     map[string]cachedRealDir{},
+	}
+}
+
+func (c *fastPathChecker) allowFile(p string) bool {
+	if c == nil || c.pol == nil {
+		return true
+	}
+	if allowed, ok := c.fileCache[p]; ok {
+		return allowed
+	}
+	var absP string
+	if filepath.IsAbs(p) {
+		absP = filepath.Clean(p)
+	} else {
+		absP = filepath.Clean(filepath.Join(c.workspaceCwd, p))
+	}
+	base := filepath.Base(absP)
+	if runtime.GOOS == "windows" && strings.ContainsRune(base, ':') {
+		c.fileCache[p] = false
+		return false
+	}
+	dir := filepath.Dir(absP)
+	de, ok := c.dirCache[dir]
+	if !ok {
+		_, realD, err := c.pol.ResolveRealPath(c.workspaceCwd, dir)
+		de = cachedRealDir{realDir: realD, ok: err == nil}
+		c.dirCache[dir] = de
+	}
+	var allowed bool
+	if de.ok {
+		if fi, lerr := os.Lstat(absP); lerr == nil && fi.Mode().Type() == 0 {
+			allowed = c.pol.CheckResolvedRead(p, absP, filepath.Join(de.realDir, base)) == nil
+		} else {
+			_, err := c.pol.ResolveAndCheckRead(c.workspaceCwd, p)
+			allowed = err == nil
+		}
+	} else {
+		_, err := c.pol.ResolveAndCheckRead(c.workspaceCwd, p)
+		allowed = err == nil
+	}
+	c.fileCache[p] = allowed
+	return allowed
+}
+
 func runRgJSON(ctx context.Context, pol *policy.Engine, rgBin, workspaceCwd, searchRoot string, q searchQuery) ([]SearchHit, int, error) {
 	rgArgs := []string{"--json", "--line-number", "--column", "--no-heading", "--color=never"}
 	if q.literal {
@@ -664,7 +736,7 @@ func runRgJSON(ctx context.Context, pol *policy.Engine, rgBin, workspaceCwd, sea
 	fileStart := 0 // index in hits of the first hit of the current file
 	full := false
 	skipFile := false
-	permCache := map[string]bool{}
+	checker := newFastPathChecker(pol, workspaceCwd)
 	scanner := bufio.NewScanner(strings.NewReader(stdout.String()))
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -676,10 +748,10 @@ func runRgJSON(ctx context.Context, pol *policy.Engine, rgBin, workspaceCwd, sea
 		case "begin":
 			window = window[:0]
 			fileStart = len(hits)
-			skipFile = !canSearchPath(pol, workspaceCwd, ev.Data.Path.Text, permCache)
+			skipFile = !checker.allowFile(ev.Data.Path.Text)
 			continue
 		case "match", "context":
-			if skipFile || !canSearchPath(pol, workspaceCwd, ev.Data.Path.Text, permCache) {
+			if skipFile || !checker.allowFile(ev.Data.Path.Text) {
 				continue
 			}
 		default:
@@ -763,31 +835,23 @@ func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, 
 	if err != nil {
 		return nil, err
 	}
-	permCache := map[string]bool{}
 	if !info.IsDir() {
-		if canSearchPath(pol, workspaceCwd, searchRoot, permCache) {
+		checker := newFastPathChecker(pol, workspaceCwd)
+		if checker.allowFile(searchRoot) {
 			files = []string{searchRoot}
 		}
 	} else {
-		_ = filepath.WalkDir(searchRoot, func(p string, d fs.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return nil
-			}
-			if d.IsDir() {
-				if p != searchRoot && (skippedWalkDirs[d.Name()] || !canSearchPath(pol, workspaceCwd, p, permCache)) {
-					return filepath.SkipDir
+		skipStd := !pathTouchesSkippedDir(workspaceCwd, searchRoot)
+		cand := walkFilesParallel(ctx, pol, workspaceCwd, []string{searchRoot}, skipStd)
+		if globMatcher == nil {
+			files = cand
+		} else {
+			for _, p := range cand {
+				if globMatcher.MatchSimple(filepath.ToSlash(p), filepath.Base(p)) {
+					files = append(files, p)
 				}
-				return nil
 			}
-			if !canSearchPath(pol, workspaceCwd, p, permCache) {
-				return nil
-			}
-			if globMatcher != nil && !globMatcher.MatchSimple(filepath.ToSlash(p), d.Name()) {
-				return nil
-			}
-			files = append(files, p)
-			return nil
-		})
+		}
 	}
 
 	hits := []SearchHit{}
@@ -841,6 +905,8 @@ func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, 
 }
 
 // runGlobSearch returns up to maxResults files plus the total number of matches.
+// Combines literal directory prefix pushdown, ripgrep (`rg --files`) `.gitignore`-aware fast path,
+// and a bounded parallel zero-syscall Go walker so even 200k-file C++/Android/AOSP trees resolve in milliseconds.
 func (b *FSSearchBinder) runGlobSearch(ctx context.Context, workspaceCwd, searchRoot, pattern string, maxResults int) ([]string, int, string, error) {
 	if maxResults <= 0 {
 		maxResults = 200
@@ -851,18 +917,38 @@ func (b *FSSearchBinder) runGlobSearch(ctx context.Context, workspaceCwd, search
 		return nil, 0, "", err
 	}
 
-	allFiles := collectWorkspaceFiles(ctx, b.Policy, workspaceCwd, searchRoot)
+	rootInfo, stErr := os.Stat(searchRoot)
+	if stErr != nil {
+		return []string{}, 0, "", nil
+	}
+	if !rootInfo.IsDir() {
+		checker := newFastPathChecker(b.Policy, workspaceCwd)
+		if checker.allowFile(searchRoot) && exactGlob.Match(filepath.Base(searchRoot)) {
+			return []string{relDisplayPath(workspaceCwd, searchRoot)}, 1, "", nil
+		}
+		return []string{}, 0, "", nil
+	}
+
+	type candidateSet struct {
+		files     []string
+		unchecked bool // true when returned raw from `rg --files` so `checker.allowFile` runs lazily ONLY on glob matches!
+	}
+
+	checker := newFastPathChecker(b.Policy, workspaceCwd)
 	total := 0
-	matchFiles := func(cg *compiledGlob) []string {
+	matchFiles := func(cs candidateSet, cg *compiledGlob) []string {
 		var matched []string
 		total = 0
-		for _, abs := range allFiles {
+		for _, abs := range cs.files {
 			relToSearch, relErr := filepath.Rel(searchRoot, abs)
 			if relErr != nil {
 				relToSearch = abs
 			}
 			relSlash := filepath.ToSlash(relToSearch)
 			if cg.Match(relSlash) {
+				if cs.unchecked && !checker.allowFile(abs) {
+					continue
+				}
 				total++
 				if len(matched) < maxResults {
 					matched = append(matched, relDisplayPath(workspaceCwd, abs))
@@ -873,9 +959,54 @@ func (b *FSSearchBinder) runGlobSearch(ctx context.Context, workspaceCwd, search
 		return matched
 	}
 
-	exact := matchFiles(exactGlob)
-	if len(exact) > 0 {
+	explicitSubPath := filepath.Clean(searchRoot) != filepath.Clean(workspaceCwd)
+	rootTouchesSkipped := pathTouchesSkippedDir(workspaceCwd, searchRoot)
+	rgBin := b.resolveRg()
+
+	collectForGlob := func(cg *compiledGlob, forceNoIgnore bool) (candidateSet, bool, []string) {
+		prefixes, patTouchesSkipped := extractGlobDirPrefixes(cg.parts)
+		touchesSkipped := rootTouchesSkipped || patTouchesSkipped
+		targetDirs, directFiles := resolveGlobTargets(b.Policy, workspaceCwd, searchRoot, prefixes)
+		if len(targetDirs) == 0 {
+			return candidateSet{files: directFiles}, false, prefixes
+		}
+		if rgBin != "" {
+			noIgnore := forceNoIgnore || touchesSkipped
+			if rgFiles, ok := runRgFiles(ctx, rgBin, workspaceCwd, targetDirs, noIgnore); ok {
+				if len(directFiles) > 0 {
+					rgFiles = append(rgFiles, directFiles...)
+				}
+				return candidateSet{files: rgFiles, unchecked: true}, !noIgnore, prefixes
+			}
+		}
+		walked := walkFilesParallel(ctx, b.Policy, workspaceCwd, targetDirs, !touchesSkipped && !forceNoIgnore)
+		if len(directFiles) > 0 {
+			walked = append(walked, directFiles...)
+		}
+		return candidateSet{files: walked, unchecked: false}, false, prefixes
+	}
+
+	allFiles, usedRgWithIgnore, exactPrefixes := collectForGlob(exactGlob, false)
+	exact := matchFiles(allFiles, exactGlob)
+	// If `rg --files` skipped a directory with inner `.ignore`/`*` rules (e.g. `build/.ignore` or `out/staging/**/*`)
+	// when the caller explicitly scoped `path` or a literal prefix, retry with unskipped parallel walk!
+	if len(exact) == 0 && usedRgWithIgnore && (explicitSubPath || rootTouchesSkipped || !(len(exactPrefixes) == 1 && exactPrefixes[0] == "")) {
+		targetDirs, directFiles := resolveGlobTargets(b.Policy, workspaceCwd, searchRoot, exactPrefixes)
+		walked := walkFilesParallel(ctx, b.Policy, workspaceCwd, targetDirs, false)
+		walked = append(walked, directFiles...)
+		exact = matchFiles(candidateSet{files: walked}, exactGlob)
+	}
+	if len(exact) > 0 || ctx.Err() != nil {
 		return exact, total, "", nil
+	}
+
+	ensureFullRootFiles := func() candidateSet {
+		if len(exactPrefixes) == 1 && exactPrefixes[0] == "" {
+			return allFiles
+		}
+		fullGlob := &compiledGlob{parts: []compiledGlobPart{{raw: "**/*"}}}
+		cs, _, _ := collectForGlob(fullGlob, false)
+		return cs
 	}
 
 	// Smart fallback 1 (inspired by agy-fast v0.2.2): expand regex alternation `a|b` mistakenly passed to glob
@@ -885,7 +1016,8 @@ func (b *FSSearchBinder) runGlobSearch(ctx context.Context, workspaceCwd, search
 		if altErr != nil {
 			return nil, 0, "", altErr
 		}
-		recovered := matchFiles(altGlob)
+		altFiles, _, _ := collectForGlob(altGlob, false)
+		recovered := matchFiles(altFiles, altGlob)
 		if len(recovered) > 0 {
 			return recovered, total, fmt.Sprintf("auto-expanded regex '|' to glob '%s'", expanded), nil
 		}
@@ -894,11 +1026,15 @@ func (b *FSSearchBinder) runGlobSearch(ctx context.Context, workspaceCwd, search
 	// Smart fallback 2: bare keyword without wildcards, slashes, or extension dots -> substring match
 	if !strings.ContainsAny(pattern, "*?[]{}/\\.") {
 		sub := strings.ToLower(pattern)
+		fullCS := ensureFullRootFiles()
 		var recovered []string
 		total = 0
-		for _, abs := range allFiles {
+		for _, abs := range fullCS.files {
 			rel := relDisplayPath(workspaceCwd, abs)
 			if strings.Contains(strings.ToLower(rel), sub) {
+				if fullCS.unchecked && !checker.allowFile(abs) {
+					continue
+				}
 				total++
 				if len(recovered) < maxResults {
 					recovered = append(recovered, rel)
@@ -914,26 +1050,310 @@ func (b *FSSearchBinder) runGlobSearch(ctx context.Context, workspaceCwd, search
 	return []string{}, 0, "", nil
 }
 
-func collectWorkspaceFiles(ctx context.Context, pol *policy.Engine, workspaceCwd, root string) []string {
-	var out []string
-	permCache := map[string]bool{}
-	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || ctx.Err() != nil {
-			return nil
+// extractGlobDirPrefixes extracts static literal directory prefixes from brace-expanded glob branches
+// (e.g. `scripts/{staging,guest}/**/*` -> `["scripts/staging", "scripts/guest"]`, `native/**/*.map` -> `["native"]`)
+// and reports whether any literal segment explicitly names a `skippedWalkDirs` directory (such as `build` or `dist`).
+func extractGlobDirPrefixes(parts []compiledGlobPart) ([]string, bool) {
+	if len(parts) == 0 {
+		return []string{""}, false
+	}
+	touchesSkipped := false
+	rawPrefixes := make([]string, 0, len(parts))
+	hasRootWildcard := false
+
+	for _, part := range parts {
+		p := strings.TrimPrefix(part.raw, "./")
+		if strings.HasPrefix(p, "/") || strings.Contains(p, "..") {
+			hasRootWildcard = true
 		}
-		if d.IsDir() {
-			if p != root && (skippedWalkDirs[d.Name()] || !canSearchPath(pol, workspaceCwd, p, permCache)) {
-				return filepath.SkipDir
+		segs := strings.Split(strings.TrimPrefix(p, "/"), "/")
+		for _, seg := range segs {
+			if seg != "" && !strings.ContainsAny(seg, "*?[]") && skippedWalkDirs[seg] {
+				touchesSkipped = true
 			}
-			return nil
 		}
-		if !canSearchPath(pol, workspaceCwd, p, permCache) {
-			return nil
+		if hasRootWildcard {
+			continue
 		}
-		out = append(out, p)
+		limit := len(segs) - 1
+		if strings.HasSuffix(p, "/") {
+			limit = len(segs)
+		}
+		k := 0
+		for k < limit && segs[k] != "" && segs[k] != "." && !strings.ContainsAny(segs[k], "*?[]") {
+			k++
+		}
+		if k == 0 {
+			hasRootWildcard = true
+		} else {
+			rawPrefixes = append(rawPrefixes, strings.Join(segs[:k], "/"))
+		}
+	}
+
+	if hasRootWildcard || len(rawPrefixes) == 0 {
+		return []string{""}, touchesSkipped
+	}
+	sort.Strings(rawPrefixes)
+	collapsed := make([]string, 0, len(rawPrefixes))
+	for _, pref := range rawPrefixes {
+		if len(collapsed) > 0 {
+			prev := collapsed[len(collapsed)-1]
+			if pref == prev || strings.HasPrefix(pref, prev+"/") {
+				continue
+			}
+		}
+		collapsed = append(collapsed, pref)
+	}
+	return collapsed, touchesSkipped
+}
+
+func pathTouchesSkippedDir(workspaceCwd, targetDir string) bool {
+	if workspaceCwd != "" {
+		if rel, err := filepath.Rel(workspaceCwd, targetDir); err == nil && !strings.HasPrefix(rel, "..") {
+			for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
+				if skippedWalkDirs[seg] {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	for _, seg := range strings.Split(filepath.ToSlash(filepath.Clean(targetDir)), "/") {
+		if skippedWalkDirs[seg] {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveGlobTargets(pol *policy.Engine, workspaceCwd, searchRoot string, prefixes []string) (targetDirs []string, directFiles []string) {
+	checker := newFastPathChecker(pol, workspaceCwd)
+	seen := map[string]bool{}
+	for _, pref := range prefixes {
+		td := searchRoot
+		if pref != "" {
+			td = filepath.Join(searchRoot, filepath.FromSlash(pref))
+		}
+		td = filepath.Clean(td)
+		if seen[td] {
+			continue
+		}
+		seen[td] = true
+		fi, err := os.Stat(td)
+		if err != nil {
+			continue
+		}
+		if !fi.IsDir() {
+			if checker.allowFile(td) {
+				directFiles = append(directFiles, td)
+			}
+			continue
+		}
+		if pol != nil {
+			if _, err := pol.ResolveAndCheckRead(workspaceCwd, td); err != nil {
+				continue
+			}
+		}
+		targetDirs = append(targetDirs, td)
+	}
+	return targetDirs, directFiles
+}
+
+// runRgFiles uses `rg --files --hidden -g !.git` to enumerate files in parallel Rust threads.
+// Policy checks are deferred lazily to matching candidates so non-matching files incur zero `Lstat` syscalls.
+func runRgFiles(ctx context.Context, rgBin, workspaceCwd string, targetDirs []string, noIgnore bool) ([]string, bool) {
+	if len(targetDirs) == 0 {
+		return []string{}, true
+	}
+	args := make([]string, 0, 8+len(targetDirs))
+	args = append(args, "--files", "--hidden", "-g", "!.git", "--color=never")
+	if noIgnore {
+		args = append(args, "--no-ignore")
+	}
+	args = append(args, "--")
+	args = append(args, targetDirs...)
+
+	rgCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(rgCtx, rgBin, args...)
+	setSysProcAttrHide(cmd)
+	stdout := newLimitedSyncBuffer(16 * 1024 * 1024)
+	cmd.Stdout = stdout
+	err := cmd.Run()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && rgCtx.Err() == nil && exitErr.ExitCode() == 1 {
+			return []string{}, true
+		}
+		return nil, false
+	}
+	if stdout.droppedBytes() > 0 {
+		return nil, false
+	}
+	var out []string
+	sc := bufio.NewScanner(strings.NewReader(stdout.String()))
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		if ctx.Err() != nil {
+			break
+		}
+		fp := strings.TrimRight(sc.Text(), "\r")
+		if fp == "" {
+			continue
+		}
+		if !filepath.IsAbs(fp) {
+			fp = filepath.Clean(filepath.Join(workspaceCwd, fp))
+		}
+		out = append(out, fp)
+	}
+	if sc.Err() != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+func collectWorkspaceFiles(ctx context.Context, pol *policy.Engine, workspaceCwd, root string) []string {
+	return walkFilesParallel(ctx, pol, workspaceCwd, []string{root}, true)
+}
+
+type walkDirWork struct {
+	absDir  string
+	realDir string
+}
+
+// walkFilesParallel traverses targetDirs concurrently across a bounded worker pool using `os.ReadDir`
+// and lock-free `pol.CheckResolvedRead` on regular entries (0 per-file `EvalSymlinks` syscalls).
+// Symlinks and Windows reparse points still go through full `ResolveAndCheckRead`, and symlinked
+// directories are never recursed into so symlink cycles cannot loop.
+func walkFilesParallel(ctx context.Context, pol *policy.Engine, workspaceCwd string, targetDirs []string, skipStandardDirs bool) []string {
+	if len(targetDirs) == 0 || ctx.Err() != nil {
 		return nil
-	})
-	return out
+	}
+	queue := make([]walkDirWork, 0, len(targetDirs)*4)
+	for _, td := range targetDirs {
+		absRoot := filepath.Clean(td)
+		realRoot := absRoot
+		if pol != nil {
+			var err error
+			absRoot, realRoot, err = pol.ResolveReadWithReal(workspaceCwd, td)
+			if err != nil {
+				continue
+			}
+		} else if r, err := filepath.EvalSymlinks(absRoot); err == nil {
+			realRoot = r
+		}
+		queue = append(queue, walkDirWork{absDir: absRoot, realDir: realRoot})
+	}
+	if len(queue) == 0 {
+		return nil
+	}
+
+	var mu sync.Mutex
+	cond := sync.NewCond(&mu)
+	active := 0
+	stopped := false
+	var allFiles []string
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	go func() {
+		select {
+		case <-ctx.Done():
+			mu.Lock()
+			stopped = true
+			cond.Broadcast()
+			mu.Unlock()
+		case <-stopCh:
+		}
+	}()
+
+	workers := minInt(8, maxInt(2, runtime.GOMAXPROCS(0)))
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for {
+				mu.Lock()
+				for len(queue) == 0 && active > 0 && !stopped {
+					cond.Wait()
+				}
+				if stopped || (len(queue) == 0 && active == 0) {
+					cond.Broadcast()
+					mu.Unlock()
+					return
+				}
+				item := queue[len(queue)-1]
+				queue = queue[:len(queue)-1]
+				active++
+				mu.Unlock()
+
+				entries, rdErr := os.ReadDir(item.absDir)
+				var localFiles []string
+				var childDirs []walkDirWork
+				if rdErr == nil && ctx.Err() == nil {
+					for _, e := range entries {
+						name := e.Name()
+						if runtime.GOOS == "windows" && strings.ContainsRune(name, ':') {
+							continue
+						}
+						typ := e.Type()
+						switch typ {
+						case 0: // Plain regular file (no symlink/reparse point) -> 0 syscalls!
+							absChild := filepath.Join(item.absDir, name)
+							if pol == nil {
+								localFiles = append(localFiles, absChild)
+							} else {
+								realChild := filepath.Join(item.realDir, name)
+								if pol.CheckResolvedRead(absChild, absChild, realChild) == nil {
+									localFiles = append(localFiles, absChild)
+								}
+							}
+						case fs.ModeDir: // True non-symlink, non-junction directory -> 0 syscalls!
+							if name == ".git" || (skipStandardDirs && skippedWalkDirs[name]) {
+								continue
+							}
+							absChild := filepath.Join(item.absDir, name)
+							realChild := filepath.Join(item.realDir, name)
+							if pol != nil && pol.CheckResolvedRead(absChild, absChild, realChild) != nil {
+								continue
+							}
+							childDirs = append(childDirs, walkDirWork{absDir: absChild, realDir: realChild})
+						default: // Symlink, Windows junction, or irregular file -> full symlink evaluation; never recurse into symlinked dirs!
+							if name == ".git" {
+								continue
+							}
+							absChild := filepath.Join(item.absDir, name)
+							if pol != nil {
+								if _, err := pol.ResolveAndCheckRead(workspaceCwd, absChild); err != nil {
+									continue
+								}
+							}
+							if fi, stErr := os.Stat(absChild); stErr == nil && !fi.IsDir() {
+								localFiles = append(localFiles, absChild)
+							}
+						}
+					}
+				}
+
+				mu.Lock()
+				if len(localFiles) > 0 {
+					allFiles = append(allFiles, localFiles...)
+				}
+				if !stopped && len(childDirs) > 0 {
+					queue = append(queue, childDirs...)
+				}
+				active--
+				if len(childDirs) > 0 || (len(queue) == 0 && active == 0) {
+					cond.Broadcast()
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	return allFiles
 }
 
 const maxGlobBraceExpansions = 64
@@ -1065,13 +1485,23 @@ func compileSingleGlobRegex(pat string) (*regexp.Regexp, error) {
 
 func buildTreeList(pol *policy.Engine, workspaceCwd, root string, maxDepth, maxItems int) []string {
 	out := []string{}
-	permCache := map[string]bool{}
-	var walk func(dir, relPrefix string, depth int)
-	walk = func(dir, relPrefix string, depth int) {
+	absRoot := filepath.Clean(root)
+	realRoot := absRoot
+	if pol != nil {
+		var err error
+		absRoot, realRoot, err = pol.ResolveReadWithReal(workspaceCwd, root)
+		if err != nil {
+			return out
+		}
+	} else if r, err := filepath.EvalSymlinks(absRoot); err == nil {
+		realRoot = r
+	}
+	var walk func(absDir, realDir, relPrefix string, depth int)
+	walk = func(absDir, realDir, relPrefix string, depth int) {
 		if depth > maxDepth || len(out) >= maxItems {
 			return
 		}
-		entries, err := os.ReadDir(dir)
+		entries, err := os.ReadDir(absDir)
 		if err != nil {
 			return
 		}
@@ -1080,28 +1510,56 @@ func buildTreeList(pol *policy.Engine, workspaceCwd, root string, maxDepth, maxI
 				return
 			}
 			name := e.Name()
-			if e.IsDir() && skippedWalkDirs[name] {
+			if runtime.GOOS == "windows" && strings.ContainsRune(name, ':') {
 				continue
 			}
-			fullPath := filepath.Join(dir, name)
-			if !canSearchPath(pol, workspaceCwd, fullPath, permCache) {
+			typ := e.Type()
+			if typ == fs.ModeDir && skippedWalkDirs[name] {
 				continue
+			}
+			fullPath := filepath.Join(absDir, name)
+			childReal := filepath.Join(realDir, name)
+			isDir := false
+			switch typ {
+			case 0:
+				if pol != nil && pol.CheckResolvedRead(fullPath, fullPath, childReal) != nil {
+					continue
+				}
+			case fs.ModeDir:
+				if pol != nil && pol.CheckResolvedRead(fullPath, fullPath, childReal) != nil {
+					continue
+				}
+				isDir = true
+			default:
+				if name == ".git" || skippedWalkDirs[name] {
+					continue
+				}
+				if pol != nil {
+					var rErr error
+					_, childReal, rErr = pol.ResolveReadWithReal(workspaceCwd, fullPath)
+					if rErr != nil {
+						continue
+					}
+				}
+				if fi, stErr := os.Stat(fullPath); stErr == nil && fi.IsDir() {
+					isDir = true
+				}
 			}
 			rel := name
 			if relPrefix != "" {
 				rel = relPrefix + "/" + name
 			}
-			if e.IsDir() {
+			if isDir {
 				out = append(out, rel+"/")
-				if depth < maxDepth {
-					walk(fullPath, rel, depth+1)
+				if depth < maxDepth && typ == fs.ModeDir {
+					walk(fullPath, childReal, rel, depth+1)
 				}
 			} else {
 				out = append(out, rel)
 			}
 		}
 	}
-	walk(root, "", 1)
+	walk(absRoot, realRoot, "", 1)
 	return out
 }
 
