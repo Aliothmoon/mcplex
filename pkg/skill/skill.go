@@ -104,7 +104,7 @@ Example:
 		Body: `- ` + "`const t = await tx.begin();`" + `
 - Operations: ` + "`t.edit(pathOrSpecs, hunks?)`" + `, ` + "`t.write(path, content, { eol? })`" + `, ` + "`t.rm(path)`" + `, ` + "`t.rename(from, to)`" + `
   - Tip: pass all files to one ` + "`await t.edit([{ path, hunks }, ...])`" + ` so every hunk validates before any file is written.
-- Inspection & checks: ` + "`await t.diff()`" + `, ` + "`await t.status()`" + `, ` + "`await t.verify(commands, { concurrency?, timeoutSec?, compact? })`" + `
+- Inspection & checks: ` + "`await t.diff()`" + `, ` + "`await t.status()`" + `, ` + "`await t.verify(commands, { cwd?, concurrency?, timeoutSec?, compact? })`" + ` (items in ` + "`commands`" + ` can be strings or ` + "`{ cmd, cwd?, name?, timeoutMs? }`" + `)
 - Finalize: ` + "`await t.commit()`" + ` (MUST call to keep changes; uncommitted ` + "`tx`" + ` auto-rolls back on exit!) or ` + "`await t.rollback()`" + `.
 
 Example:
@@ -120,7 +120,7 @@ Example:
   - ` + "`sh.shell`" + ` reports the active default shell dialect; default timeout is 15s with process-tree / Job Object kill.
   - ` + "`compact: true`" + ` keeps only summary/failure lines — omit it when you need full stdout.
 - ` + "`await sh.run(file, args?, { cwd?, env?, stdin?, timeoutMs? }) -> { ok, exitCode, timedOut, stdout, stderr, durationMs }`" + ` (direct argv execution, zero shell quoting issues).
-- ` + "`await sh.checks(commands, { concurrency?, timeoutSec?, compact? })`" + ` -> ` + "`{ ok, summary, results: [{ name, command, ok, exitCode, timedOut, durationMs, output }], failures? }`" + ` (same shape for ` + "`t.verify`" + `).`,
+- ` + "`await sh.checks(commands, { cwd?, concurrency?, timeoutSec?, compact? })`" + ` -> ` + "`{ ok, summary, results: [{ name, command, cwd?, ok, exitCode, timedOut, durationMs, output }], failures? }`" + ` (` + "`commands`" + ` accepts strings or ` + "`{ cmd, cwd?, name?, timeoutMs? }`" + `; same shape for ` + "`t.verify`" + `).`,
 	},
 	{
 		ID:      "git",

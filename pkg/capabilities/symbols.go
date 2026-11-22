@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
 )
@@ -159,18 +161,7 @@ func resolveSymbol(syms []SymbolInfo, query, rel string) (SymbolInfo, error) {
 	case 1:
 		return hits[0], nil
 	case 0:
-		var similar []string
-		low := strings.ToLower(leaf)
-		for _, s := range syms {
-			_, sl := symbolParts(s.Name)
-			slLow := strings.ToLower(sl)
-			if strings.Contains(slLow, low) || (len(sl) > 2 && strings.Contains(low, slLow)) {
-				similar = append(similar, qualifiedName(syms, s, sep))
-			}
-			if len(similar) == 5 {
-				break
-			}
-		}
+		similar := suggestSimilarSymbols(syms, leaf, quals, sep)
 		msg := fmt.Sprintf("%s: symbol %s not found", rel, query)
 		if len(similar) > 0 {
 			msg += "; similar: " + strings.Join(similar, ", ")
@@ -182,6 +173,173 @@ func resolveSymbol(syms []SymbolInfo, query, rel string) (SymbolInfo, error) {
 		names = append(names, fmt.Sprintf("%s L%d", qualifiedName(syms, h, sep), h.StartLine))
 	}
 	return SymbolInfo{}, sandbox.NewHostError(sandbox.KindAmbiguous, nil, "%s: symbol %s matches %d (%s); qualify it", rel, query, len(hits), joinLimited(names, 6))
+}
+
+func suggestSimilarSymbols(syms []SymbolInfo, leaf string, quals []string, sep string) []string {
+	low := strings.ToLower(strings.TrimSpace(leaf))
+	if low == "" || len(syms) == 0 {
+		return nil
+	}
+	qTokens := splitIdentTokens(leaf)
+	wantQual := ""
+	if len(quals) > 0 {
+		wantQual = quals[len(quals)-1]
+	}
+
+	type scoredSym struct {
+		label string
+		score int
+		line  int
+	}
+	seen := map[string]bool{}
+	var candidates []scoredSym
+
+	for _, s := range syms {
+		recv, sl := symbolParts(s.Name)
+		slLow := strings.ToLower(sl)
+		if slLow == "" {
+			continue
+		}
+		score := 0
+		if strings.Contains(slLow, low) || (len(slLow) >= 3 && strings.Contains(low, slLow)) {
+			score += 100
+		}
+		sTokens := splitIdentTokens(sl)
+		for _, qt := range qTokens {
+			if len(qt) < 3 {
+				continue
+			}
+			for _, st := range sTokens {
+				if st == qt {
+					score += 35
+					break
+				}
+				if len(qt) >= 4 && len(st) >= 4 && (strings.HasPrefix(st, qt) || strings.HasPrefix(qt, st)) {
+					score += 20
+					break
+				}
+			}
+		}
+		lenDiff := len(slLow) - len(low)
+		if lenDiff < 0 {
+			lenDiff = -lenDiff
+		}
+		if len(low) >= 4 && lenDiff <= 3 {
+			maxDist := 2
+			if len(low) >= 8 {
+				maxDist = 3
+			}
+			if d := boundedLevenshtein(low, slLow, maxDist); d >= 0 {
+				score += 65 - d*15
+			}
+		}
+		if score == 0 {
+			continue
+		}
+		if wantQual != "" {
+			if strings.EqualFold(recv, wantQual) {
+				score += 15
+			} else if c := innermostContainer(syms, s); c != nil {
+				_, cl := symbolParts(c.Name)
+				if strings.EqualFold(cl, wantQual) {
+					score += 15
+				}
+			}
+		}
+		qName := qualifiedName(syms, s, sep)
+		lbl := fmt.Sprintf("%s (L%d-%d)", qName, s.StartLine, s.EndLine)
+		if seen[lbl] {
+			continue
+		}
+		seen[lbl] = true
+		candidates = append(candidates, scoredSym{label: lbl, score: score, line: s.StartLine})
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].score != candidates[j].score {
+			return candidates[i].score > candidates[j].score
+		}
+		return candidates[i].line < candidates[j].line
+	})
+	if len(candidates) > 5 {
+		candidates = candidates[:5]
+	}
+	out := make([]string, len(candidates))
+	for i, c := range candidates {
+		out[i] = c.label
+	}
+	return out
+}
+
+func splitIdentTokens(ident string) []string {
+	runes := []rune(ident)
+	var tokens []string
+	var cur []rune
+	flush := func() {
+		if len(cur) > 0 {
+			tokens = append(tokens, strings.ToLower(string(cur)))
+			cur = cur[:0]
+		}
+	}
+	for i, r := range runes {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			flush()
+			continue
+		}
+		if len(cur) > 0 && unicode.IsUpper(r) {
+			prev := cur[len(cur)-1]
+			nextLower := i+1 < len(runes) && unicode.IsLower(runes[i+1])
+			if unicode.IsLower(prev) || unicode.IsDigit(prev) || (unicode.IsUpper(prev) && nextLower) {
+				flush()
+			}
+		}
+		cur = append(cur, r)
+	}
+	flush()
+	return tokens
+}
+
+func boundedLevenshtein(a, b string, maxDist int) int {
+	ra, rb := []rune(a), []rune(b)
+	la, lb := len(ra), len(rb)
+	diff := la - lb
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > maxDist {
+		return -1
+	}
+	prev := make([]int, lb+1)
+	curr := make([]int, lb+1)
+	for j := 0; j <= lb; j++ {
+		prev[j] = j
+	}
+	for i := 1; i <= la; i++ {
+		curr[0] = i
+		rowMin := curr[0]
+		for j := 1; j <= lb; j++ {
+			cost := 0
+			if ra[i-1] != rb[j-1] {
+				cost = 1
+			}
+			del := prev[j] + 1
+			ins := curr[j-1] + 1
+			sub := prev[j-1] + cost
+			v := min(del, min(ins, sub))
+			curr[j] = v
+			if v < rowMin {
+				rowMin = v
+			}
+		}
+		if rowMin > maxDist {
+			return -1
+		}
+		prev, curr = curr, prev
+	}
+	if prev[lb] > maxDist {
+		return -1
+	}
+	return prev[lb]
 }
 
 func hashCommentLang(path string) bool {

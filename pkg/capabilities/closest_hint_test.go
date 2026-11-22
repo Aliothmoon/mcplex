@@ -1,6 +1,7 @@
 package capabilities
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -186,5 +187,95 @@ func TestEditWhitespaceNormalizedFallbackHandlesGofmtAlignmentAndIndentDrift(t *
 	})
 	if strErr == nil {
 		t.Fatalf("expected whitespace inside string literal NOT to fuzzy-match")
+	}
+}
+
+func TestResolveSymbolFuzzyTokenAndTypoSuggestions(t *testing.T) {
+	src := strings.Join([]string{
+		"package tui",
+		"",
+		"type Model struct{}",
+		"",
+		"func copyToastTimerCmd(seq int) {}",
+		"",
+		"func (m *Model) performCopy(text string) {",
+		"\t_ = text",
+		"}",
+		"",
+		"func (m *Model) handleKey(k string) {",
+		"\t_ = k",
+		"}",
+	}, "\n")
+
+	syms, _ := outlineFromSource("model.go", []byte(src))
+
+	// 1. Semantic camelCase token overlap (`Model::showCopyToast` -> suggests `Model.performCopy` and `copyToastTimerCmd` with line ranges!)
+	_, err1 := resolveSymbol(syms, "Model::showCopyToast", "pkg/tui/model.go")
+	if err1 == nil {
+		t.Fatal("expected NoMatch error for missing symbol")
+	}
+	msg1 := err1.Error()
+	if !strings.Contains(msg1, "Model.performCopy (L7-9)") || !strings.Contains(msg1, "copyToastTimerCmd (L5-5)") {
+		t.Fatalf("expected fuzzy token suggestions with line ranges, got: %s", msg1)
+	}
+
+	// 2. Typo edit-distance match (`Model::handelKey` -> suggests `Model.handleKey (L11-13)`)
+	_, err2 := resolveSymbol(syms, "Model::handelKey", "pkg/tui/model.go")
+	if err2 == nil || !strings.Contains(err2.Error(), "Model.handleKey (L11-13)") {
+		t.Fatalf("expected typo suggestion Model.handleKey (L11-13), got: %v", err2)
+	}
+}
+
+func TestRunChecksBatchSupportsTopLevelAndPerItemCwd(t *testing.T) {
+	root := t.TempDir()
+	subA := filepath.Join(root, "modA")
+	subB := filepath.Join(root, "modB")
+	for _, d := range []string{subA, subB} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(subA, "marker_a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subB, "marker_b.txt"), []byte("beta"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pol := policy.NewEngineWithOptions(root, policy.Options{StrictWorkspace: true})
+	binder := &ShellGitBinder{Policy: pol}
+
+	// 1. Top-level opts.cwd shifts base working directory for string commands.
+	resTop, err := binder.RunChecksBatch(context.Background(), root, []any{
+		[]any{"go env GOMOD"},
+		map[string]any{"cwd": subA, "compact": false},
+	})
+	if err != nil {
+		t.Fatalf("RunChecksBatch top-level cwd error: %v", err)
+	}
+	if ok, _ := resTop["ok"].(bool); !ok {
+		t.Fatalf("expected top-level cwd check to pass, got: %+v", resTop)
+	}
+	topResults := resTop["results"].([]map[string]any)
+	if gotCwd, _ := topResults[0]["cwd"].(string); !strings.HasSuffix(gotCwd, "/modA") {
+		t.Fatalf("expected result cwd ending with /modA, got %q", gotCwd)
+	}
+
+	// 2. Per-item { cmd, cwd, name } across two sibling subdirectories in one batch.
+	resMulti, err := binder.RunChecksBatch(context.Background(), root, []any{
+		[]any{
+			map[string]any{"name": "checkA", "cmd": "go version", "cwd": "modA"},
+			map[string]any{"name": "checkB", "cmd": "go version", "cwd": "modB"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RunChecksBatch per-item cwd error: %v", err)
+	}
+	if ok, _ := resMulti["ok"].(bool); !ok {
+		t.Fatalf("expected multi-cwd checks to pass, got: %+v", resMulti)
+	}
+	multiResults := resMulti["results"].([]map[string]any)
+	if !strings.HasSuffix(multiResults[0]["cwd"].(string), "/modA") || !strings.HasSuffix(multiResults[1]["cwd"].(string), "/modB") {
+		t.Fatalf("unexpected per-item cwds: %+v", multiResults)
 	}
 }

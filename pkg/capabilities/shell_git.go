@@ -464,6 +464,7 @@ type checkSpec struct {
 	name    string
 	command string
 	cwd     string
+	hasCwd  bool
 	timeout time.Duration
 }
 
@@ -476,6 +477,7 @@ func (b *ShellGitBinder) RunChecksBatch(ctx context.Context, baseCwd string, arg
 	concurrency := 4
 	defaultTimeout := DefaultShellTimeout
 	compact := true
+	customBaseCwd := false
 
 	var rawList []any
 	var opts map[string]any
@@ -489,6 +491,14 @@ func (b *ShellGitBinder) RunChecksBatch(ctx context.Context, baseCwd string, arg
 		rawList, _ = m["commands"].([]any)
 	}
 	if opts != nil {
+		if topCwd := firstString(opts, "cwd"); topCwd != "" {
+			resolved, rErr := b.Policy.ResolveAndCheckRead(baseCwd, topCwd)
+			if rErr != nil {
+				return nil, rErr
+			}
+			baseCwd = resolved
+			customBaseCwd = true
+		}
 		concurrency = optInt(opts, "concurrency", 4)
 		defaultTimeout = resolveCommandTimeout(opts, DefaultShellTimeout)
 		if mode := firstString(opts, "outputMode"); mode == "full" {
@@ -518,6 +528,7 @@ func (b *ShellGitBinder) RunChecksBatch(ctx context.Context, baseCwd string, arg
 				name:    fmt.Sprintf("cmd_%d", i+1),
 				command: v,
 				cwd:     baseCwd,
+				hasCwd:  customBaseCwd,
 				timeout: defaultTimeout,
 			})
 		case map[string]any:
@@ -526,12 +537,14 @@ func (b *ShellGitBinder) RunChecksBatch(ctx context.Context, baseCwd string, arg
 				return nil, fmt.Errorf("check #%d missing 'command'", i+1)
 			}
 			subDir := baseCwd
+			hasCustomCwd := customBaseCwd
 			if c := firstString(v, "cwd"); c != "" {
 				resolved, rErr := b.Policy.ResolveAndCheckRead(baseCwd, c)
 				if rErr != nil {
 					return nil, rErr
 				}
 				subDir = resolved
+				hasCustomCwd = true
 			}
 			nm := firstString(v, "name")
 			if nm == "" {
@@ -544,6 +557,7 @@ func (b *ShellGitBinder) RunChecksBatch(ctx context.Context, baseCwd string, arg
 				name:    nm,
 				command: cmdStr,
 				cwd:     subDir,
+				hasCwd:  hasCustomCwd,
 				timeout: resolveCommandTimeout(v, defaultTimeout),
 			})
 		default:
@@ -570,17 +584,24 @@ func (b *ShellGitBinder) RunChecksBatch(ctx context.Context, baseCwd string, arg
 			defer func() { <-sem }()
 			r, err := b.RunSingleCommandDuration(ctx, s.cwd, s.command, s.timeout, true, compact)
 			if err != nil {
-				results[i] = map[string]any{
+				entry := map[string]any{
 					"name":     s.name,
 					"command":  s.command,
 					"ok":       false,
 					"exitCode": -1,
 					"output":   err.Error(),
 				}
+				if s.hasCwd {
+					entry["cwd"] = cleanSlash(s.cwd)
+				}
+				results[i] = entry
 				return
 			}
 			r["name"] = s.name
 			r["command"] = s.command
+			if s.hasCwd {
+				r["cwd"] = cleanSlash(s.cwd)
+			}
 			results[i] = r
 		}(idx, sp)
 	}
