@@ -1111,6 +1111,8 @@ func installBootstrapWrappers(env *ExecutionEnv) error {
 						edit: (pathOrSpec, hunks) => rawTx._edit(id, pathOrSpec, hunks),
 						replace: (path, target, replacement, opts) => rawTx._edit(id, path, Object.assign({}, opts || {}, { target, replacement })),
 						replaceSymbol: (path, symbol, replacement) => rawTx._replaceSymbol(id, path, symbol, replacement),
+						insertSymbol: (path, symbol, position, replacement) => rawTx._edit(id, path, { symbol, insert: position, replacement }),
+						append: (path, content) => rawTx._edit(id, path, { insert: "eof", replacement: content }),
 						write: (path, content, opts) => rawTx._write(id, path, content, opts || {}),
 						rm: (path) => rawTx._rm(id, path),
 						remove: (path) => rawTx._rm(id, path),

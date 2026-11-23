@@ -68,12 +68,12 @@ func (b *ASTBinder) Bind(env *sandbox.ExecutionEnv) error {
 			for i, p := range paths {
 				absPath, err := b.Policy.ResolveAndCheckRead(env.Cwd, p)
 				if err != nil {
-					results[i] = FileOutline{File: p, Error: err.Error()}
+					results[i] = FileOutline{File: p, Symbols: []SymbolInfo{}, Error: err.Error()}
 					continue
 				}
 				ol, err := extractFileOutline(env.Cwd, absPath)
 				if err != nil {
-					results[i] = FileOutline{File: p, Error: err.Error()}
+					results[i] = FileOutline{File: p, Symbols: []SymbolInfo{}, Error: err.Error()}
 					continue
 				}
 				results[i] = ol

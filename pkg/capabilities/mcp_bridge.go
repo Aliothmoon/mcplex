@@ -29,6 +29,7 @@ import (
 type ToolDescriptor struct {
 	Ref         string         `json:"ref"`
 	Provider    string         `json:"provider"`
+	Server      string         `json:"server,omitempty"`
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"inputSchema,omitempty"`
@@ -253,8 +254,10 @@ func (m *MCPBridge) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			catalog := m.buildCatalog(ctx, env.Cwd, true)
 			normRef := normalizeRefLookup(ref)
+			normBare := strings.TrimPrefix(normRef, "mcp.")
 			for _, item := range catalog {
-				if normalizeRefLookup(item.Ref) == normRef || normalizeRefLookup(item.Name) == normRef {
+				itemNorm := normalizeRefLookup(item.Ref)
+				if itemNorm == normRef || strings.TrimPrefix(itemNorm, "mcp.") == normBare || normalizeRefLookup(item.Name) == normRef {
 					return item, nil
 				}
 			}
@@ -384,6 +387,7 @@ func (m *MCPBridge) buildCatalog(ctx context.Context, cwd string, includeSchemas
 				td := ToolDescriptor{
 					Ref:         ref,
 					Provider:    "mcp." + srvName,
+					Server:      srvName,
 					Name:        parsed.Name,
 					Description: desc,
 				}
@@ -506,6 +510,7 @@ func decodeMCPToolsList(serverName string, raw []byte) []ToolDescriptor {
 		out = append(out, ToolDescriptor{
 			Ref:         fmt.Sprintf("mcp.%s.%s", serverName, t.Name),
 			Provider:    "mcp." + serverName,
+			Server:      serverName,
 			Name:        t.Name,
 			Description: t.Description,
 			InputSchema: t.InputSchema,

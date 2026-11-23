@@ -31,6 +31,7 @@ type EditHunk struct {
 	Nth           int    `json:"nth,omitempty"`           // 1-based: replace only the Nth match (like sed s/x/y/N)
 	Symbol        string `json:"symbol,omitempty"`        // restrict matching to a symbol's lines, e.g. "Editor::on_escape"
 	ReplaceSymbol bool   `json:"replaceSymbol,omitempty"` // replace entire resolved symbol span (0 target tokens)
+	Insert        string `json:"insert,omitempty"`        // "after" | "before" | "inside" (with symbol) or "eof" (0 target tokens)
 }
 
 // FileEditSpec describes edits or creation for one file.
@@ -198,6 +199,52 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 					Symbol:        sym,
 					ReplaceSymbol: true,
 					Replacement:   repl,
+				}},
+			}
+			return b.applyFileSpecsWithOwner(ctx, env.Cwd, env.ExecID, []FileEditSpec{spec}, false, false, nil)
+		},
+		"insertSymbol": func(ctx context.Context, args []any) (any, error) {
+			if len(args) < 4 {
+				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "edit.insertSymbol requires (path, symbol, position, replacement) where position is 'after' | 'before' | 'inside'")
+			}
+			p, _ := args[0].(string)
+			sym, _ := args[1].(string)
+			pos, _ := args[2].(string)
+			repl, ok := args[3].(string)
+			if !ok || strings.TrimSpace(repl) == "" {
+				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "edit.insertSymbol requires a non-empty replacement string")
+			}
+			canonMode, mErr := normalizeInsertMode(pos)
+			if mErr != nil {
+				return nil, mErr
+			}
+			if canonMode == "eof" || strings.TrimSpace(sym) == "" {
+				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "edit.insertSymbol requires non-empty symbol and position 'after' | 'before' | 'inside' (use edit.append for EOF)")
+			}
+			spec := FileEditSpec{
+				Path: p,
+				Hunks: []EditHunk{{
+					Symbol:      sym,
+					Insert:      canonMode,
+					Replacement: repl,
+				}},
+			}
+			return b.applyFileSpecsWithOwner(ctx, env.Cwd, env.ExecID, []FileEditSpec{spec}, false, false, nil)
+		},
+		"append": func(ctx context.Context, args []any) (any, error) {
+			if len(args) < 2 {
+				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "edit.append requires (path, content)")
+			}
+			p, _ := args[0].(string)
+			content, ok := args[1].(string)
+			if !ok || strings.TrimSpace(content) == "" {
+				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "edit.append requires a non-empty content string")
+			}
+			spec := FileEditSpec{
+				Path: p,
+				Hunks: []EditHunk{{
+					Insert:      "eof",
+					Replacement: content,
 				}},
 			}
 			return b.applyFileSpecsWithOwner(ctx, env.Cwd, env.ExecID, []FileEditSpec{spec}, false, false, nil)
@@ -961,6 +1008,26 @@ func planSingleFile(absPath, relPath string, spec FileEditSpec) (plannedFileWrit
 			continue
 		}
 
+		if h.Insert != "" {
+			spStart, spEnd, insRepl, sLine, eLine, lbl, iErr := resolveInsertHunk(
+				normText, symLines, lineStarts, outline, h, relPath, sep, normRepl,
+			)
+			if iErr != nil {
+				hunkErrs = append(hunkErrs, prefixHunkErr(iErr, hIdx))
+				continue
+			}
+			spans = append(spans, span{
+				start:     spStart,
+				end:       spEnd,
+				repl:      insRepl,
+				idx:       hIdx,
+				startLine: sLine,
+				endLine:   eLine,
+				label:     lbl,
+			})
+			continue
+		}
+
 		normTarget := strings.ReplaceAll(h.Target, "\r\n", "\n")
 		scope := fmt.Sprintf("L%d-%d", h.StartLine, h.EndLine)
 		if h.Symbol != "" {
@@ -1116,7 +1183,15 @@ func planSingleFile(absPath, relPath string, spec FileEditSpec) (plannedFileWrit
 		}
 	}
 
-	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+	sort.SliceStable(spans, func(i, j int) bool {
+		if spans[i].start != spans[j].start {
+			return spans[i].start < spans[j].start
+		}
+		if spans[i].end != spans[j].end {
+			return spans[i].end < spans[j].end
+		}
+		return spans[i].idx < spans[j].idx
+	})
 	for i := 1; i < len(spans); i++ {
 		if spans[i].start < spans[i-1].end {
 			a, bSpan := spans[i-1], spans[i]
@@ -1681,6 +1756,13 @@ func resolveEndTargetHunk(
 	cappedBy120 := false
 	if h.Symbol == "" && h.EndLine == 0 {
 		maxLine := sEndLine + defaultMaxEndTargetSpanLines
+		// If `target` sits inside an AST symbol (e.g. a 250-line C/Java/Rust function or class), allow `endTarget`
+		// anywhere up to the end of that enclosing symbol without requiring an explicit `symbol` parameter.
+		for _, sym := range outline() {
+			if sLine >= sym.StartLine && sLine <= sym.EndLine && sym.EndLine > maxLine {
+				maxLine = sym.EndLine
+			}
+		}
 		if maxLine < len(lineStarts) {
 			capRel := lineStarts[maxLine] - winStart
 			if capRel < subEnd && capRel >= afterOff {
@@ -2554,19 +2636,40 @@ func decodeSingleFileMap(m map[string]any) (FileEditSpec, error) {
 		return FileEditSpec{}, errors.New("file edit requires 'path'")
 	}
 	if createVal, hasCreate := m["create"]; hasCreate && createVal != nil {
-		if cs, ok := createVal.(string); ok {
-			return FileEditSpec{
-				Path:      p,
-				Create:    &cs,
-				Overwrite: optBool(m, "overwrite", false),
-				EOL:       firstString(m, "eol"),
-			}, nil
+		if _, hasAppend := m["append"]; hasAppend {
+			return FileEditSpec{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s: 'create' cannot be combined with 'append'", p)
+		}
+		cs, ok := createVal.(string)
+		if !ok {
+			return FileEditSpec{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s: 'create' must be a string", p)
+		}
+		return FileEditSpec{
+			Path:      p,
+			Create:    &cs,
+			Overwrite: optBool(m, "overwrite", false),
+			EOL:       firstString(m, "eol"),
+		}, nil
+	}
+
+	var appendHunk *EditHunk
+	if appendVal, hasAppend := m["append"]; hasAppend && appendVal != nil {
+		as, ok := appendVal.(string)
+		if !ok || strings.TrimSpace(as) == "" {
+			return FileEditSpec{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s: 'append' must be a non-empty string", p)
+		}
+		appendHunk = &EditHunk{
+			Insert:      "eof",
+			Replacement: as,
 		}
 	}
+
 	if hRaw, ok := m["hunks"].([]any); ok {
 		hunks, err := decodeHunks(hRaw)
 		if err != nil {
 			return FileEditSpec{}, err
+		}
+		if appendHunk != nil {
+			hunks = append(hunks, *appendHunk)
 		}
 		return FileEditSpec{Path: p, Hunks: hunks}, nil
 	}
@@ -2575,8 +2678,29 @@ func decodeSingleFileMap(m map[string]any) (FileEditSpec, error) {
 		if err != nil {
 			return FileEditSpec{}, err
 		}
+		if appendHunk != nil {
+			hunks = append(hunks, *appendHunk)
+		}
 		return FileEditSpec{Path: p, Hunks: hunks}, nil
 	}
+	if appendHunk != nil {
+		hasInlineHunk := false
+		for _, k := range []string{"target", "oldText", "old_string", "replaceSymbol", "insert", "insertAfter", "insertBefore", "replacement", "newText", "new_string"} {
+			if _, ok := m[k]; ok {
+				hasInlineHunk = true
+				break
+			}
+		}
+		if !hasInlineHunk {
+			return FileEditSpec{Path: p, Hunks: []EditHunk{*appendHunk}}, nil
+		}
+		h, err := decodeSingleHunk(m)
+		if err != nil {
+			return FileEditSpec{}, err
+		}
+		return FileEditSpec{Path: p, Hunks: []EditHunk{h, *appendHunk}}, nil
+	}
+
 	// Inline single hunk on the file object itself
 	h, err := decodeSingleHunk(m)
 	if err != nil {
@@ -2606,6 +2730,23 @@ func decodeSingleHunk(m map[string]any) (EditHunk, error) {
 	endTarget := firstString(m, "endTarget", "end_target")
 	replaceSym := optBool(m, "replaceSymbol", false)
 	sym := firstString(m, "symbol", "in")
+	insertMode := firstString(m, "insert", "position")
+	if insAfter := firstString(m, "insertAfter", "afterSymbol"); insAfter != "" {
+		if sym == "" {
+			sym = insAfter
+		}
+		if insertMode == "" {
+			insertMode = "after"
+		}
+	} else if insBefore := firstString(m, "insertBefore", "beforeSymbol"); insBefore != "" {
+		if sym == "" {
+			sym = insBefore
+		}
+		if insertMode == "" {
+			insertMode = "before"
+		}
+	}
+
 	startLine := optInt(m, "startLine", 0)
 	endLine := optInt(m, "endLine", 0)
 	replaceAll := optBool(m, "replaceAll", optBool(m, "all", false))
@@ -2634,6 +2775,9 @@ func decodeSingleHunk(m map[string]any) (EditHunk, error) {
 	}
 
 	if replaceSym {
+		if insertMode != "" {
+			return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "replaceSymbol: true cannot be combined with 'insert'")
+		}
 		if strings.TrimSpace(sym) == "" {
 			return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "replaceSymbol: true requires non-empty 'symbol'")
 		}
@@ -2650,8 +2794,36 @@ func decodeSingleHunk(m map[string]any) (EditHunk, error) {
 		}, nil
 	}
 
+	if insertMode != "" {
+		canonMode, mErr := normalizeInsertMode(insertMode)
+		if mErr != nil {
+			return EditHunk{}, mErr
+		}
+		if strings.TrimSpace(repl) == "" {
+			return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "insert: %q requires non-empty 'replacement'", canonMode)
+		}
+		if target != "" || endTarget != "" {
+			return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "insert: %q cannot be combined with 'target' or 'endTarget' (zero-target insertion uses 'symbol' or 'eof')", canonMode)
+		}
+		if replaceAll || nth > 0 || startLine > 0 || endLine > 0 {
+			return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "insert: %q cannot be combined with startLine, endLine, nth, or replaceAll", canonMode)
+		}
+		if canonMode == "eof" {
+			if strings.TrimSpace(sym) != "" {
+				return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "insert: \"eof\" cannot be combined with 'symbol' (use insert: \"after\" | \"inside\" for symbol-relative insertion)")
+			}
+		} else if strings.TrimSpace(sym) == "" {
+			return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "insert: %q requires non-empty 'symbol' (or use insert: \"eof\" / append to add at end of file)", canonMode)
+		}
+		return EditHunk{
+			Symbol:      sym,
+			Insert:      canonMode,
+			Replacement: repl,
+		}, nil
+	}
+
 	if target == "" {
-		return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "hunk requires non-empty 'target' (or pass { symbol, replaceSymbol: true, replacement } to replace an entire symbol)")
+		return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "hunk requires non-empty 'target' (or pass { symbol, replaceSymbol: true, replacement } or { symbol, insert: \"after\"|\"before\"|\"inside\", replacement })")
 	}
 	if endTarget != "" && (replaceAll || nth > 0) {
 		return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "endTarget cannot be combined with replaceAll or nth")

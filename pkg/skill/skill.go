@@ -75,7 +75,7 @@ Example:
 		Summary: "ast.outline, ast.outlines, ast.read(\"Type::method\"), ast.enclosingSymbol",
 		Aliases: []string{"outline", "symbol", "symbols", "parser"},
 		Body: `- ` + "`await ast.outline(path)`" + ` / ` + "`await ast.outlines(paths)`" + ` -> ` + "`{ file, totalLines, symbols: [{ kind, name, signature?, startLine, endLine }] }`" + `
-  - Exact ` + "`go/parser`" + ` AST for Go; also supports TS/JS, Python, Rust, C/C++, Java, Kotlin, Markdown.
+  - Exact ` + "`go/parser`" + ` AST for Go + Tree-sitter AST (including ` + "`Type::method`" + ` / ` + "`Type.method`" + ` members) for C/C++, Rust, Python, TS/TSX/JS, Java, Kotlin, C#, plus Markdown.
 - ` + "`await ast.read(path, \"Type::method\", { lineNumbers? })`" + ` -> ` + "`{ kind, name, startLine, endLine, text }`" + ` (also accepts ` + "`Type.method`" + ` or bare ` + "`name`" + `)
 - ` + "`await ast.enclosingSymbol(path, line)`" + ` -> ` + "`{ kind, name, startLine, endLine } | null`" + `
 
@@ -85,10 +85,13 @@ Example:
 	{
 		ID:      "edit",
 		Title:   "edit — Scoped Multi-File Atomic Edits",
-		Summary: "edit.replaceSymbol (0 target), endTarget span, edit.apply, edit.replace",
+		Summary: "edit.replaceSymbol / insertSymbol / append (0 target), endTarget span, edit.apply",
 		Aliases: []string{"replace", "replaceSymbol", "endTarget", "patch", "hunk", "hunks"},
 		Body: `- **Low-token whole-symbol rewrite (recommended for full functions/methods/structs)**:
   - ` + "`await edit.replaceSymbol(path, \"Type::method\", P.newCode)`" + ` (0 ` + "`target`" + ` tokens; auto-preserves leading doc comments/decorators unless ` + "`P.newCode`" + ` includes them).
+- **Zero-` + "`target`" + ` function/method insertion & EOF append**:
+  - ` + "`await edit.insertSymbol(path, \"Type::fn\", \"after\" | \"before\" | \"inside\", P.newFn)`" + ` (or hunk ` + "`{ symbol, insert: \"after\" | \"before\" | \"inside\", replacement: P.newFn }`" + ` — ` + "`inside`" + ` appends a member before a ` + "`class`/`struct`/`impl`/`namespace`" + ` closing brace with auto-indent).
+  - ` + "`await edit.append(path, P.newFn)`" + ` (or ` + "`{ path, append: P.newFn }`" + ` / hunk ` + "`{ insert: \"eof\", replacement: P.newFn }`" + `).
 - **Low-token boundary-anchored span (` + "`endTarget`" + `, recommended for 10–120 line blocks)**:
   - ` + "`{ symbol?: \"fn\", target: \"<start line>\", endTarget: \"<end line>\", replacement: P.newBlock }`" + ` (replaces closed span ` + "`[target .. endTarget]`" + ` without copying middle lines).
 - **Scoped multi-file / micro-hunk edits**:

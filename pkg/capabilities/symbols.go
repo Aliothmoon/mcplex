@@ -21,6 +21,9 @@ func outlineFromSource(absPath string, raw []byte) ([]SymbolInfo, []string) {
 			return syms, lines
 		}
 	}
+	if syms, ok := extractTreeSitterSymbols(ext, []byte(text), lines); ok {
+		return syms, lines
+	}
 	return extractGenericSymbols(ext, lines), lines
 }
 
@@ -155,6 +158,17 @@ func resolveSymbol(syms []SymbolInfo, query, rel string) (SymbolInfo, error) {
 		}
 		if ok {
 			hits = append(hits, s)
+		}
+	}
+	if len(hits) > 1 {
+		var withBody []SymbolInfo
+		for _, h := range hits {
+			if h.hasBraces {
+				withBody = append(withBody, h)
+			}
+		}
+		if len(withBody) == 1 {
+			return withBody[0], nil
 		}
 	}
 	switch len(hits) {
@@ -370,6 +384,16 @@ func isCppFamilyExt(ext string) bool {
 	switch ext {
 	case ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".ino":
 		return true
+	}
+	return false
+}
+
+func hasPreprocConditional(spanLines []string) bool {
+	for _, l := range spanLines {
+		t := strings.TrimSpace(l)
+		if strings.HasPrefix(t, "#if") || strings.HasPrefix(t, "#elif") || strings.HasPrefix(t, "#else") {
+			return true
+		}
 	}
 	return false
 }
@@ -706,6 +730,14 @@ func verifyReplaceableSymbol(lines []string, syms []SymbolInfo, sym SymbolInfo, 
 			"%s: symbol %s (L%d-%d) has no brace-delimited body; use a standard target hunk",
 			relPath, sym.Name, sym.StartLine, sym.EndLine)
 	}
+	if isCppFamilyExt(ext) && hasPreprocConditional(lines[sym.StartLine-1:sym.EndLine]) {
+		spanText := strings.Join(lines[sym.StartLine-1:sym.EndLine], "\n")
+		if delta, ok := netBraceDeltaLexed(spanText, relPath); !ok || delta != 0 {
+			return sandbox.NewHostError(sandbox.KindBadArgs, nil,
+				"%s: symbol %s (L%d-%d) has unbalanced preprocessor braces (net %+d); use target+endTarget or target hunk",
+				relPath, sym.Name, sym.StartLine, sym.EndLine, delta)
+		}
+	}
 	if sym.EndLine > sym.StartLine {
 		endRaw := lines[sym.EndLine-1]
 		endTrim := strings.TrimSpace(endRaw)
@@ -809,4 +841,369 @@ func replContainsTemplate(normRepl string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeInsertMode(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "after", "after_symbol", "below":
+		return "after", nil
+	case "before", "before_symbol", "above":
+		return "before", nil
+	case "inside", "inside_end", "append_member":
+		return "inside", nil
+	case "eof", "end", "append":
+		return "eof", nil
+	default:
+		return "", sandbox.NewHostError(sandbox.KindBadArgs, nil,
+			"invalid insert mode %q: expected \"after\", \"before\", \"inside\", or \"eof\"", raw)
+	}
+}
+
+func cppPreprocDirective(trimmed string) (string, string) {
+	if !strings.HasPrefix(trimmed, "#") {
+		return "", ""
+	}
+	rest := strings.TrimSpace(trimmed[1:])
+	if rest == "" {
+		return "", ""
+	}
+	fields := strings.Fields(rest)
+	dir := fields[0]
+	arg := ""
+	if len(fields) > 1 {
+		arg = strings.Join(fields[1:], " ")
+	}
+	return dir, arg
+}
+
+func detectHeaderGuardInsertLine(lines []string) int {
+	inBlock := false
+	firstIdx, secondIdx := -1, -1
+	firstDir, firstArg, secondDir := "", "", ""
+	for i, l := range lines {
+		t := strings.TrimSpace(l)
+		if inBlock {
+			if strings.Contains(t, "*/") {
+				inBlock = false
+			}
+			continue
+		}
+		if strings.HasPrefix(t, "/*") {
+			if !strings.Contains(t, "*/") {
+				inBlock = true
+			}
+			continue
+		}
+		if t == "" || strings.HasPrefix(t, "//") {
+			continue
+		}
+		dir, arg := cppPreprocDirective(t)
+		if firstIdx < 0 {
+			firstIdx, firstDir, firstArg = i, dir, arg
+			continue
+		}
+		secondIdx, secondDir = i, dir
+		break
+	}
+	isIfndef := firstDir == "ifndef" || (firstDir == "if" && strings.HasPrefix(strings.ReplaceAll(firstArg, " ", ""), "!defined"))
+	if firstIdx < 0 || secondIdx < 0 || !isIfndef || secondDir != "define" {
+		return 0
+	}
+
+	endifIdx := -1
+	for i := len(lines) - 1; i > secondIdx; i-- {
+		t := strings.TrimSpace(lines[i])
+		if t == "" || strings.HasPrefix(t, "//") || (strings.HasPrefix(t, "/*") && strings.HasSuffix(t, "*/")) {
+			continue
+		}
+		dir, _ := cppPreprocDirective(t)
+		if dir == "endif" {
+			endifIdx = i
+		}
+		break
+	}
+	if endifIdx < 0 {
+		return 0
+	}
+
+	depth := 0
+	inBlock = false
+	for i := firstIdx; i <= endifIdx; i++ {
+		t := strings.TrimSpace(lines[i])
+		if inBlock {
+			if strings.Contains(t, "*/") {
+				inBlock = false
+			}
+			continue
+		}
+		if strings.HasPrefix(t, "/*") {
+			if !strings.Contains(t, "*/") {
+				inBlock = true
+			}
+			continue
+		}
+		dir, _ := cppPreprocDirective(t)
+		switch dir {
+		case "if", "ifdef", "ifndef":
+			depth++
+		case "endif":
+			depth--
+			if i < endifIdx && depth <= 0 {
+				return 0
+			}
+		}
+	}
+	if depth != 0 {
+		return 0
+	}
+
+	insertIdx := endifIdx
+	// Step above an immediately preceding `#ifdef __cplusplus` / `}` / `#endif` footer if present.
+	nonBlankPrev := func(from int) int {
+		for k := from - 1; k > secondIdx; k-- {
+			kt := strings.TrimSpace(lines[k])
+			if kt == "" || strings.HasPrefix(kt, "//") || (strings.HasPrefix(kt, "/*") && strings.HasSuffix(kt, "*/")) {
+				continue
+			}
+			return k
+		}
+		return -1
+	}
+	if p1 := nonBlankPrev(endifIdx); p1 > secondIdx {
+		d1, _ := cppPreprocDirective(strings.TrimSpace(lines[p1]))
+		if d1 == "endif" {
+			if p2 := nonBlankPrev(p1); p2 > secondIdx && strings.TrimSpace(lines[p2]) == "}" {
+				if p3 := nonBlankPrev(p2); p3 > secondIdx {
+					d3, a3 := cppPreprocDirective(strings.TrimSpace(lines[p3]))
+					normA3 := strings.ReplaceAll(a3, " ", "")
+					if (d3 == "ifdef" && strings.HasPrefix(normA3, "__cplusplus")) ||
+						(d3 == "if" && strings.HasPrefix(normA3, "defined(__cplusplus)")) {
+						insertIdx = p3
+					}
+				}
+			}
+		}
+	}
+	return insertIdx + 1
+}
+
+func isInsertSafeDeclWithoutBody(lines []string, s SymbolInfo) bool {
+	if s.unclosed || s.StartLine < 1 || s.EndLine < s.StartLine || s.EndLine > len(lines) {
+		return false
+	}
+	if s.StartLine == s.EndLine {
+		return true
+	}
+	if !s.hasBraces {
+		endTrim := strings.TrimSpace(lines[s.EndLine-1])
+		if idx := strings.Index(endTrim, "//"); idx >= 0 {
+			endTrim = strings.TrimSpace(endTrim[:idx])
+		}
+		return strings.HasSuffix(endTrim, ";")
+	}
+	return false
+}
+
+func inferMemberIndentUnit(lines []string, relPath string) string {
+	ext := strings.ToLower(filepath.Ext(relPath))
+	if ext == ".go" {
+		return "\t"
+	}
+	tabs, twoSp, fourSp := 0, 0, 0
+	for _, l := range lines {
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+		if strings.HasPrefix(l, "\t") {
+			tabs++
+		} else if strings.HasPrefix(l, "    ") {
+			fourSp++
+		} else if strings.HasPrefix(l, "  ") {
+			twoSp++
+		}
+	}
+	if tabs > fourSp && tabs > twoSp {
+		return "\t"
+	}
+	if twoSp > fourSp*2 {
+		return "  "
+	}
+	switch ext {
+	case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".c", ".h", ".cpp", ".cc", ".hpp":
+		if fourSp == 0 {
+			return "  "
+		}
+	}
+	return "    "
+}
+
+func resolveInsertHunk(
+	normText string,
+	symLines []string,
+	lineStarts []int,
+	outline func() []SymbolInfo,
+	h EditHunk,
+	relPath string,
+	sep string,
+	normRepl string,
+) (spStart, spEnd int, replText string, sLine, eLine int, label string, err error) {
+	if len(symLines) == 0 {
+		symLines = strings.Split(normText, "\n")
+	}
+	body := strings.Trim(normRepl, "\n")
+	if strings.TrimSpace(body) == "" {
+		return 0, 0, "", 0, 0, "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "insert replacement cannot be empty")
+	}
+
+	ext := strings.ToLower(filepath.Ext(relPath))
+	if h.Insert == "eof" {
+		if isCppFamilyExt(ext) {
+			if guardLine := detectHeaderGuardInsertLine(symLines); guardLine > 0 && guardLine <= len(lineStarts) {
+				pos := lineStarts[guardLine-1]
+				prevTrim := ""
+				if guardLine >= 2 {
+					prevTrim = strings.TrimSpace(symLines[guardLine-2])
+				}
+				prefix := ""
+				if strings.Contains(body, "\n") && prevTrim != "" && !strings.HasPrefix(prevTrim, "#define") && !strings.HasSuffix(prevTrim, "{") {
+					prefix = "\n"
+				}
+				return pos, pos, prefix + body + "\n", guardLine, guardLine, fmt.Sprintf("L%d (before #endif)", guardLine), nil
+			}
+		}
+		if strings.TrimSpace(normText) == "" {
+			return 0, len(normText), body + "\n", 1, maxInt(1, len(symLines)), "L1 (eof)", nil
+		}
+		pos := len(normText)
+		trailingNL := 0
+		for i := len(normText) - 1; i >= 0 && normText[i] == '\n'; i-- {
+			trailingNL++
+		}
+		var ins string
+		switch {
+		case trailingNL >= 2:
+			ins = body + "\n"
+		case trailingNL == 1:
+			ins = "\n" + body + "\n"
+		default:
+			ins = "\n\n" + body + "\n"
+		}
+		lastLine := maxInt(1, len(symLines))
+		return pos, pos, ins, lastLine, lastLine, fmt.Sprintf("L%d (eof)", lastLine), nil
+	}
+
+	syms := outline()
+	s, sErr := resolveSymbol(syms, h.Symbol, relPath)
+	if sErr != nil {
+		return 0, 0, "", 0, 0, "", sErr
+	}
+	qName := qualifiedName(syms, s, sep)
+
+	switch h.Insert {
+	case "inside":
+		if !containerKinds[s.Kind] {
+			return 0, 0, "", 0, 0, "", sandbox.NewHostError(sandbox.KindBadArgs, nil,
+				"%s: symbol %s (%s) is not a container (class/struct/impl/namespace); use insert: \"after\" or \"before\"",
+				relPath, qName, s.Kind)
+		}
+		if vErr := verifyReplaceableSymbol(symLines, syms, s, relPath); vErr != nil {
+			return 0, 0, "", 0, 0, "", vErr
+		}
+		memberRef := ""
+		for _, ch := range syms {
+			if ch.StartLine > s.StartLine && ch.EndLine <= s.EndLine {
+				memberRef = symLines[ch.StartLine-1]
+			}
+		}
+		if memberRef == "" {
+			baseLead, _ := splitLeadingHSpace(symLines[s.StartLine-1])
+			memberRef = baseLead + inferMemberIndentUnit(symLines, relPath) + "member"
+		}
+		aligned := strings.TrimSuffix(alignSymbolReplacementIndent(memberRef, body, relPath), "\n")
+
+		if isPythonPath(relPath) {
+			_, endOff := exactLineSpanOffsets(normText, lineStarts, s.EndLine, s.EndLine)
+			ins := "\n\n" + aligned
+			if endOff == len(normText) {
+				ins += "\n"
+			} else if s.EndLine < len(symLines) && strings.TrimSpace(symLines[s.EndLine]) != "" {
+				ins += "\n"
+			}
+			return endOff, endOff, ins, s.EndLine, s.EndLine, fmt.Sprintf("L%d (inside %s)", s.EndLine, qName), nil
+		}
+
+		if s.EndLine == s.StartLine {
+			lineStart, lineEnd := exactLineSpanOffsets(normText, lineStarts, s.StartLine, s.StartLine)
+			rawLine := normText[lineStart:lineEnd]
+			closeIdx := strings.LastIndexByte(rawLine, '}')
+			if closeIdx < 0 {
+				return 0, 0, "", 0, 0, "", sandbox.NewHostError(sandbox.KindBadArgs, nil,
+					"%s: container %s at L%d has no closing '}'", relPath, qName, s.StartLine)
+			}
+			baseLead, _ := splitLeadingHSpace(symLines[s.StartLine-1])
+			pos := lineStart + closeIdx
+			ins := "\n" + aligned + "\n" + baseLead
+			return pos, pos, ins, s.StartLine, s.StartLine, fmt.Sprintf("L%d (inside %s)", s.StartLine, qName), nil
+		}
+
+		pos := lineStarts[s.EndLine-1]
+		prevTrim := ""
+		if s.EndLine-2 >= 0 {
+			prevTrim = strings.TrimSpace(symLines[s.EndLine-2])
+		}
+		ins := "\n" + aligned + "\n"
+		if prevTrim == "" || strings.HasSuffix(prevTrim, "{") {
+			ins = aligned + "\n"
+		}
+		return pos, pos, ins, s.EndLine, s.EndLine, fmt.Sprintf("L%d (inside %s)", s.EndLine, qName), nil
+
+	case "after":
+		if !isInsertSafeDeclWithoutBody(symLines, s) {
+			if vErr := verifyReplaceableSymbol(symLines, syms, s, relPath); vErr != nil {
+				return 0, 0, "", 0, 0, "", vErr
+			}
+		}
+		aligned := strings.TrimSuffix(alignSymbolReplacementIndent(symLines[s.StartLine-1], body, relPath), "\n")
+		_, endOff := exactLineSpanOffsets(normText, lineStarts, s.EndLine, s.EndLine)
+		isMulti := s.EndLine > s.StartLine || strings.Contains(aligned, "\n")
+		prefix := "\n\n"
+		if !isMulti {
+			prefix = "\n"
+		}
+		suffix := ""
+		if endOff == len(normText) {
+			suffix = "\n"
+		} else if isMulti && s.EndLine < len(symLines) {
+			nextTrim := strings.TrimSpace(symLines[s.EndLine])
+			if nextTrim != "" && !strings.HasPrefix(nextTrim, "}") && !strings.HasPrefix(nextTrim, "#endif") {
+				suffix = "\n"
+			}
+		}
+		return endOff, endOff, prefix + aligned + suffix, s.EndLine, s.EndLine, fmt.Sprintf("L%d (after %s)", s.EndLine, qName), nil
+
+	case "before":
+		if !isInsertSafeDeclWithoutBody(symLines, s) {
+			if vErr := verifyReplaceableSymbol(symLines, syms, s, relPath); vErr != nil {
+				return 0, 0, "", 0, 0, "", vErr
+			}
+		}
+		anchorLine := leadingDocStartLine(symLines, syms, s, relPath)
+		aligned := strings.TrimSuffix(alignSymbolReplacementIndent(symLines[s.StartLine-1], body, relPath), "\n")
+		pos, _ := exactLineSpanOffsets(normText, lineStarts, anchorLine, anchorLine)
+		isMulti := s.EndLine > s.StartLine || strings.Contains(aligned, "\n")
+		prefix := ""
+		if isMulti && anchorLine > 1 {
+			prevTrim := strings.TrimSpace(symLines[anchorLine-2])
+			if prevTrim != "" && !strings.HasSuffix(prevTrim, "{") {
+				prefix = "\n"
+			}
+		}
+		sepAfter := "\n\n"
+		if !isMulti {
+			sepAfter = "\n"
+		}
+		return pos, pos, prefix + aligned + sepAfter, anchorLine, anchorLine, fmt.Sprintf("L%d (before %s)", anchorLine, qName), nil
+	}
+
+	return 0, 0, "", 0, 0, "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "unsupported insert mode %q", h.Insert)
 }

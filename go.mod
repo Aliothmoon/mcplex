@@ -10,6 +10,7 @@ require (
 	github.com/evanw/esbuild v0.28.2
 	github.com/mattn/go-isatty v0.0.20
 	github.com/muesli/termenv v0.16.0
+	github.com/odvcencio/gotreesitter v0.58.0
 )
 
 require (
