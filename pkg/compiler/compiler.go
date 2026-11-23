@@ -418,7 +418,7 @@ func lexTypeScript(src string, numLines int) ([]jsToken, []bool) {
 	lineIsTopLevel[0] = true
 	lineIdx := 0
 
-	var tokens []jsToken
+	tokens := make([]jsToken, 0, len(src)/4+16)
 	n := len(src)
 	var ctx []lexCtx
 	allowRegex := true
@@ -1040,7 +1040,7 @@ func analyzePayloadReferences(tokens []jsToken) map[string]bool {
 	refs := map[string]bool{}
 	n := len(tokens)
 	match := buildMatchTable(tokens)
-	scopes := []lexicalScope{{vars: map[string]bool{}}}
+	scopes := make([]lexicalScope, 1, 16)
 	bodyBraceVars := map[int]map[string]bool{}
 	arrowExprVars := map[int]map[string]bool{}
 
@@ -1060,6 +1060,9 @@ func analyzePayloadReferences(tokens []jsToken) map[string]bool {
 	addCurrentVar := func(name string) {
 		if !isPayloadName(name) {
 			return
+		}
+		if scopes[len(scopes)-1].vars == nil {
+			scopes[len(scopes)-1].vars = map[string]bool{}
 		}
 		scopes[len(scopes)-1].vars[name] = true
 	}
@@ -1142,15 +1145,20 @@ func analyzePayloadReferences(tokens []jsToken) map[string]bool {
 			switch tok.text {
 			case "{":
 				braceDepth++
-				vars := map[string]bool{}
-				for k := range bodyBraceVars[i] {
-					vars[k] = true
+				var vars map[string]bool
+				if len(bodyBraceVars) > 0 {
+					if bv := bodyBraceVars[i]; len(bv) > 0 {
+						vars = make(map[string]bool, len(bv))
+						for k := range bv {
+							vars[k] = true
+						}
+					}
 				}
 				scopes = append(scopes, lexicalScope{vars: vars})
 				continue
 			case "${":
 				braceDepth++
-				scopes = append(scopes, lexicalScope{vars: map[string]bool{}})
+				scopes = append(scopes, lexicalScope{})
 				continue
 			case "}", "} `":
 				if braceDepth > 0 {
@@ -1163,10 +1171,12 @@ func analyzePayloadReferences(tokens []jsToken) map[string]bool {
 				popCompletedExprScopes(false, -1)
 				continue
 			case "(":
-				if closeIdx := match[i]; closeIdx > i {
-					if arrowIdx := findArrowAfterCloseParen(tokens, match, closeIdx); arrowIdx > 0 {
-						paramVars := extractParamListBindings(tokens[i+1 : closeIdx])
-						attachArrowVars(arrowIdx, paramVars)
+				if canPrecedeArrowParen(tokens, i) {
+					if closeIdx := match[i]; closeIdx > i {
+						if arrowIdx := findArrowAfterCloseParen(tokens, match, closeIdx); arrowIdx > 0 {
+							paramVars := extractParamListBindings(tokens[i+1 : closeIdx])
+							attachArrowVars(arrowIdx, paramVars)
+						}
 					}
 				}
 				parenDepth++
@@ -1190,19 +1200,21 @@ func analyzePayloadReferences(tokens []jsToken) map[string]bool {
 				popCompletedExprScopes(true, -1)
 				continue
 			case "=>":
-				if ev := arrowExprVars[i]; len(ev) > 0 {
-					vars := map[string]bool{}
-					for k := range ev {
-						vars[k] = true
+				if len(arrowExprVars) > 0 {
+					if ev := arrowExprVars[i]; len(ev) > 0 {
+						vars := map[string]bool{}
+						for k := range ev {
+							vars[k] = true
+						}
+						scopes = append(scopes, lexicalScope{
+							vars:       vars,
+							isExprBody: true,
+							baseBrace:  braceDepth,
+							baseParen:  parenDepth,
+							baseBrack:  brackDepth,
+							asiFrom:    i,
+						})
 					}
-					scopes = append(scopes, lexicalScope{
-						vars:       vars,
-						isExprBody: true,
-						baseBrace:  braceDepth,
-						baseParen:  parenDepth,
-						baseBrack:  brackDepth,
-						asiFrom:    i,
-					})
 				}
 				continue
 			}
@@ -1283,7 +1295,8 @@ func analyzePayloadReferences(tokens []jsToken) map[string]bool {
 			continue
 		}
 
-		if !prevIsDot(i) && !isControlParenKeyword(ident) && isMethodNamePosition(tokens, i) {
+		if i+1 < n && tokens[i+1].kind == tokPunct && (tokens[i+1].text == "(" || tokens[i+1].text == "<") &&
+			!prevIsDot(i) && !isControlParenKeyword(ident) && isMethodNamePosition(tokens, i) {
 			if openIdx := findMethodOpenParen(tokens, match, i+1); openIdx > 0 {
 				if closeIdx := match[openIdx]; closeIdx > openIdx {
 					if bodyBrace := findMethodBodyBrace(tokens, match, closeIdx); bodyBrace > 0 {
@@ -1438,7 +1451,7 @@ func scanPastReturnType(tokens []jsToken, match []int, from int, wantArrow bool)
 			if wantArrow && aDepth == 0 {
 				return k
 			}
-		case ";", "=":
+		case ";", "=", ",":
 			if aDepth == 0 {
 				return -1
 			}
@@ -1460,6 +1473,23 @@ func endsTypeAnnotation(t jsToken) bool {
 		}
 	}
 	return false
+}
+
+func canPrecedeArrowParen(tokens []jsToken, openIdx int) bool {
+	if openIdx <= 0 {
+		return true
+	}
+	p := tokens[openIdx-1]
+	if p.kind == tokIdent {
+		if isPropertyNameAt(tokens, openIdx-1) {
+			return false
+		}
+		if p.text == "async" || keywordAllowsRegex(p.text) || keywordStartsExpressionBrace(p.text) {
+			return true
+		}
+		return tokens[openIdx].line > p.line
+	}
+	return true
 }
 
 func findArrowAfterCloseParen(tokens []jsToken, match []int, closeIdx int) int {

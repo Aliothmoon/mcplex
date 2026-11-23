@@ -102,11 +102,12 @@ type subscriber struct {
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
 
-	mu       sync.Mutex
-	overflow []Event
-	inFlight bool // pump holds the oldest queued event and is blocked sending it
-	pumping  bool
-	stopped  bool
+	mu          sync.Mutex
+	overflow    []Event
+	nonTerminal int
+	inFlight    bool // pump holds the oldest queued event and is blocked sending it
+	pumping     bool
+	stopped     bool
 }
 
 // ringSlot is one physical ring entry; dead slots were superseded (stream coalescing / terminal replacement)
@@ -285,22 +286,40 @@ func (sub *subscriber) deliver(ev Event) (dropped bool) {
 		default:
 		}
 	}
+	isTerm := isTerminalLifecycleEvent(ev)
 	sub.overflow = append(sub.overflow, ev)
+	if !isTerm {
+		sub.nonTerminal++
+	}
 	if len(sub.overflow) > subscriberOverflowCap {
 		dropIdx := -1
-		for i := range sub.overflow {
-			if !isTerminalLifecycleEvent(sub.overflow[i]) {
-				dropIdx = i
-				break
+		if sub.nonTerminal > 0 {
+			for i := range sub.overflow {
+				if !isTerminalLifecycleEvent(sub.overflow[i]) {
+					dropIdx = i
+					break
+				}
 			}
-		}
-		if dropIdx < 0 && len(sub.overflow) > subscriberOverflowHardCap {
+		} else if len(sub.overflow) > subscriberOverflowHardCap {
 			dropIdx = 0 // consumer is stuck: bound memory even for lifecycle events
 		}
 		if dropIdx >= 0 {
-			copy(sub.overflow[dropIdx:], sub.overflow[dropIdx+1:])
-			sub.overflow[len(sub.overflow)-1] = Event{}
-			sub.overflow = sub.overflow[:len(sub.overflow)-1]
+			if !isTerminalLifecycleEvent(sub.overflow[dropIdx]) {
+				sub.nonTerminal--
+			}
+			if dropIdx == 0 {
+				sub.overflow[0] = Event{}
+				sub.overflow = sub.overflow[1:]
+				if cap(sub.overflow) > 2*subscriberOverflowHardCap && cap(sub.overflow) > 2*len(sub.overflow) {
+					cp := make([]Event, len(sub.overflow))
+					copy(cp, sub.overflow)
+					sub.overflow = cp
+				}
+			} else {
+				copy(sub.overflow[dropIdx:], sub.overflow[dropIdx+1:])
+				sub.overflow[len(sub.overflow)-1] = Event{}
+				sub.overflow = sub.overflow[:len(sub.overflow)-1]
+			}
 			dropped = true
 		}
 	}
@@ -324,10 +343,14 @@ func (sub *subscriber) pump() {
 			return
 		}
 		next := sub.overflow[0]
+		if !isTerminalLifecycleEvent(next) {
+			sub.nonTerminal--
+		}
 		sub.overflow[0] = Event{}
 		sub.overflow = sub.overflow[1:]
 		if len(sub.overflow) == 0 {
 			sub.overflow = nil
+			sub.nonTerminal = 0
 		}
 		sub.inFlight = true
 		sub.mu.Unlock()
@@ -385,6 +408,7 @@ func (h *Hub) Subscribe(sessionFilter string, replay int, afterSeq int64) (<-cha
 			sub.mu.Lock()
 			sub.stopped = true
 			sub.overflow = nil
+			sub.nonTerminal = 0
 			sub.mu.Unlock()
 			close(sub.stopCh)
 			sub.wg.Wait()

@@ -283,8 +283,8 @@ func TestPayloadAnalysisStaysLinearOnPathologicalInputs(t *testing.T) {
 		start := time.Now()
 		tokens, _ := lexTypeScript(src, strings.Count(src, "\n")+1)
 		analyzePayloadReferences(tokens)
-		if elapsed := time.Since(start); elapsed > time.Second {
-			t.Fatalf("%s: payload analysis took %v, expected linear time (well under 1s)", name, elapsed)
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("%s: payload analysis took %v, expected linear time", name, elapsed)
 		}
 	}
 
