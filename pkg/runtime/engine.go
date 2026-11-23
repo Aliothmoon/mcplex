@@ -51,6 +51,7 @@ type EngineOptions struct {
 	AntigravityMode       bool // true for agy-ptc plugin; false for standalone generic mcplex
 	EnableTasks           bool // enable background tasks manager & sandbox tasks.* namespace
 	EnableEvents          bool // record live CRUD & execution events for TUI / HTTP SSE
+	PersistEvents         bool // persist live events to <dataDir>/logs/events.jsonl for cross-process TUI
 	EventHistory          int  // ring buffer capacity for EventHub (default 500)
 }
 
@@ -90,6 +91,7 @@ func NewEngine(dataDir, defaultCwd string) *Engine {
 		DataDir:         dataDir,
 		DefaultCwd:      defaultCwd,
 		AntigravityMode: true,
+		PersistEvents:   true,
 	})
 }
 
@@ -109,9 +111,13 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 	if dataDir != "" {
 		_ = os.MkdirAll(dataDir, 0o755)
 	}
+	auditor := audit.NewLogger(dataDir)
 	hub := events.NewHub(opts.EventHistory)
 	if opts.EnableEvents {
 		hub.SetAlwaysRecord(true)
+	}
+	if opts.PersistEvents && auditor.Enabled() {
+		hub.SetSink(auditor.RecordEvent)
 	}
 	return &Engine{
 		dataDir:               dataDir,
@@ -126,13 +132,47 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 		trustWorkspaceMCP:     opts.TrustWorkspaceMCP,
 		antigravityMode:       opts.AntigravityMode,
 		enableTasks:           opts.EnableTasks,
-		auditor:               audit.NewLogger(dataDir),
+		auditor:               auditor,
 		stores:                map[string]*capabilities.StateStore{},
 		bridges:               map[string]*capabilities.MCPBridge{},
 		wsRefs:                map[string]int{},
 		fileLocks:             capabilities.NewFileLockTable(),
 		events:                hub,
 	}
+}
+
+func (e *Engine) nextExecRunID() string {
+	n := e.runSeq.Add(1)
+	inst := e.events.InstanceID()
+	if len(inst) > 4 {
+		inst = inst[:4]
+	}
+	if e.antigravityMode {
+		if inst != "" {
+			return fmt.Sprintf("ptc_%s_%s_%03d", time.Now().Format("20060102_150405"), inst, n)
+		}
+		return fmt.Sprintf("ptc_%s_%03d", time.Now().Format("20060102_150405"), n)
+	}
+	if inst != "" {
+		return fmt.Sprintf("run_%s_%d", inst, n)
+	}
+	return fmt.Sprintf("run_%d", n)
+}
+
+func (e *Engine) eventSessionForCwd(sid, cwd string) string {
+	if strings.TrimSpace(sid) != "" {
+		return sid
+	}
+	clean := strings.TrimSpace(cwd)
+	if clean == "" {
+		return ""
+	}
+	norm := workspaceCacheKey(clean)
+	lbl := filepath.Base(filepath.Clean(clean))
+	if lbl != "" && lbl != "." && lbl != "/" && lbl != "\\" {
+		e.events.SetSessionLabel(norm, lbl)
+	}
+	return norm
 }
 
 type sessionCtxKey struct{}
@@ -276,13 +316,14 @@ func (e *Engine) RunReadTool(ctx context.Context, req capabilities.DirectReadReq
 	}
 	res, err := capabilities.ReadFileDirect(pol, cwd, req)
 	if e.events.Active() {
+		evSid := e.eventSessionForCwd(sid, cwd)
 		absTarget := req.Path
 		if !filepath.IsAbs(absTarget) {
 			absTarget = filepath.Join(cwd, absTarget)
 		}
 		ev := events.Event{
 			Kind:       events.KindFileRead,
-			SessionID:  sid,
+			SessionID:  evSid,
 			RunID:      runID,
 			Tool:       "read",
 			Cwd:        filepath.ToSlash(filepath.Clean(cwd)),
@@ -427,12 +468,13 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 		title = "vm_exec"
 	}
 	sid := SessionIDFromContext(ctx)
-	runID := fmt.Sprintf("run_%d", e.runSeq.Add(1))
+	evSid := e.eventSessionForCwd(sid, cwd)
+	runID := e.nextExecRunID()
 	if e.events.Active() {
 		codePrev, codeTrunc := events.CapPreview(in.Code, events.DefaultCodePreview)
 		e.events.Emit(events.Event{
 			Kind:       events.KindExecStart,
-			SessionID:  sid,
+			SessionID:  evSid,
 			RunID:      runID,
 			Tool:       "exec",
 			Cwd:        filepath.ToSlash(filepath.Clean(cwd)),
@@ -444,10 +486,10 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 		})
 	}
 
-	fsSearch := &capabilities.FSSearchBinder{Policy: pol, Locks: e.fileLocks, Events: e.events, SessionID: sid, RunID: runID}
+	fsSearch := &capabilities.FSSearchBinder{Policy: pol, Locks: e.fileLocks, Events: e.events, SessionID: evSid, RunID: runID}
 	astBinder := &capabilities.ASTBinder{Policy: pol}
-	shellGit := &capabilities.ShellGitBinder{Policy: pol, Events: e.events, SessionID: sid, RunID: runID}
-	editTx := &capabilities.EditTxBinder{Policy: pol, ShellRunner: shellGit, Locks: e.fileLocks, Events: e.events, SessionID: sid, RunID: runID}
+	shellGit := &capabilities.ShellGitBinder{Policy: pol, Events: e.events, SessionID: evSid, RunID: runID}
+	editTx := &capabilities.EditTxBinder{Policy: pol, ShellRunner: shellGit, Locks: e.fileLocks, Events: e.events, SessionID: evSid, RunID: runID}
 	stateBinder := &capabilities.StateBinder{Store: store, SessionID: sid}
 
 	timeout := sandbox.EffectiveDefaultTimeout()
@@ -515,6 +557,7 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 				statusTag = ee.Phase
 			}
 			e.auditor.Record(audit.Entry{
+				ID:            runID,
 				Cwd:           cwd,
 				Title:         title,
 				Status:        statusTag,
@@ -534,7 +577,7 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 				det, trunc := events.CapPreview(formatted, events.DefaultReadPreview)
 				e.events.Emit(events.Event{
 					Kind:       events.KindExecEnd,
-					SessionID:  sid,
+					SessionID:  evSid,
 					RunID:      runID,
 					Tool:       "exec",
 					Title:      title,
@@ -560,6 +603,7 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 		}
 		formatted := output.TruncateWithByteNotice("Error: "+execErr.Error(), maxOutBytes)
 		e.auditor.Record(audit.Entry{
+			ID:            runID,
 			Cwd:           cwd,
 			Title:         title,
 			Status:        "runtime_error",
@@ -573,7 +617,7 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 			det, trunc := events.CapPreview(formatted, events.DefaultReadPreview)
 			e.events.Emit(events.Event{
 				Kind:       events.KindExecEnd,
-				SessionID:  sid,
+				SessionID:  evSid,
 				RunID:      runID,
 				Tool:       "exec",
 				Title:      title,
@@ -606,6 +650,7 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 		errCat = audit.ClassifyError("", "", res.Traces)
 	}
 	e.auditor.Record(audit.Entry{
+		ID:            runID,
 		Cwd:           cwd,
 		Title:         title,
 		Status:        statusTag,
@@ -627,7 +672,7 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 		det, trunc := events.CapPreview(formatted, events.DefaultReadPreview)
 		e.events.Emit(events.Event{
 			Kind:       events.KindExecEnd,
-			SessionID:  sid,
+			SessionID:  evSid,
 			RunID:      runID,
 			Tool:       "exec",
 			Title:      title,

@@ -342,37 +342,140 @@ func boundedLevenshtein(a, b string, maxDist int) int {
 	return prev[lb]
 }
 
-func hashCommentLang(path string) bool {
+type preambleKind int
+
+const (
+	preambleNone preambleKind = iota
+	preambleDoc               // line or block comment
+	preambleAttr              // decorator, attribute, or C++ template<...> header
+)
+
+func isPythonPath(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".py", ".sh", ".bash", ".zsh", ".rb", ".yml", ".yaml", ".toml":
+	case ".py", ".pyw", ".star":
 		return true
 	}
 	return false
 }
 
-// leadingDocStartLine extends a symbol's 1-based startLine upward to include any directly attached
-// doc comment block (//, ///, /* ... */, /** ... */, # in Python/shell) and attributes/decorators
-// (#[...], @...) without crossing a blank line, another symbol's body, or an enclosing header.
-func leadingDocStartLine(lines []string, syms []SymbolInfo, target SymbolInfo, path string) int {
+func hashOnlyCommentLang(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".sh", ".bash", ".zsh", ".rb", ".yml", ".yaml", ".toml":
+		return true
+	}
+	return false
+}
+
+func isCppFamilyExt(ext string) bool {
+	switch ext {
+	case ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".ino":
+		return true
+	}
+	return false
+}
+
+func isCppTemplateHeader(trimmed string) bool {
+	return trimmed == "template" || strings.HasPrefix(trimmed, "template<") || strings.HasPrefix(trimmed, "template <")
+}
+
+func isGoDirectiveLine(trimmed string) (string, bool) {
+	if !strings.HasPrefix(trimmed, "//go:") {
+		return "", false
+	}
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 || len(fields[0]) <= len("//go:") {
+		return "", false
+	}
+	return fields[0], true
+}
+
+func isSupportedReplaceSymbolExt(ext string) bool {
+	switch ext {
+	case ".go", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".ino",
+		".rs", ".py", ".pyw",
+		".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts",
+		".java", ".cs", ".kt", ".kts":
+		return true
+	}
+	return false
+}
+
+func classifyFirstReplLine(normRepl, path string) preambleKind {
+	ext := strings.ToLower(filepath.Ext(path))
+	first := ""
+	for _, l := range strings.Split(normRepl, "\n") {
+		if t := strings.TrimSpace(l); t != "" {
+			first = t
+			break
+		}
+	}
+	if first == "" {
+		return preambleNone
+	}
+	if isPythonPath(path) {
+		if strings.HasPrefix(first, "#") {
+			return preambleDoc
+		}
+		if strings.HasPrefix(first, "@") {
+			return preambleAttr
+		}
+		return preambleNone
+	}
+	if hashOnlyCommentLang(path) {
+		if strings.HasPrefix(first, "#") {
+			return preambleDoc
+		}
+		return preambleNone
+	}
+	if strings.HasPrefix(first, "//") || strings.HasPrefix(first, "/*") {
+		return preambleDoc
+	}
+	switch ext {
+	case ".rs":
+		if strings.HasPrefix(first, "#[") {
+			return preambleAttr
+		}
+	case ".cs":
+		if strings.HasPrefix(first, "[") && !strings.HasPrefix(first, "[[") {
+			return preambleAttr
+		}
+	case ".java", ".kt", ".kts", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts":
+		if strings.HasPrefix(first, "@") {
+			return preambleAttr
+		}
+	default:
+		if isCppFamilyExt(ext) {
+			if isCppTemplateHeader(first) || strings.HasPrefix(first, "[[") || strings.HasPrefix(first, "__attribute__") {
+				return preambleAttr
+			}
+		}
+	}
+	return preambleNone
+}
+
+func scanSymbolPreamble(lines []string, syms []SymbolInfo, target SymbolInfo, path string) (int, map[int]preambleKind) {
+	kinds := map[int]preambleKind{}
 	if target.StartLine <= 1 || len(lines) == 0 {
-		return target.StartLine
+		return target.StartLine, kinds
 	}
 	minLine := 1
 	for _, other := range syms {
 		if other.StartLine == target.StartLine && other.EndLine == target.EndLine && other.Name == target.Name {
 			continue
 		}
-		// Never cross a preceding sibling symbol's end line.
 		if other.EndLine > 0 && other.EndLine < target.StartLine && other.EndLine+1 > minLine {
 			minLine = other.EndLine + 1
 		}
-		// Never cross an enclosing container's header line.
 		if other.StartLine < target.StartLine && other.EndLine >= target.EndLine && other.StartLine+1 > minLine {
 			minLine = other.StartLine + 1
 		}
 	}
 
-	allowHash := hashCommentLang(path)
+	ext := strings.ToLower(filepath.Ext(path))
+	pyMode := isPythonPath(path)
+	hashOnly := hashOnlyCommentLang(path)
+	cppMode := isCppFamilyExt(ext)
+
 	docStart := target.StartLine
 	line := target.StartLine - 1
 	for line >= minLine && line <= len(lines) {
@@ -380,23 +483,96 @@ func leadingDocStartLine(lines []string, syms []SymbolInfo, target SymbolInfo, p
 		if trimmed == "" {
 			break
 		}
-		if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#[") || strings.HasPrefix(trimmed, "@") {
-			docStart = line
-			line--
-			continue
+		if pyMode {
+			if strings.HasPrefix(trimmed, "#") {
+				kinds[line] = preambleDoc
+				docStart = line
+				line--
+				continue
+			}
+			if strings.HasPrefix(trimmed, "@") {
+				kinds[line] = preambleAttr
+				docStart = line
+				line--
+				continue
+			}
+			if strings.HasSuffix(trimmed, ")") {
+				foundAt := 0
+				for k := line - 1; k >= maxInt(minLine, line-8); k-- {
+					kt := strings.TrimSpace(lines[k-1])
+					if kt == "" || strings.HasPrefix(kt, "#") {
+						break
+					}
+					if strings.HasPrefix(kt, "@") && strings.Contains(kt, "(") {
+						foundAt = k
+						break
+					}
+				}
+				if foundAt > 0 {
+					for m := foundAt; m <= line; m++ {
+						kinds[m] = preambleAttr
+					}
+					docStart = foundAt
+					line = foundAt - 1
+					continue
+				}
+			}
+			break
 		}
-		if allowHash && strings.HasPrefix(trimmed, "#") {
+		if hashOnly {
+			if strings.HasPrefix(trimmed, "#") {
+				kinds[line] = preambleDoc
+				docStart = line
+				line--
+				continue
+			}
+			break
+		}
+
+		if strings.HasPrefix(trimmed, "#") {
+			if ext == ".rs" && strings.HasPrefix(trimmed, "#[") {
+				kinds[line] = preambleAttr
+				docStart = line
+				line--
+				continue
+			}
+			break
+		}
+		if ext == ".rs" && strings.HasSuffix(trimmed, "]") {
+			foundAttr := 0
+			for k := line - 1; k >= maxInt(minLine, line-8); k-- {
+				kt := strings.TrimSpace(lines[k-1])
+				if kt == "" || strings.Contains(kt, "]") {
+					break
+				}
+				if strings.HasPrefix(kt, "#[") {
+					foundAttr = k
+					break
+				}
+			}
+			if foundAttr > 0 {
+				for m := foundAttr; m <= line; m++ {
+					kinds[m] = preambleAttr
+				}
+				docStart = foundAttr
+				line = foundAttr - 1
+				continue
+			}
+		}
+
+		if strings.HasPrefix(trimmed, "//") {
+			kinds[line] = preambleDoc
 			docStart = line
 			line--
 			continue
 		}
 		if strings.HasSuffix(trimmed, "*/") {
 			if strings.HasPrefix(trimmed, "/*") {
+				kinds[line] = preambleDoc
 				docStart = line
 				line--
 				continue
 			}
-			// Code followed by an inline block comment (e.g. "var x = 1 /* note */") is not a doc comment.
 			if strings.Contains(trimmed, "/*") {
 				break
 			}
@@ -412,13 +588,225 @@ func leadingDocStartLine(lines []string, syms []SymbolInfo, target SymbolInfo, p
 				}
 			}
 			if foundStart > 0 {
+				for m := foundStart; m <= line; m++ {
+					kinds[m] = preambleDoc
+				}
 				docStart = foundStart
 				line = foundStart - 1
 				continue
 			}
 			break
 		}
+
+		switch ext {
+		case ".java", ".kt", ".kts", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts":
+			if strings.HasPrefix(trimmed, "@") {
+				kinds[line] = preambleAttr
+				docStart = line
+				line--
+				continue
+			}
+		case ".cs":
+			if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+				kinds[line] = preambleAttr
+				docStart = line
+				line--
+				continue
+			}
+		default:
+			if cppMode {
+				if isCppTemplateHeader(trimmed) ||
+					(strings.HasPrefix(trimmed, "[[") && strings.HasSuffix(trimmed, "]]")) ||
+					strings.HasPrefix(trimmed, "__attribute__") {
+					kinds[line] = preambleAttr
+					docStart = line
+					line--
+					continue
+				}
+				if strings.HasSuffix(trimmed, ">") && !strings.HasSuffix(trimmed, "->") && !strings.ContainsAny(trimmed, ";{}") {
+					foundTpl := 0
+					for k := line - 1; k >= maxInt(minLine, line-8); k-- {
+						kt := strings.TrimSpace(lines[k-1])
+						if kt == "" || strings.ContainsAny(kt, ";{}") {
+							break
+						}
+						if isCppTemplateHeader(kt) {
+							foundTpl = k
+							break
+						}
+					}
+					if foundTpl > 0 {
+						for m := foundTpl; m <= line; m++ {
+							kinds[m] = preambleAttr
+						}
+						docStart = foundTpl
+						line = foundTpl - 1
+						continue
+					}
+				}
+			}
+		}
 		break
 	}
+	return docStart, kinds
+}
+
+func leadingDocStartLine(lines []string, syms []SymbolInfo, target SymbolInfo, path string) int {
+	docStart, _ := scanSymbolPreamble(lines, syms, target, path)
 	return docStart
+}
+
+func verifyReplaceableSymbol(lines []string, syms []SymbolInfo, sym SymbolInfo, relPath string) error {
+	ext := strings.ToLower(filepath.Ext(relPath))
+	if !isSupportedReplaceSymbolExt(ext) {
+		return sandbox.NewHostError(sandbox.KindBadArgs, nil,
+			"%s: replaceSymbol is not supported for %q files; use target or target+endTarget", relPath, ext)
+	}
+	if sym.StartLine < 1 || sym.EndLine < sym.StartLine || sym.EndLine > len(lines) {
+		return sandbox.NewHostError(sandbox.KindBadArgs, nil,
+			"%s: symbol %s has invalid line span L%d-%d", relPath, sym.Name, sym.StartLine, sym.EndLine)
+	}
+	if sym.unclosed {
+		return sandbox.NewHostError(sandbox.KindBadArgs, nil,
+			"%s: symbol %s (L%d-%d) has unclosed braces/quotes or syntax errors; use a standard target hunk",
+			relPath, sym.Name, sym.StartLine, sym.EndLine)
+	}
+
+	startRaw := lines[sym.StartLine-1]
+	startIndent := countIndent(startRaw)
+
+	for _, other := range syms {
+		if other.StartLine > sym.StartLine && other.StartLine <= sym.EndLine {
+			if countIndent(lines[other.StartLine-1]) <= startIndent {
+				return sandbox.NewHostError(sandbox.KindBadArgs, nil,
+					"%s: symbol %s boundary uncertain (overlaps peer symbol %s at L%d); use target+endTarget or target hunk",
+					relPath, sym.Name, other.Name, other.StartLine)
+			}
+		}
+	}
+
+	if ext == ".py" || ext == ".pyw" {
+		stTrim := strings.TrimSpace(startRaw)
+		if !strings.HasPrefix(stTrim, "def ") && !strings.HasPrefix(stTrim, "async def ") && !strings.HasPrefix(stTrim, "class ") {
+			return sandbox.NewHostError(sandbox.KindBadArgs, nil,
+				"%s: symbol %s at L%d does not start at a Python def/class line", relPath, sym.Name, sym.StartLine)
+		}
+		pyStates := scanPythonLines(lines)
+		endSt := pyStates[sym.EndLine-1]
+		if endSt.endTriple != "" || endSt.endParen != 0 {
+			return sandbox.NewHostError(sandbox.KindBadArgs, nil,
+				"%s: symbol %s (L%d-%d) ends inside an unclosed string or parenthesis; use a standard target hunk",
+				relPath, sym.Name, sym.StartLine, sym.EndLine)
+		}
+		return nil
+	}
+
+	if ext != ".go" && !sym.hasBraces {
+		return sandbox.NewHostError(sandbox.KindBadArgs, nil,
+			"%s: symbol %s (L%d-%d) has no brace-delimited body; use a standard target hunk",
+			relPath, sym.Name, sym.StartLine, sym.EndLine)
+	}
+	if sym.EndLine > sym.StartLine {
+		endRaw := lines[sym.EndLine-1]
+		endTrim := strings.TrimSpace(endRaw)
+		validClose := strings.HasPrefix(endTrim, "}") || (ext == ".go" && sym.Kind == "type" && strings.HasPrefix(endTrim, ")"))
+		startLead, _ := splitLeadingHSpace(startRaw)
+		endLead, _ := splitLeadingHSpace(endRaw)
+		if !validClose || startLead != endLead {
+			return sandbox.NewHostError(sandbox.KindBadArgs, nil,
+				"%s: symbol %s closing line L%d does not align with declaration L%d; use target+endTarget or target hunk",
+				relPath, sym.Name, sym.EndLine, sym.StartLine)
+		}
+	} else if sym.hasBraces {
+		endTrim := strings.TrimSpace(lines[sym.EndLine-1])
+		if idx := strings.Index(endTrim, "//"); idx >= 0 {
+			endTrim = strings.TrimSpace(endTrim[:idx])
+		}
+		if !strings.HasSuffix(endTrim, "}") && !strings.HasSuffix(endTrim, "};") {
+			return sandbox.NewHostError(sandbox.KindBadArgs, nil,
+				"%s: single-line symbol %s at L%d does not end with '}'", relPath, sym.Name, sym.StartLine)
+		}
+	}
+	return nil
+}
+
+func resolveSymbolReplaceSpan(lines []string, syms []SymbolInfo, sym SymbolInfo, relPath, normRepl string) (int, int, string, error) {
+	if err := verifyReplaceableSymbol(lines, syms, sym, relPath); err != nil {
+		return 0, 0, "", err
+	}
+	preambleTop, kinds := scanSymbolPreamble(lines, syms, sym, relPath)
+	replKind := classifyFirstReplLine(normRepl, relPath)
+
+	repStart := sym.StartLine
+	docStatus := ""
+	if preambleTop < sym.StartLine {
+		if replKind == preambleNone {
+			repStart = sym.StartLine
+			docStatus = "doc kept"
+		} else {
+			earliest := 0
+			for ln := preambleTop; ln < sym.StartLine; ln++ {
+				if kinds[ln] == replKind {
+					earliest = ln
+					break
+				}
+			}
+			if earliest > 0 {
+				repStart = earliest
+				if repStart > preambleTop {
+					docStatus = "doc kept"
+				} else {
+					docStatus = "doc replaced"
+				}
+			} else {
+				repStart = sym.StartLine
+				docStatus = "doc kept"
+			}
+		}
+	}
+
+	ext := strings.ToLower(filepath.Ext(relPath))
+	if ext == ".go" && repStart < sym.StartLine {
+		for ln := repStart; ln < sym.StartLine; ln++ {
+			if dir, ok := isGoDirectiveLine(strings.TrimSpace(lines[ln-1])); ok {
+				if !replContainsLinePrefix(normRepl, dir) {
+					return 0, 0, "", sandbox.NewHostError(sandbox.KindBadArgs, nil,
+						"%s: symbol %s has compiler directive %s at L%d missing from replacement; include %s in replacement or omit leading doc comments",
+						relPath, sym.Name, dir, ln, dir)
+				}
+			}
+		}
+	}
+	if isCppFamilyExt(ext) && repStart < sym.StartLine {
+		for ln := repStart; ln < sym.StartLine; ln++ {
+			if isCppTemplateHeader(strings.TrimSpace(lines[ln-1])) {
+				if !replContainsTemplate(normRepl) {
+					return 0, 0, "", sandbox.NewHostError(sandbox.KindBadArgs, nil,
+						"%s: symbol %s has a template<...> header at L%d missing from replacement; include template<...> in replacement or omit leading doc comments",
+						relPath, sym.Name, ln)
+				}
+			}
+		}
+	}
+
+	return repStart, sym.EndLine, docStatus, nil
+}
+
+func replContainsLinePrefix(normRepl, prefix string) bool {
+	for _, l := range strings.Split(normRepl, "\n") {
+		t := strings.TrimSpace(l)
+		if t == prefix || strings.HasPrefix(t, prefix+" ") || strings.HasPrefix(t, prefix+"\t") {
+			return true
+		}
+	}
+	return false
+}
+
+func replContainsTemplate(normRepl string) bool {
+	for _, l := range strings.Split(normRepl, "\n") {
+		if isCppTemplateHeader(strings.TrimSpace(l)) {
+			return true
+		}
+	}
+	return false
 }

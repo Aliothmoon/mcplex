@@ -8,6 +8,7 @@ require (
 	github.com/charmbracelet/x/ansi v0.10.1
 	github.com/dop251/goja v0.0.0-20261118204651-8dfece3d1e1d
 	github.com/evanw/esbuild v0.28.2
+	github.com/mattn/go-isatty v0.0.20
 	github.com/muesli/termenv v0.16.0
 )
 
@@ -21,7 +22,6 @@ require (
 	github.com/go-sourcemap/sourcemap v2.1.3+incompatible // indirect
 	github.com/google/pprof v0.0.0-20230207041349-798e818bf904 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
-	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
 	github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6 // indirect

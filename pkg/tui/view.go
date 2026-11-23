@@ -97,10 +97,14 @@ func (m *Model) renderEmptyState() []string {
 		lines[i] = paintLineBg("", colorCanvas, m.width)
 	}
 
+	listenVerb := "Listening on "
+	if m.cfg.ModeLabel == "logs" {
+		listenVerb = "Watching "
+	}
 	cardW := min(m.width-6, 74)
 	if cardW < 40 {
 		// Compact fallback on narrow terminals
-		msg := "  " + styleBrandMark.Render("◆") + " " + styleGroupText.Render("Listening on "+m.cfg.Endpoint)
+		msg := "  " + styleBrandMark.Render("◆") + " " + styleGroupText.Render(listenVerb+m.cfg.Endpoint)
 		if m.bodyHeight > 1 {
 			lines[1] = paintLineBg(msg, colorCanvas, m.width)
 		}
@@ -127,12 +131,15 @@ func (m *Model) renderEmptyState() []string {
 		if m.cfg.OAuthEnabled {
 			oauthBadge = "  " + styleTokenPill.Render(" OAuth 2.1 ")
 		}
-		titleRow := "  " + styleBrandMark.Render("◆") + "  " + styleBrand.Render("MCPlex Console") + "  " + styleDim.Render("v"+m.cfg.Version) + oauthBadge
+		titleRow := "  " + styleBrandMark.Render("◆") + "  " + styleBrand.Render(m.brandName()+" Console") + "  " + styleDim.Render("v"+m.cfg.Version) + oauthBadge
 		var infoRows []string
 		if strings.TrimSpace(m.cfg.PublicEndpoint) != "" {
 			pubRow := "     " + styleLiveDot.Render("●") + " " + styleMuted.Render("Public MCP  ") + stylePath.Render(m.cfg.PublicEndpoint) + "  " + styleDim.Render("[u] copy")
 			locRow := "       " + styleDim.Render("Local HTTP  "+m.cfg.Endpoint)
 			infoRows = append(infoRows, pubRow, locRow)
+		} else if m.cfg.ModeLabel == "logs" {
+			statusRow := "     " + styleLiveDot.Render("●") + " " + styleMuted.Render("Watching ") + stylePath.Render(m.cfg.Endpoint)
+			infoRows = append(infoRows, statusRow)
 		} else {
 			statusRow := "     " + styleLiveDot.Render("●") + " " + styleMuted.Render("Listening on ") + stylePath.Render(m.cfg.Endpoint) + "  " + styleDim.Render("[u] copy")
 			infoRows = append(infoRows, statusRow)
@@ -160,6 +167,9 @@ func (m *Model) renderEmptyState() []string {
 		k1 := "  " + styleFooterKey.Render("↑ ↓") + styleDim.Render("  navigate feed        ") + styleFooterKey.Render("enter / click") + styleDim.Render("  fold & expand")
 		k2 := "  " + styleFooterKey.Render("← →") + styleDim.Render("  toolbar & tree       ") + styleFooterKey.Render("o / dbl-click") + styleDim.Render("  inspect modal")
 		k3 := "  " + styleFooterKey.Render("/") + styleDim.Render("    search & regex       ") + styleFooterKey.Render("t / u        ") + styleDim.Render("  copy token / URL")
+		if m.cfg.ModeLabel == "logs" {
+			k3 = "  " + styleFooterKey.Render("/") + styleDim.Render("    search & regex       ") + styleFooterKey.Render("s / 1-5      ") + styleDim.Render("  workspace / filter")
+		}
 
 		card = append(card, bdr.Render("│")+paintLineBg("", colorSurface, innerW)+bdr.Render("│"))
 		card = append(card, bdr.Render("│")+paintLineBg(titleRow, colorSurface, innerW)+bdr.Render("│"))
@@ -202,7 +212,7 @@ func (m *Model) renderHeaderBar() string {
 		status = styleRunDot.Render(fmt.Sprintf("%s Running %d", m.currentSpinner(), n))
 	}
 
-	prefix := " " + styleBrandMark.Render("◆") + " " + styleBrand.Render("MCPlex") +
+	prefix := " " + styleBrandMark.Render("◆") + " " + styleBrand.Render(m.brandName()) +
 		styleDim.Render(" v"+m.cfg.Version) +
 		styleFooterSep.Render("  ·  ")
 	ep := m.primaryEndpoint()
@@ -353,7 +363,11 @@ func (m *Model) renderFooterBar() string {
 		if m.token != "" || m.cfg.RotateToken != nil {
 			tokHint = sep + hint("t/T", "token")
 		}
-		left = " " + hint("←→", "select") + sep + hint("enter", "apply") + sep + hint("↓/tab", "feed") + tokHint + sep + hint("1-4", "filter") + sep + hint("q", "quit")
+		fk := "1-4"
+		if m.cfg.ShowErrorsTab {
+			fk = "1-5"
+		}
+		left = " " + hint("←→", "select") + sep + hint("enter", "apply") + sep + hint("↓/tab", "feed") + tokHint + sep + hint(fk, "filter") + sep + hint("q", "quit")
 	} else {
 		tokHint := ""
 		if m.token != "" || m.cfg.RotateToken != nil {

@@ -22,6 +22,8 @@ type SymbolInfo struct {
 	Signature string `json:"signature,omitempty"`
 	StartLine int    `json:"startLine"`
 	EndLine   int    `json:"endLine"`
+	unclosed  bool
+	hasBraces bool
 }
 
 // FileOutline groups extracted symbols for a file.
@@ -182,13 +184,13 @@ func extractFileOutline(workspaceCwd, absPath string) (FileOutline, error) {
 	return FileOutline{File: relDisplayPath(workspaceCwd, absPath), TotalLines: len(lines), Symbols: syms}, nil
 }
 
-// extractGoASTSymbols uses Go's standard `go/parser` for 100% exact AST line ranges on Go files.
 func extractGoASTSymbols(absPath string, src []byte, lines []string) ([]SymbolInfo, bool) {
 	fset := token.NewFileSet()
-	fileNode, err := parser.ParseFile(fset, absPath, src, parser.SkipObjectResolution)
-	if err != nil && fileNode == nil {
+	fileNode, parseErr := parser.ParseFile(fset, absPath, src, parser.SkipObjectResolution)
+	if parseErr != nil && fileNode == nil {
 		return nil, false
 	}
+	hasSyntaxErr := parseErr != nil
 
 	syms := []SymbolInfo{}
 	clampLines := func(start, end int) (int, int) {
@@ -224,6 +226,8 @@ func extractGoASTSymbols(absPath string, src []byte, lines []string) ([]SymbolIn
 				Signature: sig,
 				StartLine: start,
 				EndLine:   end,
+				unclosed:  hasSyntaxErr,
+				hasBraces: d.Body != nil,
 			})
 		case *ast.GenDecl:
 			for _, spec := range d.Specs {
@@ -237,17 +241,22 @@ func extractGoASTSymbols(absPath string, src []byte, lines []string) ([]SymbolIn
 					}
 					start, end = clampLines(start, end)
 					kind := "type"
+					hasBraces := false
 					switch s.Type.(type) {
 					case *ast.StructType:
 						kind = "struct"
+						hasBraces = true
 					case *ast.InterfaceType:
 						kind = "interface"
+						hasBraces = true
 					}
 					syms = append(syms, SymbolInfo{
 						Kind:      kind,
 						Name:      s.Name.Name,
 						StartLine: start,
 						EndLine:   end,
+						unclosed:  hasSyntaxErr,
+						hasBraces: hasBraces,
 					})
 				}
 			}
@@ -282,26 +291,34 @@ var (
 
 func extractGenericSymbols(ext string, lines []string) []SymbolInfo {
 	switch ext {
-	case ".py":
+	case ".py", ".pyw", ".star":
 		return extractIndentSymbols(lines)
 	case ".md", ".markdown":
 		return extractMarkdownSections(lines)
 	case ".rs":
-		return extractBraceSymbols(lines, rustSymRegex)
+		return extractBraceSymbolsExt(lines, rustSymRegex, ext)
 	case ".java", ".cs":
-		return extractBraceSymbols(lines, javaSymRegex)
+		return extractBraceSymbolsExt(lines, javaSymRegex, ext)
 	case ".kt", ".kts":
-		return extractBraceSymbols(lines, kotlinSymRegex)
+		return extractBraceSymbolsExt(lines, kotlinSymRegex, ext)
 	case ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".ino":
-		return extractCppSymbols(lines)
+		return extractCppSymbolsExt(lines, ext)
 	default:
-		return extractBraceSymbols(lines, tsSymRegex)
+		return extractBraceSymbolsExt(lines, tsSymRegex, ext)
 	}
 }
 
 func extractBraceSymbols(lines []string, declRe *regexp.Regexp) []SymbolInfo {
+	return extractBraceSymbolsExt(lines, declRe, "")
+}
+
+func extractBraceSymbolsExt(lines []string, declRe *regexp.Regexp, ext string) []SymbolInfo {
 	syms := []SymbolInfo{}
+	inBlockStart := scanBlockCommentStarts(lines, ext)
 	for i := 0; i < len(lines); i++ {
+		if inBlockStart[i] {
+			continue
+		}
 		m := declRe.FindStringSubmatch(lines[i])
 		if len(m) < 3 && declRe == rustSymRegex {
 			if im := rustImplRegex.FindStringSubmatch(lines[i]); im != nil {
@@ -325,14 +342,16 @@ func extractBraceSymbols(lines []string, declRe *regexp.Regexp) []SymbolInfo {
 		kind := m[1]
 		name := m[2]
 		if name == "" {
-			if kind != "object" { // Kotlin `companion object {`
+			if kind != "object" {
 				continue
 			}
 			name = "Companion"
 		}
-		end := findBraceEnd(lines, i, declRe.MatchString)
+		end, seenOpen, unclosed := findBraceEndLexed(lines, i, ext, inBlockStart, declRe.MatchString)
 		if declRe == kotlinSymRegex && kotlinExprBody.MatchString(lines[i]) {
-			end = i // `fun x(): Int = 1` has no braces
+			end = i
+			seenOpen = false
+			unclosed = false
 		}
 		syms = append(syms, SymbolInfo{
 			Kind:      kind,
@@ -340,26 +359,225 @@ func extractBraceSymbols(lines []string, declRe *regexp.Regexp) []SymbolInfo {
 			Signature: strings.TrimSpace(lines[i]),
 			StartLine: i + 1,
 			EndLine:   end + 1,
+			unclosed:  unclosed,
+			hasBraces: seenOpen,
 		})
 	}
 	return syms
 }
 
-// findBraceEnd returns the line closing the block opened at/after startIdx. isDecl stops the search when another
-// declaration starts before any `{` (bodyless declarations must not swallow the next symbol's braces).
+func isJSLikeExt(ext string) bool {
+	switch ext {
+	case ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts":
+		return true
+	}
+	return false
+}
+
+func scanClosedCharLiteral(line string, start int) int {
+	k := start + 1
+	if k >= len(line) {
+		return -1
+	}
+	if line[k] == '\\' {
+		k++
+		limit := minInt(len(line), k+12)
+		for k < limit {
+			if line[k] == '\'' {
+				return k + 1
+			}
+			k++
+		}
+		return -1
+	}
+	b := line[k]
+	if b == '\'' {
+		return -1
+	}
+	width := 1
+	if b >= 0x80 {
+		for k+width < len(line) && (line[k+width]&0xC0) == 0x80 {
+			width++
+		}
+	}
+	if k+width < len(line) && line[k+width] == '\'' {
+		return k + width + 1
+	}
+	return -1
+}
+
+func scanBlockCommentStarts(lines []string, ext string) []bool {
+	out := make([]bool, len(lines))
+	inBlock := false
+	inBacktick := false
+	jsLike := isJSLikeExt(ext)
+	for i, line := range lines {
+		out[i] = inBlock
+		for j := 0; j < len(line); {
+			if inBlock {
+				if j+1 < len(line) && line[j] == '*' && line[j+1] == '/' {
+					inBlock = false
+					j += 2
+					continue
+				}
+				j++
+				continue
+			}
+			if inBacktick {
+				if line[j] == '\\' && j+1 < len(line) {
+					j += 2
+					continue
+				}
+				if line[j] == '`' {
+					inBacktick = false
+				}
+				j++
+				continue
+			}
+			if j+1 < len(line) && line[j] == '/' && line[j+1] == '/' {
+				break
+			}
+			if j+1 < len(line) && line[j] == '/' && line[j+1] == '*' {
+				inBlock = true
+				j += 2
+				continue
+			}
+			if line[j] == '"' {
+				j++
+				for j < len(line) {
+					if line[j] == '\\' && j+1 < len(line) {
+						j += 2
+						continue
+					}
+					if line[j] == '"' {
+						j++
+						break
+					}
+					j++
+				}
+				continue
+			}
+			if jsLike && line[j] == '\'' {
+				j++
+				for j < len(line) {
+					if line[j] == '\\' && j+1 < len(line) {
+						j += 2
+						continue
+					}
+					if line[j] == '\'' {
+						j++
+						break
+					}
+					j++
+				}
+				continue
+			}
+			if jsLike && line[j] == '`' {
+				inBacktick = true
+				j++
+				continue
+			}
+			if !jsLike && line[j] == '\'' {
+				if next := scanClosedCharLiteral(line, j); next > j {
+					j = next
+					continue
+				}
+			}
+			j++
+		}
+	}
+	return out
+}
+
 func findBraceEnd(lines []string, startIdx int, isDecl func(string) bool) int {
+	end, _, _ := findBraceEndLexed(lines, startIdx, "", nil, isDecl)
+	return end
+}
+
+func findBraceEndLexed(lines []string, startIdx int, ext string, inBlockStart []bool, isDecl func(string) bool) (endIdx int, seenOpen bool, unclosed bool) {
 	depth := 0
-	seenOpen := false
+	inBlock := false
+	if startIdx >= 0 && startIdx < len(inBlockStart) {
+		inBlock = inBlockStart[startIdx]
+	}
+	inBacktick := false
+	jsLike := isJSLikeExt(ext)
+
 	for i := startIdx; i < len(lines); i++ {
 		line := lines[i]
-		if !seenOpen && i > startIdx && isDecl != nil && isDecl(line) {
-			return startIdx
+		if !inBlock && !inBacktick && !seenOpen && i > startIdx && isDecl != nil && isDecl(line) {
+			return startIdx, false, false
 		}
-		// Strip line comment heuristic
-		if idx := strings.Index(line, "//"); idx >= 0 {
-			line = line[:idx]
-		}
-		for j := 0; j < len(line); j++ {
+		for j := 0; j < len(line); {
+			if inBlock {
+				if j+1 < len(line) && line[j] == '*' && line[j+1] == '/' {
+					inBlock = false
+					j += 2
+					continue
+				}
+				j++
+				continue
+			}
+			if inBacktick {
+				if line[j] == '\\' && j+1 < len(line) {
+					j += 2
+					continue
+				}
+				if line[j] == '`' {
+					inBacktick = false
+				}
+				j++
+				continue
+			}
+			if j+1 < len(line) && line[j] == '/' && line[j+1] == '/' {
+				break
+			}
+			if j+1 < len(line) && line[j] == '/' && line[j+1] == '*' {
+				inBlock = true
+				j += 2
+				continue
+			}
+			if line[j] == '"' {
+				j++
+				for j < len(line) {
+					if line[j] == '\\' && j+1 < len(line) {
+						j += 2
+						continue
+					}
+					if line[j] == '"' {
+						j++
+						break
+					}
+					j++
+				}
+				continue
+			}
+			if jsLike && line[j] == '\'' {
+				j++
+				for j < len(line) {
+					if line[j] == '\\' && j+1 < len(line) {
+						j += 2
+						continue
+					}
+					if line[j] == '\'' {
+						j++
+						break
+					}
+					j++
+				}
+				continue
+			}
+			if jsLike && line[j] == '`' {
+				inBacktick = true
+				j++
+				continue
+			}
+			if !jsLike && line[j] == '\'' {
+				if next := scanClosedCharLiteral(line, j); next > j {
+					j = next
+					continue
+				}
+			}
 			switch line[j] {
 			case '{':
 				depth++
@@ -367,26 +585,105 @@ func findBraceEnd(lines []string, startIdx int, isDecl func(string) bool) int {
 			case '}':
 				depth--
 				if seenOpen && depth <= 0 {
-					return i
+					return i, true, false
 				}
 			}
+			j++
 		}
-		if !seenOpen && strings.HasSuffix(strings.TrimSpace(line), ";") {
-			return i
+		if !inBlock && !inBacktick && !seenOpen && strings.HasSuffix(strings.TrimSpace(line), ";") {
+			return i, false, false
 		}
-		if !seenOpen && i-startIdx > 25 {
-			return startIdx
+		if !inBlock && !inBacktick && !seenOpen && i-startIdx > 25 {
+			return startIdx, false, false
 		}
 	}
 	if seenOpen {
-		return len(lines) - 1
+		return len(lines) - 1, true, true
 	}
-	return startIdx
+	return startIdx, false, false
+}
+
+type pyLineState struct {
+	startTriple string
+	startParen  int
+	endTriple   string
+	endParen    int
+}
+
+func scanPythonLines(lines []string) []pyLineState {
+	out := make([]pyLineState, len(lines))
+	curTriple := ""
+	curParen := 0
+
+	for idx, s := range lines {
+		st := pyLineState{startTriple: curTriple, startParen: curParen}
+		for k := 0; k < len(s); {
+			if curTriple != "" {
+				if s[k] == '\\' && k+1 < len(s) {
+					k += 2
+					continue
+				}
+				if strings.HasPrefix(s[k:], curTriple) {
+					curTriple = ""
+					k += 3
+					continue
+				}
+				k++
+				continue
+			}
+			if s[k] == '#' {
+				break
+			}
+			if strings.HasPrefix(s[k:], `"""`) {
+				curTriple = `"""`
+				k += 3
+				continue
+			}
+			if strings.HasPrefix(s[k:], `'''`) {
+				curTriple = `'''`
+				k += 3
+				continue
+			}
+			if s[k] == '"' || s[k] == '\'' {
+				q := s[k]
+				k++
+				for k < len(s) {
+					if s[k] == '\\' && k+1 < len(s) {
+						k += 2
+						continue
+					}
+					if s[k] == q {
+						k++
+						break
+					}
+					k++
+				}
+				continue
+			}
+			switch s[k] {
+			case '(', '[', '{':
+				curParen++
+			case ')', ']', '}':
+				if curParen > 0 {
+					curParen--
+				}
+			}
+			k++
+		}
+		st.endTriple = curTriple
+		st.endParen = curParen
+		out[idx] = st
+	}
+	return out
 }
 
 func extractIndentSymbols(lines []string) []SymbolInfo {
 	syms := []SymbolInfo{}
+	pyStates := scanPythonLines(lines)
 	for i := 0; i < len(lines); i++ {
+		if pyStates[i].startTriple != "" || pyStates[i].startParen > 0 {
+			continue
+		}
 		m := pySymRegex.FindStringSubmatch(lines[i])
 		if len(m) < 4 {
 			continue
@@ -394,6 +691,11 @@ func extractIndentSymbols(lines []string) []SymbolInfo {
 		baseIndent := countIndent(m[1])
 		end := i
 		for j := i + 1; j < len(lines); j++ {
+			st := pyStates[j]
+			if st.startTriple != "" || st.startParen > 0 {
+				end = j
+				continue
+			}
 			trimmed := strings.TrimSpace(lines[j])
 			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 				continue
@@ -404,12 +706,14 @@ func extractIndentSymbols(lines []string) []SymbolInfo {
 			}
 			end = j
 		}
+		unclosed := pyStates[end].endTriple != "" || pyStates[end].endParen != 0
 		syms = append(syms, SymbolInfo{
 			Kind:      m[2],
 			Name:      m[3],
 			Signature: strings.TrimSpace(lines[i]),
 			StartLine: i + 1,
 			EndLine:   end + 1,
+			unclosed:  unclosed,
 		})
 	}
 	return syms
@@ -469,15 +773,21 @@ var cppNonDecl = map[string]bool{
 	"sizeof": true, "catch": true, "decltype": true, "static_assert": true, "alignof": true,
 }
 
-// extractCppSymbols outlines C/C++: namespaces, classes/structs/enums, and function definitions
-// (free, in-class, `Type::method`, ctors/dtors). Pure declarations ending in `;` are skipped.
 func extractCppSymbols(lines []string) []SymbolInfo {
+	return extractCppSymbolsExt(lines, ".cpp")
+}
+
+func extractCppSymbolsExt(lines []string, ext string) []SymbolInfo {
 	syms := []SymbolInfo{}
+	inBlockStart := scanBlockCommentStarts(lines, ext)
 	isDecl := func(l string) bool {
 		t := strings.TrimSpace(l)
 		return !strings.HasSuffix(t, ";") && (cppTypeRegex.MatchString(l) || cppFuncRegex.MatchString(l) || cppCtorRegex.MatchString(l))
 	}
 	for i, line := range lines {
+		if inBlockStart[i] {
+			continue
+		}
 		t := strings.TrimSpace(line)
 		if t == "" || strings.HasPrefix(t, "//") || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "*") || strings.HasSuffix(t, ";") {
 			continue
@@ -497,11 +807,19 @@ func extractCppSymbols(lines []string) []SymbolInfo {
 		if name == "" || cppNonDecl[leaf] {
 			continue
 		}
-		end := findBraceEnd(lines, i, isDecl)
-		if end == i && !strings.Contains(line, "{") {
-			continue // declaration split across lines or macro-like call without a body
+		end, seenOpen, unclosed := findBraceEndLexed(lines, i, ext, inBlockStart, isDecl)
+		if end == i && !seenOpen {
+			continue
 		}
-		syms = append(syms, SymbolInfo{Kind: kind, Name: name, Signature: t, StartLine: i + 1, EndLine: end + 1})
+		syms = append(syms, SymbolInfo{
+			Kind:      kind,
+			Name:      name,
+			Signature: t,
+			StartLine: i + 1,
+			EndLine:   end + 1,
+			unclosed:  unclosed,
+			hasBraces: seenOpen,
+		})
 	}
 	return syms
 }

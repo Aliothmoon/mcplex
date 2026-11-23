@@ -85,30 +85,35 @@ Example:
 	{
 		ID:      "edit",
 		Title:   "edit — Scoped Multi-File Atomic Edits",
-		Summary: "edit.apply (symbol/nth/range/dryRun/verify) and edit.replace",
-		Aliases: []string{"replace", "patch", "hunk", "hunks"},
-		Body: `- ` + "`await edit.apply({ edits: [{ path, hunks: [{ target, replacement, symbol?, nth?, startLine?, endLine?, replaceAll? }], create?, overwrite? }], dryRun?, bestEffort?, verify? })`" + `
-  - ` + "`symbol: \"Type::method\"`" + ` restricts matching to that symbol (including attached leading doc comments & attributes/decorators).
-  - ` + "`nth: 2`" + ` targets the Nth occurrence; ` + "`dryRun: true`" + ` previews ` + "`.diff`" + ` without writing.
-- Single hunk shortcut: ` + "`await edit.replace(path, target, replacement, { symbol?, nth?, replaceAll? })`" + `
-- Always pass multiline replacement code in ` + "`payloads`" + ` (` + "`P.newCode`" + `) to avoid escaping errors.
+		Summary: "edit.replaceSymbol (0 target), endTarget span, edit.apply, edit.replace",
+		Aliases: []string{"replace", "replaceSymbol", "endTarget", "patch", "hunk", "hunks"},
+		Body: `- **Low-token whole-symbol rewrite (recommended for full functions/methods/structs)**:
+  - ` + "`await edit.replaceSymbol(path, \"Type::method\", P.newCode)`" + ` (0 ` + "`target`" + ` tokens; auto-preserves leading doc comments/decorators unless ` + "`P.newCode`" + ` includes them).
+- **Low-token boundary-anchored span (` + "`endTarget`" + `, recommended for 10–120 line blocks)**:
+  - ` + "`{ symbol?: \"fn\", target: \"<start line>\", endTarget: \"<end line>\", replacement: P.newBlock }`" + ` (replaces closed span ` + "`[target .. endTarget]`" + ` without copying middle lines).
+- **Scoped multi-file / micro-hunk edits**:
+  - ` + "`await edit.apply({ edits: [{ path, hunks: [{ target, endTarget?, replacement, symbol?, replaceSymbol?, nth?, startLine?, endLine?, replaceAll? }], create?, overwrite? }], dryRun?, bestEffort?, verify? })`" + `
+  - ` + "`symbol: \"Type::method\"`" + ` restricts matching to that symbol; ` + "`nth: 2`" + ` targets the Nth occurrence; ` + "`dryRun: true`" + ` previews ` + "`.diff`" + `.
+- Single hunk shortcut: ` + "`await edit.replace(path, target, replacement, { symbol?, endTarget?, nth?, replaceAll? })`" + `
+- Always pass multiline replacement code in ` + "`payloads`" + ` (` + "`P.newCode`" + `) to avoid JS backslash escaping issues.
 
 Example:
-` + "```ts\nawait edit.replace(\"pkg/config.go\", \"Timeout = 5\", \"Timeout = 15\", { symbol: \"DefaultConfig\" });\n```",
+` + "```ts\nawait edit.replaceSymbol(\"pkg/config.go\", \"LoadConfig\", P.newLoadConfig);\nawait edit.replace(\"pkg/config.go\", \"Timeout = 5\", \"Timeout = 15\", { symbol: \"DefaultConfig\" });\n```",
 	},
 	{
 		ID:      "tx",
 		Title:   "tx — Atomic Multi-File Transactions with Auto-Rollback",
-		Summary: "tx.begin() -> edit, write, rm, rename, verify, diff, status, commit, rollback",
+		Summary: "tx.begin() -> replaceSymbol, edit, write, rm, rename, verify, diff, status, commit, rollback",
 		Aliases: []string{"transaction", "transactions", "rollback", "commit", "diff", "verify"},
 		Body: `- ` + "`const t = await tx.begin();`" + `
-- Operations: ` + "`t.edit(pathOrSpecs, hunks?)`" + `, ` + "`t.write(path, content, { eol? })`" + `, ` + "`t.rm(path)`" + `, ` + "`t.rename(from, to)`" + `
-  - Tip: pass all files to one ` + "`await t.edit([{ path, hunks }, ...])`" + ` so every hunk validates before any file is written.
+- Operations: ` + "`t.replaceSymbol(path, symbol, replacement)`" + `, ` + "`t.edit(pathOrSpecs, hunks?)`" + `, ` + "`t.write(path, content, { eol? })`" + `, ` + "`t.rm(path)`" + `, ` + "`t.rename(from, to)`" + `
+  - Prefer ` + "`t.replaceSymbol`" + ` (0 ` + "`target`" + ` tokens) for whole functions/methods, ` + "`{ symbol, target, endTarget, replacement }`" + ` for 10–120 line blocks, and ` + "`{ symbol, target, replacement }`" + ` for 1–5 line tweaks.
+  - Pass all files to one ` + "`await t.edit([{ path, hunks }, ...])`" + ` — every hunk across every file is validated upfront before anything is written.
 - Inspection & checks: ` + "`await t.diff()`" + `, ` + "`await t.status()`" + `, ` + "`await t.verify(commands, { cwd?, concurrency?, timeoutSec?, compact? })`" + ` (items in ` + "`commands`" + ` can be strings or ` + "`{ cmd, cwd?, name?, timeoutMs? }`" + `)
 - Finalize: ` + "`await t.commit()`" + ` (MUST call to keep changes; uncommitted ` + "`tx`" + ` auto-rolls back on exit!) or ` + "`await t.rollback()`" + `.
 
 Example:
-` + "```ts\nconst t = await tx.begin();\nawait t.edit(\"pkg/a.go\", [{ target: P.oldA, replacement: P.newA }]);\nconst v = await t.verify([\"go vet ./...\", \"go test ./pkg/...\"]);\nif (!v.ok) { await t.rollback(); print(v.failures); return { ok: false }; }\nawait t.commit();\nreturn { ok: true, summary: v.summary };\n```",
+` + "```ts\nconst t = await tx.begin();\nawait t.replaceSymbol(\"pkg/a.go\", \"Service.Run\", P.newRun);\nawait t.edit(\"pkg/b.go\", [{ symbol: \"Init\", target: \"timeout := 5\", replacement: \"timeout := 15\" }]);\nconst v = await t.verify([\"go vet ./...\", \"go test ./pkg/...\"]);\nif (!v.ok) { await t.rollback(); print(v.failures); return { ok: false }; }\nawait t.commit();\nreturn { ok: true, summary: v.summary };\n```",
 	},
 	{
 		ID:      "sh",

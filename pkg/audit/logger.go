@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aliothmoon/mcplex/pkg/events"
 	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
 )
@@ -72,6 +73,25 @@ func NewLogger(dataDir string) *Logger {
 	_ = os.MkdirAll(dir, 0o700)
 	_ = os.Chmod(dir, 0o700)
 	return &Logger{logsDir: dir}
+}
+
+// Enabled reports whether file-backed audit/event logging is active.
+func (l *Logger) Enabled() bool {
+	return l != nil && l.logsDir != ""
+}
+
+// RecordEvent appends a structured runtime Event to `<dataDir>/logs/events.jsonl` for cross-process TUI streaming.
+// High-frequency `stream_chunk` deltas are skipped (the terminal shell/task event carries full capped output).
+func (l *Logger) RecordEvent(ev events.Event) {
+	if l == nil || l.logsDir == "" || ev.Kind == events.KindStreamChunk {
+		return
+	}
+	if ev.Timestamp == "" {
+		ev.Timestamp = time.Now().Format(time.RFC3339)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.appendJSONL(filepath.Join(l.logsDir, "events.jsonl"), ev, maxLogFileBytes)
 }
 
 func capAuditLogs(logs []string) []string {

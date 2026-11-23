@@ -22,13 +22,15 @@ import (
 
 // EditHunk represents a single non-overlapping replacement inside a file.
 type EditHunk struct {
-	Target      string `json:"target"`
-	Replacement string `json:"replacement"`
-	StartLine   int    `json:"startLine,omitempty"`
-	EndLine     int    `json:"endLine,omitempty"`
-	ReplaceAll  bool   `json:"replaceAll,omitempty"`
-	Nth         int    `json:"nth,omitempty"`    // 1-based: replace only the Nth match (like sed s/x/y/N)
-	Symbol      string `json:"symbol,omitempty"` // restrict matching to a symbol's lines, e.g. "Editor::on_escape"
+	Target        string `json:"target"`
+	EndTarget     string `json:"endTarget,omitempty"` // optional end boundary anchor: replaces closed span [target .. endTarget]
+	Replacement   string `json:"replacement"`
+	StartLine     int    `json:"startLine,omitempty"`
+	EndLine       int    `json:"endLine,omitempty"`
+	ReplaceAll    bool   `json:"replaceAll,omitempty"`
+	Nth           int    `json:"nth,omitempty"`           // 1-based: replace only the Nth match (like sed s/x/y/N)
+	Symbol        string `json:"symbol,omitempty"`        // restrict matching to a symbol's lines, e.g. "Editor::on_escape"
+	ReplaceSymbol bool   `json:"replaceSymbol,omitempty"` // replace entire resolved symbol span (0 target tokens)
 }
 
 // FileEditSpec describes edits or creation for one file.
@@ -49,6 +51,7 @@ type plannedFileWrite struct {
 	newBytes     []byte
 	hunksApplied int
 	lineDelta    int
+	spanLabels   []string
 }
 
 type fileSnapshot struct {
@@ -165,12 +168,36 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 				Path: p,
 				Hunks: []EditHunk{{
 					Target:      target,
+					EndTarget:   firstString(opts, "endTarget", "end_target"),
 					Replacement: repl,
 					StartLine:   optInt(opts, "startLine", 0),
 					EndLine:     optInt(opts, "endLine", 0),
 					ReplaceAll:  optBool(opts, "replaceAll", optBool(opts, "all", false)),
 					Nth:         optInt(opts, "nth", optInt(opts, "occurrence", 0)),
 					Symbol:      firstString(opts, "symbol", "in"),
+				}},
+			}
+			return b.applyFileSpecsWithOwner(ctx, env.Cwd, env.ExecID, []FileEditSpec{spec}, false, false, nil)
+		},
+		"replaceSymbol": func(ctx context.Context, args []any) (any, error) {
+			if len(args) < 3 {
+				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "edit.replaceSymbol requires (path, symbol, replacement)")
+			}
+			p, _ := args[0].(string)
+			sym, _ := args[1].(string)
+			repl, ok := args[2].(string)
+			if !ok {
+				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "edit.replaceSymbol replacement must be a string")
+			}
+			if strings.TrimSpace(sym) == "" {
+				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "edit.replaceSymbol requires non-empty symbol")
+			}
+			spec := FileEditSpec{
+				Path: p,
+				Hunks: []EditHunk{{
+					Symbol:        sym,
+					ReplaceSymbol: true,
+					Replacement:   repl,
 				}},
 			}
 			return b.applyFileSpecsWithOwner(ctx, env.Cwd, env.ExecID, []FileEditSpec{spec}, false, false, nil)
@@ -214,6 +241,37 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 			txMu.Lock()
 			defer txMu.Unlock()
 			return b.applyFileSpecsWithOwner(ctx, env.Cwd, env.ExecID, specs, false, false, tx)
+		},
+		"_replaceSymbol": func(ctx context.Context, args []any) (any, error) {
+			id, _ := requireStringArg(args, 0, "id")
+			if len(args) < 4 {
+				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "t.replaceSymbol requires (path, symbol, replacement)")
+			}
+			p, _ := args[1].(string)
+			sym, _ := args[2].(string)
+			repl, ok := args[3].(string)
+			if !ok {
+				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "t.replaceSymbol replacement must be a string")
+			}
+			if strings.TrimSpace(sym) == "" {
+				return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "t.replaceSymbol requires non-empty symbol")
+			}
+			txMu.Lock()
+			tx, active := txMap[id]
+			if !active || tx.committed || tx.rolledBack {
+				txMu.Unlock()
+				return nil, fmt.Errorf("transaction '%s' is not active", id)
+			}
+			defer txMu.Unlock()
+			spec := FileEditSpec{
+				Path: p,
+				Hunks: []EditHunk{{
+					Symbol:        sym,
+					ReplaceSymbol: true,
+					Replacement:   repl,
+				}},
+			}
+			return b.applyFileSpecsWithOwner(ctx, env.Cwd, env.ExecID, []FileEditSpec{spec}, false, false, tx)
 		},
 		"_write": func(ctx context.Context, args []any) (any, error) {
 			id, _ := requireStringArg(args, 0, "id")
@@ -656,6 +714,7 @@ func (b *EditTxBinder) applyFileSpecsWithOwner(ctx context.Context, cwd, execOwn
 	}
 
 	var planned []plannedFileWrite
+	var planErrs []error
 	for _, m := range merged {
 		pw, planErr := planSingleFile(m.absPath, m.rel, m.spec)
 		if planErr != nil {
@@ -663,9 +722,13 @@ func (b *EditTxBinder) applyFileSpecsWithOwner(ctx context.Context, cwd, execOwn
 				failures = append(failures, map[string]any{"path": m.rel, "error": planErr.Error()})
 				continue
 			}
-			return nil, planErr
+			planErrs = append(planErrs, planErr)
+			continue
 		}
 		planned = append(planned, pw)
+	}
+	if len(planErrs) > 0 {
+		return nil, combinePlanErrors(planErrs)
 	}
 
 	if !dryRun {
@@ -751,11 +814,15 @@ func (b *EditTxBinder) applyFileSpecsWithOwner(ctx context.Context, cwd, execOwn
 
 	applied := make([]map[string]any, len(planned))
 	for i, pw := range planned {
-		applied[i] = map[string]any{
+		entry := map[string]any{
 			"path":      pw.relPath,
 			"hunks":     pw.hunksApplied,
 			"lineDelta": pw.lineDelta,
 		}
+		if len(pw.spanLabels) > 0 {
+			entry["spans"] = pw.spanLabels
+		}
+		applied[i] = entry
 	}
 	res := map[string]any{
 		"ok":      len(failures) == 0,
@@ -827,12 +894,16 @@ func planSingleFile(absPath, relPath string, spec FileEditSpec) (plannedFileWrit
 	lineStarts := computeLineOffsets(normText)
 
 	type span struct {
-		start int
-		end   int
-		repl  string
-		idx   int
+		start     int
+		end       int
+		repl      string
+		idx       int
+		startLine int
+		endLine   int
+		label     string
 	}
 	var spans []span
+	var hunkErrs []error
 
 	var syms []SymbolInfo
 	var symLines []string
@@ -844,15 +915,59 @@ func planSingleFile(absPath, relPath string, spec FileEditSpec) (plannedFileWrit
 		}
 		return syms
 	}
+
+	var pyStates []pyLineState
+	pyStatesLoaded := false
+	getPyStates := func() []pyLineState {
+		if !pyStatesLoaded {
+			pyStates = scanPythonLines(strings.Split(normText, "\n"))
+			pyStatesLoaded = true
+		}
+		return pyStates
+	}
 	sep := symbolSep(relPath)
 
 	for hIdx, h := range spec.Hunks {
+		normRepl := strings.ReplaceAll(h.Replacement, "\r\n", "\n")
+
+		if h.ReplaceSymbol {
+			s, sErr := resolveSymbol(outline(), h.Symbol, relPath)
+			if sErr != nil {
+				hunkErrs = append(hunkErrs, prefixHunkErr(sErr, hIdx))
+				continue
+			}
+			repStart, repEnd, docStatus, vErr := resolveSymbolReplaceSpan(symLines, outline(), s, relPath, normRepl)
+			if vErr != nil {
+				hunkErrs = append(hunkErrs, prefixHunkErr(vErr, hIdx))
+				continue
+			}
+			alignedRepl := alignSymbolReplacementIndent(symLines[repStart-1], normRepl, relPath)
+			alignedRepl = strings.TrimSuffix(alignedRepl, "\n")
+			spStart, spEnd := exactLineSpanOffsets(normText, lineStarts, repStart, repEnd)
+			qName := qualifiedName(outline(), s, sep)
+			lbl := fmt.Sprintf("L%d-%d (symbol %s)", repStart, repEnd, qName)
+			if docStatus != "" {
+				lbl = fmt.Sprintf("L%d-%d (symbol %s, %s)", repStart, repEnd, qName, docStatus)
+			}
+			spans = append(spans, span{
+				start:     spStart,
+				end:       spEnd,
+				repl:      alignedRepl,
+				idx:       hIdx,
+				startLine: repStart,
+				endLine:   repEnd,
+				label:     lbl,
+			})
+			continue
+		}
+
 		normTarget := strings.ReplaceAll(h.Target, "\r\n", "\n")
 		scope := fmt.Sprintf("L%d-%d", h.StartLine, h.EndLine)
 		if h.Symbol != "" {
 			s, sErr := resolveSymbol(outline(), h.Symbol, relPath)
 			if sErr != nil {
-				return plannedFileWrite{}, prefixHunkErr(sErr, hIdx)
+				hunkErrs = append(hunkErrs, prefixHunkErr(sErr, hIdx))
+				continue
 			}
 			symStart := leadingDocStartLine(symLines, syms, s, relPath)
 			if h.StartLine < symStart {
@@ -863,15 +978,38 @@ func planSingleFile(absPath, relPath string, spec FileEditSpec) (plannedFileWrit
 			}
 			scope = h.Symbol + fmt.Sprintf(" (L%d-%d)", symStart, s.EndLine)
 		}
-		normRepl := strings.ReplaceAll(h.Replacement, "\r\n", "\n")
 		if normTarget == "" {
-			return plannedFileWrite{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s hunk %d: empty target", relPath, hIdx+1)
+			hunkErrs = append(hunkErrs, sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s hunk %d: empty target", relPath, hIdx+1))
+			continue
 		}
 		winStart, winEnd, wErr := lineWindowBounds(normText, lineStarts, h.StartLine, h.EndLine)
 		if wErr != nil {
-			return plannedFileWrite{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s hunk %d: %v", relPath, hIdx+1, wErr)
+			hunkErrs = append(hunkErrs, sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s hunk %d: %v", relPath, hIdx+1, wErr))
+			continue
 		}
 		windowText := normText[winStart:winEnd]
+
+		if h.EndTarget != "" {
+			normEnd := strings.ReplaceAll(h.EndTarget, "\r\n", "\n")
+			spStart, spEnd, adjRepl, sLine, eLine, bErr := resolveEndTargetHunk(
+				normText, windowText, normTarget, normEnd, normRepl, relPath, scope,
+				h, hIdx, winStart, lineStarts, outline, sep, getPyStates,
+			)
+			if bErr != nil {
+				hunkErrs = append(hunkErrs, bErr)
+				continue
+			}
+			spans = append(spans, span{
+				start:     spStart,
+				end:       spEnd,
+				repl:      adjRepl,
+				idx:       hIdx,
+				startLine: sLine,
+				endLine:   eLine,
+				label:     fmt.Sprintf("L%d-%d", sLine, eLine),
+			})
+			continue
+		}
 
 		if h.ReplaceAll {
 			searchOff := 0
@@ -883,28 +1021,50 @@ func planSingleFile(absPath, relPath string, spec FileEditSpec) (plannedFileWrit
 				}
 				absStart := winStart + searchOff + idx
 				absEnd := absStart + len(normTarget)
-				spans = append(spans, span{start: absStart, end: absEnd, repl: normRepl, idx: hIdx})
+				sLine := offsetToLineNumber(lineStarts, absStart)
+				eLine := offsetToLineNumber(lineStarts, maxInt(absStart, absEnd-1))
+				spans = append(spans, span{
+					start:     absStart,
+					end:       absEnd,
+					repl:      normRepl,
+					idx:       hIdx,
+					startLine: sLine,
+					endLine:   eLine,
+					label:     fmt.Sprintf("L%d-%d", sLine, eLine),
+				})
 				searchOff += idx + len(normTarget)
 				count++
 			}
 			if count == 0 {
 				hint := closestLineHint(normText, normTarget)
-				return plannedFileWrite{}, sandbox.NewHostError(sandbox.KindNoMatch, nil, "%s hunk %d: target not found%s", relPath, hIdx+1, hint)
+				hunkErrs = append(hunkErrs, sandbox.NewHostError(sandbox.KindNoMatch, nil, "%s hunk %d: target not found%s", relPath, hIdx+1, hint))
 			}
 		} else {
 			firstIdx := strings.Index(windowText, normTarget)
 			if firstIdx < 0 {
-				// Check if target exists outside the specified startLine..endLine window (drifted lines hint!)
-				if (h.StartLine > 0 || h.EndLine > 0 || h.Symbol != "") && strings.Contains(normText, normTarget) {
-					actualOff := strings.Index(normText, normTarget)
-					actualLine := offsetToLineNumber(lineStarts, actualOff)
-					return plannedFileWrite{}, sandbox.NewHostError(sandbox.KindNoMatch, map[string]any{"lines": []int{actualLine}}, "%s hunk %d: target not in %s; exact match at L%d", relPath, hIdx+1, scope, actualLine)
+				if h.StartLine > 0 || h.EndLine > 0 || h.Symbol != "" {
+					if actualLine := findTargetAnywhereLine(normText, normTarget, relPath, lineStarts, getPyStates); actualLine > 0 {
+						hunkErrs = append(hunkErrs, sandbox.NewHostError(sandbox.KindNoMatch, map[string]any{"lines": []int{actualLine}},
+							"%s hunk %d: target not in %s; exact match at L%d", relPath, hIdx+1, scope, actualLine))
+						continue
+					}
 				}
-				// Fallback: quote-aware horizontal whitespace & indent normalization when strictly unique (count == 1).
 				if h.Nth <= 1 {
-					wsStart, wsEnd, wsRepl, wsLines := matchWhitespaceNormalized(windowText, normTarget, normRepl, relPath, winStart, lineStarts)
+					wsStart, wsEnd, wsRepl, wsLines := matchWhitespaceNormalized(windowText, normTarget, normRepl, relPath, winStart, lineStarts, getPyStates)
 					if len(wsLines) == 1 {
-						spans = append(spans, span{start: winStart + wsStart, end: winStart + wsEnd, repl: wsRepl, idx: hIdx})
+						absStart := winStart + wsStart
+						absEnd := winStart + wsEnd
+						sLine := offsetToLineNumber(lineStarts, absStart)
+						eLine := offsetToLineNumber(lineStarts, maxInt(absStart, absEnd-1))
+						spans = append(spans, span{
+							start:     absStart,
+							end:       absEnd,
+							repl:      wsRepl,
+							idx:       hIdx,
+							startLine: sLine,
+							endLine:   eLine,
+							label:     fmt.Sprintf("L%d-%d", sLine, eLine),
+						})
 						continue
 					}
 					if len(wsLines) > 1 {
@@ -912,19 +1072,22 @@ func planSingleFile(absPath, relPath string, spec FileEditSpec) (plannedFileWrit
 						for i, l := range wsLines {
 							where[i] = symbolAt(outline(), l, sep)
 						}
-						return plannedFileWrite{}, sandbox.NewHostError(sandbox.KindAmbiguous, map[string]any{"lines": wsLines, "symbols": where},
-							"%s hunk %d: target matches %d places via whitespace normalization (%s); set symbol or startLine/endLine", relPath, hIdx+1, len(wsLines), formatMatchList(wsLines, where, 6))
+						hunkErrs = append(hunkErrs, sandbox.NewHostError(sandbox.KindAmbiguous, map[string]any{"lines": wsLines, "symbols": where},
+							"%s hunk %d: target matches %d places via whitespace normalization (%s); set symbol or startLine/endLine", relPath, hIdx+1, len(wsLines), formatMatchList(wsLines, where, 6)))
+						continue
 					}
 				}
 				hint := closestLineHint(normText, normTarget)
-				return plannedFileWrite{}, sandbox.NewHostError(sandbox.KindNoMatch, nil, "%s hunk %d: target not found%s", relPath, hIdx+1, hint)
+				hunkErrs = append(hunkErrs, sandbox.NewHostError(sandbox.KindNoMatch, nil, "%s hunk %d: target not found%s", relPath, hIdx+1, hint))
+				continue
 			}
 			if h.Nth > 0 {
 				offs := matchOffsets(windowText, normTarget)
 				if h.Nth > len(offs) {
 					lines := matchLines(windowText, normTarget, winStart, lineStarts)
-					return plannedFileWrite{}, sandbox.NewHostError(sandbox.KindNoMatch, map[string]any{"lines": lines},
-						"%s hunk %d: nth %d but only %d match(es) (%s)", relPath, hIdx+1, h.Nth, len(offs), formatLineList(lines, 6))
+					hunkErrs = append(hunkErrs, sandbox.NewHostError(sandbox.KindNoMatch, map[string]any{"lines": lines},
+						"%s hunk %d: nth %d but only %d match(es) (%s)", relPath, hIdx+1, h.Nth, len(offs), formatLineList(lines, 6)))
+					continue
 				}
 				firstIdx = offs[h.Nth-1]
 			} else if strings.Contains(windowText[firstIdx+len(normTarget):], normTarget) {
@@ -933,27 +1096,52 @@ func planSingleFile(absPath, relPath string, spec FileEditSpec) (plannedFileWrit
 				for i, l := range lines {
 					where[i] = symbolAt(outline(), l, sep)
 				}
-				return plannedFileWrite{}, sandbox.NewHostError(sandbox.KindAmbiguous, map[string]any{"lines": lines, "symbols": where},
-					"%s hunk %d: target matches %d places (%s); set symbol, nth, or replaceAll: true", relPath, hIdx+1, len(lines), formatMatchList(lines, where, 6))
+				hunkErrs = append(hunkErrs, sandbox.NewHostError(sandbox.KindAmbiguous, map[string]any{"lines": lines, "symbols": where},
+					"%s hunk %d: target matches %d places (%s); set symbol, nth, or replaceAll: true", relPath, hIdx+1, len(lines), formatMatchList(lines, where, 6)))
+				continue
 			}
 			absStart := winStart + firstIdx
-			spans = append(spans, span{start: absStart, end: absStart + len(normTarget), repl: normRepl, idx: hIdx})
+			absEnd := absStart + len(normTarget)
+			sLine := offsetToLineNumber(lineStarts, absStart)
+			eLine := offsetToLineNumber(lineStarts, maxInt(absStart, absEnd-1))
+			spans = append(spans, span{
+				start:     absStart,
+				end:       absEnd,
+				repl:      normRepl,
+				idx:       hIdx,
+				startLine: sLine,
+				endLine:   eLine,
+				label:     fmt.Sprintf("L%d-%d", sLine, eLine),
+			})
 		}
 	}
 
 	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
 	for i := 1; i < len(spans); i++ {
 		if spans[i].start < spans[i-1].end {
-			return plannedFileWrite{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s: hunks %d and %d overlap", relPath, spans[i-1].idx+1, spans[i].idx+1)
+			a, bSpan := spans[i-1], spans[i]
+			if a.idx > bSpan.idx {
+				a, bSpan = bSpan, a
+			}
+			hunkErrs = append(hunkErrs, sandbox.NewHostError(sandbox.KindBadArgs, nil,
+				"%s: hunks %d (L%d-%d) and %d (L%d-%d) overlap",
+				relPath, a.idx+1, a.startLine, a.endLine, bSpan.idx+1, bSpan.startLine, bSpan.endLine))
 		}
+	}
+	if len(hunkErrs) > 0 {
+		return plannedFileWrite{}, combinePlanErrors(hunkErrs)
 	}
 
 	var bld strings.Builder
+	var spanLabels []string
 	cursor := 0
 	for _, sp := range spans {
 		bld.WriteString(normText[cursor:sp.start])
 		bld.WriteString(sp.repl)
 		cursor = sp.end
+		if sp.label != "" {
+			spanLabels = append(spanLabels, sp.label)
+		}
 	}
 	bld.WriteString(normText[cursor:])
 	finalNorm := bld.String()
@@ -975,6 +1163,7 @@ func planSingleFile(absPath, relPath string, spec FileEditSpec) (plannedFileWrit
 		newBytes:     []byte(finalOut),
 		hunksApplied: len(spans),
 		lineDelta:    newLines - oldLines,
+		spanLabels:   spanLabels,
 	}, nil
 }
 
@@ -1191,33 +1380,201 @@ func trackMultilineBackticks(lines []string, btEscape bool) []bool {
 	return startsInBT
 }
 
-// matchWhitespaceNormalized attempts a quote-aware horizontal whitespace / indent normalized line-block
-// match inside windowText. It succeeds ONLY if target contains substantive code tokens (>=6 alnum/CJK runes)
-// and matches strictly 1 unique location (or returns >1 line numbers so caller reports KindAmbiguous).
-func matchWhitespaceNormalized(windowText, normTarget, normRepl, relPath string, winStart int, lineStarts []int) (start, end int, adjustedRepl string, matchedLineNums []int) {
-	trimmedTarget := strings.TrimSuffix(normTarget, "\n")
-	hasTrailingNL := strings.HasSuffix(normTarget, "\n")
-	if trimmedTarget == "" {
-		return 0, 0, "", nil
+func isPythonContinuationPath(relPath string) bool {
+	switch strings.ToLower(filepath.Ext(relPath)) {
+	case ".py", ".pyw", ".star":
+		return true
 	}
-	identRunes := 0
-	for _, r := range trimmedTarget {
+	return false
+}
+
+func isBraceConservationExt(relPath string) bool {
+	switch strings.ToLower(filepath.Ext(relPath)) {
+	case ".go", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".ino",
+		".rs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts",
+		".java", ".cs", ".kt", ".kts":
+		return true
+	}
+	return false
+}
+
+func countIdentRunes(s string) int {
+	n := 0
+	for _, r := range s {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			identRunes++
+			n++
 		}
 	}
-	if identRunes < 6 {
-		return 0, 0, "", nil
+	return n
+}
+
+func canonicalizePythonLine(s string, keepIndent bool) string {
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	lead := s[:i]
+	rest := strings.TrimRight(s[i:], " \t")
+	if keepIndent {
+		for j := 0; j < len(lead); j++ {
+			if lead[j] == '\t' {
+				b.WriteString("    ")
+			} else {
+				b.WriteByte(' ')
+			}
+		}
+		b.WriteString("::")
 	}
 
-	keepIndent := isIndentSensitivePath(relPath)
-	btEscape := isBacktickEscapeLang(relPath)
+	inSpace := false
+	for k := 0; k < len(rest); {
+		if strings.HasPrefix(rest[k:], `"""`) || strings.HasPrefix(rest[k:], `'''`) {
+			if inSpace {
+				b.WriteByte(' ')
+				inSpace = false
+			}
+			delim := rest[k : k+3]
+			b.WriteString(delim)
+			k += 3
+			for k < len(rest) {
+				if rest[k] == '\\' && k+1 < len(rest) {
+					b.WriteString(rest[k : k+2])
+					k += 2
+					continue
+				}
+				if strings.HasPrefix(rest[k:], delim) {
+					b.WriteString(delim)
+					k += 3
+					break
+				}
+				b.WriteByte(rest[k])
+				k++
+			}
+			continue
+		}
+		c := rest[k]
+		if c == '"' || c == '\'' {
+			if inSpace {
+				b.WriteByte(' ')
+				inSpace = false
+			}
+			b.WriteByte(c)
+			k++
+			for k < len(rest) {
+				if rest[k] == '\\' && k+1 < len(rest) {
+					b.WriteString(rest[k : k+2])
+					k += 2
+					continue
+				}
+				b.WriteByte(rest[k])
+				if rest[k] == c {
+					k++
+					break
+				}
+				k++
+			}
+			continue
+		}
+		if c == ' ' || c == '\t' {
+			inSpace = true
+			k++
+			continue
+		}
+		if inSpace {
+			b.WriteByte(' ')
+			inSpace = false
+		}
+		r, w := utf8.DecodeRuneInString(rest[k:])
+		b.WriteRune(r)
+		k += w
+	}
+	return b.String()
+}
+
+func matchWhitespaceNormalized(windowText, normTarget, normRepl, relPath string, winStart int, lineStarts []int, getPyStates func() []pyLineState) (start, end int, adjustedRepl string, matchedLineNums []int) {
+	offs, repls, lines := matchWhitespaceNormalizedAll(windowText, normTarget, normRepl, relPath, winStart, lineStarts, getPyStates)
+	if len(offs) != 1 {
+		return 0, 0, "", lines
+	}
+	return offs[0][0], offs[0][1], repls[0], lines
+}
+
+func matchWhitespaceNormalizedAll(windowText, normTarget, normRepl, relPath string, winStart int, lineStarts []int, getPyStates func() []pyLineState) (relSpans [][2]int, adjustedRepls []string, matchedLineNums []int) {
+	trimmedTarget := strings.TrimSuffix(normTarget, "\n")
+	hasTrailingNL := strings.HasSuffix(normTarget, "\n")
+	if trimmedTarget == "" || countIdentRunes(trimmedTarget) < 6 {
+		return nil, nil, nil
+	}
+
 	tLines := strings.Split(trimmedTarget, "\n")
 	k := len(tLines)
 	wLines := splitWindowLines(windowText)
 	if len(wLines) < k {
-		return 0, 0, "", nil
+		return nil, nil, nil
 	}
+
+	if isPythonContinuationPath(relPath) && getPyStates != nil {
+		pyStates := getPyStates()
+		winStartLine := offsetToLineNumber(lineStarts, winStart)
+
+		tStrict := make([]string, k)
+		tRelaxed := make([]string, k)
+		for j, tl := range tLines {
+			tStrict[j] = canonicalizePythonLine(tl, true)
+			tRelaxed[j] = canonicalizePythonLine(tl, false)
+		}
+
+		wStrict := make([]string, len(wLines))
+		wRelaxed := make([]string, len(wLines))
+		for i, wl := range wLines {
+			wStrict[i] = canonicalizePythonLine(wl.raw, true)
+			wRelaxed[i] = canonicalizePythonLine(wl.raw, false)
+		}
+
+		for i := 0; i <= len(wLines)-k; i++ {
+			ok := true
+			for j := 0; j < k; j++ {
+				fIdx := (winStartLine - 1) + i + j
+				var st pyLineState
+				if fIdx >= 0 && fIdx < len(pyStates) {
+					st = pyStates[fIdx]
+				}
+				if st.startTriple != "" {
+					if wLines[i+j].raw != tLines[j] {
+						ok = false
+						break
+					}
+				} else if st.startParen > 0 {
+					if wRelaxed[i+j] != tRelaxed[j] {
+						ok = false
+						break
+					}
+				} else {
+					if wStrict[i+j] != tStrict[j] {
+						ok = false
+						break
+					}
+				}
+			}
+			if ok {
+				s := wLines[i].start
+				e := wLines[i+k-1].end
+				if hasTrailingNL && e < len(windowText) && windowText[e] == '\n' {
+					e++
+				}
+				relSpans = append(relSpans, [2]int{s, e})
+				adjustedRepls = append(adjustedRepls, normRepl)
+				matchedLineNums = append(matchedLineNums, offsetToLineNumber(lineStarts, winStart+s))
+			}
+		}
+		return relSpans, adjustedRepls, matchedLineNums
+	}
+
+	keepIndent := isIndentSensitivePath(relPath)
+	btEscape := isBacktickEscapeLang(relPath)
 
 	tCanon := make([]string, k)
 	tInBT := false
@@ -1231,7 +1588,6 @@ func matchWhitespaceNormalized(windowText, normTarget, normRepl, relPath string,
 		wCanon[i], wInBT = canonicalizeCodeLineStateful(wl.raw, keepIndent, wInBT, btEscape)
 	}
 
-	var hitIndices []int
 	for i := 0; i <= len(wLines)-k; i++ {
 		ok := true
 		for j := 0; j < k; j++ {
@@ -1241,28 +1597,370 @@ func matchWhitespaceNormalized(windowText, normTarget, normRepl, relPath string,
 			}
 		}
 		if ok {
-			hitIndices = append(hitIndices, i)
-			matchedLineNums = append(matchedLineNums, offsetToLineNumber(lineStarts, winStart+wLines[i].start))
+			s := wLines[i].start
+			e := wLines[i+k-1].end
+			if hasTrailingNL && e < len(windowText) && windowText[e] == '\n' {
+				e++
+			}
+			adj := realignReplacementIndent(wLines[i:i+k], tLines, normRepl, keepIndent, btEscape)
+			relSpans = append(relSpans, [2]int{s, e})
+			adjustedRepls = append(adjustedRepls, adj)
+			matchedLineNums = append(matchedLineNums, offsetToLineNumber(lineStarts, winStart+s))
 		}
 	}
-	if len(hitIndices) != 1 {
-		return 0, 0, "", matchedLineNums
-	}
-
-	idx := hitIndices[0]
-	start = wLines[idx].start
-	end = wLines[idx+k-1].end
-	if hasTrailingNL && end < len(windowText) && windowText[end] == '\n' {
-		end++
-	}
-
-	adjustedRepl = realignReplacementIndent(wLines[idx:idx+k], tLines, normRepl, keepIndent, btEscape)
-	return start, end, adjustedRepl, matchedLineNums
+	return relSpans, adjustedRepls, matchedLineNums
 }
 
-// realignReplacementIndent adjusts uniform leading-indent drift between targetLines and matched fileLines
-// so over- or under-indented hunks land with the file's actual indentation while leaving multiline backtick
-// raw/template string interiors untouched.
+func findAnchorCandidates(windowText, normAnchor, relPath string, winStart int, lineStarts []int, getPyStates func() []pyLineState) (relSpans [][2]int, lines []int, exact bool) {
+	offs := matchOffsets(windowText, normAnchor)
+	if len(offs) > 0 {
+		relSpans = make([][2]int, len(offs))
+		lines = make([]int, len(offs))
+		for i, o := range offs {
+			relSpans[i] = [2]int{o, o + len(normAnchor)}
+			lines[i] = offsetToLineNumber(lineStarts, winStart+o)
+		}
+		return relSpans, lines, true
+	}
+	wsSpans, _, wsLines := matchWhitespaceNormalizedAll(windowText, normAnchor, "", relPath, winStart, lineStarts, getPyStates)
+	return wsSpans, wsLines, false
+}
+
+func findTargetAnywhereLine(normText, normTarget, relPath string, lineStarts []int, getPyStates func() []pyLineState) int {
+	if idx := strings.Index(normText, normTarget); idx >= 0 {
+		return offsetToLineNumber(lineStarts, idx)
+	}
+	_, _, wsLines := matchWhitespaceNormalizedAll(normText, normTarget, "", relPath, 0, lineStarts, getPyStates)
+	if len(wsLines) > 0 {
+		return wsLines[0]
+	}
+	return 0
+}
+
+const defaultMaxEndTargetSpanLines = 120
+
+func resolveEndTargetHunk(
+	normText, windowText, normStart, normEnd, normRepl, relPath, scope string,
+	h EditHunk, hIdx, winStart int, lineStarts []int,
+	outline func() []SymbolInfo, sep string, getPyStates func() []pyLineState,
+) (absStart, absEnd int, finalRepl string, sLine, eLine int, err error) {
+	endBody := strings.TrimSuffix(normEnd, "\n")
+	if h.EndLine == 0 && !strings.Contains(endBody, "\n") && isBoilerplateAnchorLine(strings.TrimSpace(endBody)) && countIdentRunes(endBody) < 6 {
+		return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindBadArgs, nil,
+			"%s hunk %d: endTarget %q is a bare closing delimiter; include the preceding statement in endTarget (e.g. \"return ok;\\n}\"), set endLine, or use replaceSymbol",
+			relPath, hIdx+1, strings.TrimSpace(endBody))
+	}
+
+	startSpans, startLines, startExact := findAnchorCandidates(windowText, normStart, relPath, winStart, lineStarts, getPyStates)
+	if len(startSpans) == 0 {
+		if h.StartLine > 0 || h.EndLine > 0 || h.Symbol != "" {
+			if actualLine := findTargetAnywhereLine(normText, normStart, relPath, lineStarts, getPyStates); actualLine > 0 {
+				return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindNoMatch, map[string]any{"lines": []int{actualLine}},
+					"%s hunk %d: start target not in %s; match found at L%d", relPath, hIdx+1, scope, actualLine)
+			}
+		}
+		hint := closestLineHint(normText, normStart)
+		return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindNoMatch, nil, "%s hunk %d: start target not found%s", relPath, hIdx+1, hint)
+	}
+	if len(startSpans) > 1 {
+		where := make([]string, len(startLines))
+		for i, l := range startLines {
+			where[i] = symbolAt(outline(), l, sep)
+		}
+		return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindAmbiguous, map[string]any{"lines": startLines, "symbols": where},
+			"%s hunk %d: start target matches %d places (%s); set symbol or startLine/endLine",
+			relPath, hIdx+1, len(startLines), formatMatchList(startLines, where, 6))
+	}
+
+	sRel := startSpans[0]
+	sLine = startLines[0]
+	sEndLine := offsetToLineNumber(lineStarts, winStart+maxInt(sRel[0], sRel[1]-1))
+
+	afterOff := sRel[1]
+	subEnd := len(windowText)
+	cappedBy120 := false
+	if h.Symbol == "" && h.EndLine == 0 {
+		maxLine := sEndLine + defaultMaxEndTargetSpanLines
+		if maxLine < len(lineStarts) {
+			capRel := lineStarts[maxLine] - winStart
+			if capRel < subEnd && capRel >= afterOff {
+				subEnd = capRel
+				cappedBy120 = true
+			}
+		}
+	}
+
+	subWindow := windowText[afterOff:subEnd]
+	endSpans, endLines, _ := findAnchorCandidates(subWindow, normEnd, relPath, winStart+afterOff, lineStarts, getPyStates)
+	if len(endSpans) == 0 {
+		if cappedBy120 && subEnd < len(windowText) {
+			farSpans, farLines, _ := findAnchorCandidates(windowText[subEnd:], normEnd, relPath, winStart+subEnd, lineStarts, getPyStates)
+			if len(farSpans) > 0 {
+				return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindNoMatch, map[string]any{"lines": []int{farLines[0]}},
+					"%s hunk %d: target matched at L%d, but endTarget is at L%d (%d lines away, exceeds %d-line span limit); set symbol or endLine",
+					relPath, hIdx+1, sLine, farLines[0], farLines[0]-sLine, defaultMaxEndTargetSpanLines)
+			}
+		}
+		hint := closestLineHint(subWindow, normEnd)
+		return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindNoMatch, nil,
+			"%s hunk %d: target matched at L%d, but endTarget not found after L%d%s", relPath, hIdx+1, sLine, sLine, hint)
+	}
+	if len(endSpans) > 1 {
+		where := make([]string, len(endLines))
+		for i, l := range endLines {
+			where[i] = symbolAt(outline(), l, sep)
+		}
+		return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindAmbiguous, map[string]any{"lines": endLines, "symbols": where},
+			"%s hunk %d: endTarget matches %d places after L%d (%s); include preceding statement in endTarget or set endLine",
+			relPath, hIdx+1, len(endLines), sLine, formatMatchList(endLines, where, 6))
+	}
+
+	totalRelStart := sRel[0]
+	totalRelEnd := afterOff + endSpans[0][1]
+	absStart = winStart + totalRelStart
+	absEnd = winStart + totalRelEnd
+	eLine = offsetToLineNumber(lineStarts, maxInt(absStart, absEnd-1))
+
+	// If `target` started with whitespace (intended as a full-line anchor with approximate indent) and matched as
+	// a suffix of line sLine's leading indentation while `replacement` supplies its own leading indent on line 0,
+	// snap absStart to the beginning of line sLine so leftover spaces are never double-prepended!
+	line0Start := lineStarts[sLine-1]
+	if absStart > line0Start {
+		prefix := normText[line0Start:absStart]
+		if strings.Trim(prefix, " \t") == "" {
+			tLead, _ := splitLeadingHSpace(normStart)
+			rLead, _ := splitLeadingHSpace(normRepl)
+			if tLead != "" && rLead != "" {
+				absStart = line0Start
+				totalRelStart = absStart - winStart
+			}
+		}
+	}
+
+	finalRepl = normRepl
+	if !startExact && !isIndentSensitivePath(relPath) {
+		matchedStartLine := normText[lineStarts[sLine-1]:]
+		if nl := strings.IndexByte(matchedStartLine, '\n'); nl >= 0 {
+			matchedStartLine = matchedStartLine[:nl]
+		}
+		tFirst := strings.SplitN(normStart, "\n", 2)[0]
+		finalRepl = realignReplacementIndent([]winLineSpan{{raw: matchedStartLine}}, []string{tFirst}, normRepl, false, isBacktickEscapeLang(relPath))
+	}
+
+	if isBraceConservationExt(relPath) {
+		oldDelta, oldOK := netBraceDeltaLexed(windowText[totalRelStart:totalRelEnd], relPath)
+		newDelta, newOK := netBraceDeltaLexed(finalRepl, relPath)
+		if !oldOK || !newOK || oldDelta != newDelta {
+			return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindBadArgs, nil,
+				"%s hunk %d: target..endTarget span L%d-%d has net brace delta %+d vs replacement %+d; verify endTarget or use a standard target hunk",
+				relPath, hIdx+1, sLine, eLine, oldDelta, newDelta)
+		}
+	}
+
+	return absStart, absEnd, finalRepl, sLine, eLine, nil
+}
+
+func netBraceDeltaLexed(src, relPath string) (delta int, ok bool) {
+	ext := strings.ToLower(filepath.Ext(relPath))
+	jsLike := isJSLikeExt(ext)
+	inBlock := false
+	inBacktick := false
+
+	lines := strings.Split(src, "\n")
+	for _, line := range lines {
+		for j := 0; j < len(line); {
+			if inBlock {
+				if j+1 < len(line) && line[j] == '*' && line[j+1] == '/' {
+					inBlock = false
+					j += 2
+					continue
+				}
+				j++
+				continue
+			}
+			if inBacktick {
+				if line[j] == '\\' && ext != ".go" && j+1 < len(line) {
+					j += 2
+					continue
+				}
+				if line[j] == '`' {
+					inBacktick = false
+				}
+				j++
+				continue
+			}
+			if j+1 < len(line) && line[j] == '/' && line[j+1] == '/' {
+				break
+			}
+			if j+1 < len(line) && line[j] == '/' && line[j+1] == '*' {
+				inBlock = true
+				j += 2
+				continue
+			}
+			if line[j] == '"' {
+				j++
+				closed := false
+				for j < len(line) {
+					if line[j] == '\\' && j+1 < len(line) {
+						j += 2
+						continue
+					}
+					if line[j] == '"' {
+						closed = true
+						j++
+						break
+					}
+					j++
+				}
+				if !closed {
+					return 0, false
+				}
+				continue
+			}
+			if (jsLike || ext == ".go") && line[j] == '`' {
+				inBacktick = true
+				j++
+				continue
+			}
+			if jsLike && line[j] == '\'' {
+				j++
+				closed := false
+				for j < len(line) {
+					if line[j] == '\\' && j+1 < len(line) {
+						j += 2
+						continue
+					}
+					if line[j] == '\'' {
+						closed = true
+						j++
+						break
+					}
+					j++
+				}
+				if !closed {
+					return 0, false
+				}
+				continue
+			}
+			if !jsLike && line[j] == '\'' {
+				if next := scanClosedCharLiteral(line, j); next > j {
+					j = next
+					continue
+				}
+			}
+			switch line[j] {
+			case '{':
+				delta++
+			case '}':
+				delta--
+			}
+			j++
+		}
+	}
+	if inBlock || inBacktick {
+		return 0, false
+	}
+	return delta, true
+}
+
+func alignSymbolReplacementIndent(origStartLine, normRepl, relPath string) string {
+	baseIndent, _ := splitLeadingHSpace(origStartLine)
+	if baseIndent == "" {
+		return normRepl
+	}
+	hasTrailingNL := strings.HasSuffix(normRepl, "\n")
+	body := strings.TrimSuffix(normRepl, "\n")
+	rLines := strings.Split(body, "\n")
+
+	firstNonBlank := -1
+	for i, l := range rLines {
+		if strings.TrimSpace(l) != "" {
+			firstNonBlank = i
+			break
+		}
+	}
+	if firstNonBlank < 0 {
+		return normRepl
+	}
+	replLead, _ := splitLeadingHSpace(rLines[firstNonBlank])
+	if replLead != "" {
+		return normRepl
+	}
+
+	if isPythonContinuationPath(relPath) {
+		pySt := scanPythonLines(rLines)
+		for i, rl := range rLines {
+			if pySt[i].startTriple == "" && strings.TrimSpace(rl) != "" {
+				rLines[i] = baseIndent + rl
+			}
+		}
+	} else {
+		startsInBT := trackMultilineBackticks(rLines, isBacktickEscapeLang(relPath))
+		for i, rl := range rLines {
+			if !startsInBT[i] && strings.TrimSpace(rl) != "" {
+				rLines[i] = baseIndent + rl
+			}
+		}
+	}
+	out := strings.Join(rLines, "\n")
+	if hasTrailingNL {
+		out += "\n"
+	}
+	return out
+}
+
+func exactLineSpanOffsets(text string, starts []int, startLine, endLine int) (int, int) {
+	s := maxInt(1, minInt(startLine, len(starts)))
+	e := maxInt(s, minInt(endLine, len(starts)))
+	startOff := starts[s-1]
+	endOff := len(text)
+	if e < len(starts) {
+		endOff = starts[e] - 1
+	}
+	if endOff < startOff {
+		endOff = startOff
+	}
+	return startOff, endOff
+}
+
+func combinePlanErrors(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	if len(errs) == 1 {
+		return errs[0]
+	}
+	primaryKind := sandbox.KindNoMatch
+	var primaryData map[string]any
+	msgs := make([]string, 0, minInt(len(errs), 5)+1)
+	for i, e := range errs {
+		var he *sandbox.HostError
+		msg := e.Error()
+		if errors.As(e, &he) {
+			msg = he.Msg
+			if i == 0 {
+				primaryKind = he.Kind
+				primaryData = he.Data
+			}
+		}
+		if i < 5 {
+			if i == 0 {
+				msgs = append(msgs, msg)
+			} else {
+				msgs = append(msgs, "  also: "+msg)
+			}
+		}
+	}
+	if len(errs) > 5 {
+		msgs = append(msgs, fmt.Sprintf("  (+%d more hunk/file errors)", len(errs)-5))
+	}
+	return &sandbox.HostError{
+		Kind: primaryKind,
+		Data: primaryData,
+		Msg:  strings.Join(msgs, "\n"),
+	}
+}
+
 func realignReplacementIndent(matched []winLineSpan, tLines []string, normRepl string, keepIndent, btEscape bool) string {
 	if keepIndent || len(matched) == 0 || len(matched) != len(tLines) {
 		return normRepl
@@ -1274,11 +1972,9 @@ func realignReplacementIndent(matched []winLineSpan, tLines []string, normRepl s
 	tStartsInBT := trackMultilineBackticks(tLines, btEscape)
 	rStartsInBT := trackMultilineBackticks(rLines, btEscape)
 
-	// Check if every non-empty code target line (outside multiline backticks) is uniformly over-indented by
-	// extraPrefix relative to matched file lines, or uniformly under-indented by missingPrefix.
 	extraPrefix := ""
 	missingPrefix := ""
-	mode := 0 // 0=init, 1=target has extraPrefix, 2=target lacks missingPrefix, -1=mixed
+	mode := 0
 	for i := range tLines {
 		if tStartsInBT[i] || strings.TrimSpace(tLines[i]) == "" || strings.TrimSpace(matched[i].raw) == "" {
 			continue
@@ -1315,7 +2011,6 @@ func realignReplacementIndent(matched []winLineSpan, tLines []string, normRepl s
 
 	switch mode {
 	case 1:
-		// Strip extraPrefix if every non-empty code replacement line (outside backticks) also carries it.
 		allHave := true
 		for i, rl := range rLines {
 			if !rStartsInBT[i] && strings.TrimSpace(rl) != "" && !strings.HasPrefix(rl, extraPrefix) {
@@ -1337,8 +2032,6 @@ func realignReplacementIndent(matched []winLineSpan, tLines []string, normRepl s
 			}
 		}
 	default:
-		// Special case: caller omitted leading indent ONLY on line 0 of both target and replacement.
-		// Guard against whitespace-only matched[0].raw so trailing spaces on a blank line are never copied as code indent.
 		if !tStartsInBT[0] && !rStartsInBT[0] &&
 			strings.TrimSpace(matched[0].raw) != "" &&
 			strings.TrimSpace(tLines[0]) != "" &&
@@ -1362,160 +2055,399 @@ func realignReplacementIndent(matched []winLineSpan, tLines []string, normRepl s
 func isBoilerplateAnchorLine(trimmed string) bool {
 	low := strings.ToLower(trimmed)
 	switch low {
-	case "}", ")", "]", "} else {", "else {", "else", "return", "return nil", "return err",
-		"break", "continue", "default:", "try {", "} catch {", "finally {":
+	case "}", "};", ")", ");", "]", "];", "} else {", "else {", "else", "return", "return;", "return nil", "return err",
+		"break", "break;", "continue", "continue;", "default:", "try {", "} catch {", "finally {":
 		return true
 	}
 	return false
 }
 
-// selectBestAnchorLine picks the most distinctive line in targetLines (highest identifier/CJK content)
-// instead of blindly stopping at a leading '} else {' or closing brace.
+func anchorLineRank(l string) int {
+	t := strings.TrimSpace(l)
+	rc := utf8.RuneCountInString(t)
+	if rc < 3 {
+		return -1
+	}
+	if isBoilerplateAnchorLine(t) {
+		return 1
+	}
+	alnum := 0
+	for _, r := range t {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			alnum++
+		}
+	}
+	return alnum*3 + minInt(rc, 80)
+}
+
 func selectBestAnchorLine(targetLines []string) (bestIdx int, bestAnchor string) {
 	bestIdx = -1
 	bestRank := -1
 	for idx, l := range targetLines {
-		t := strings.TrimSpace(l)
-		rc := utf8.RuneCountInString(t)
-		if rc < 3 {
-			continue
-		}
-		alnum := 0
-		for _, r := range t {
-			if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
-				alnum++
-			}
-		}
-		rank := alnum*3 + minInt(rc, 80)
-		if isBoilerplateAnchorLine(t) {
-			rank = 1
-		}
+		rank := anchorLineRank(l)
 		if rank > bestRank {
 			bestRank = rank
 			bestIdx = idx
-			bestAnchor = t
+			bestAnchor = strings.TrimSpace(l)
 		}
 	}
 	return bestIdx, bestAnchor
 }
 
-// closestLineHint finds the closest matching anchor line in the file so the caller can self-correct without an extra read turn.
+func selectDiverseAnchors(targetLines []string) []int {
+	var out []int
+	seen := map[int]bool{}
+	add := func(idx int) {
+		if idx >= 0 && idx < len(targetLines) && !seen[idx] && strings.TrimSpace(targetLines[idx]) != "" {
+			seen[idx] = true
+			out = append(out, idx)
+		}
+	}
+
+	for i, l := range targetLines {
+		if anchorLineRank(l) > 1 {
+			add(i)
+			break
+		}
+	}
+	for i := len(targetLines) - 1; i >= 0; i-- {
+		if anchorLineRank(lAt(targetLines, i)) > 1 {
+			add(i)
+			break
+		}
+	}
+	mid := len(targetLines) / 2
+	if best1, _ := selectBestAnchorLine(targetLines[:maxInt(1, mid)]); best1 >= 0 {
+		add(best1)
+	}
+	if mid < len(targetLines) {
+		if best2, _ := selectBestAnchorLine(targetLines[mid:]); best2 >= 0 {
+			add(mid + best2)
+		}
+	}
+	if len(out) == 0 {
+		if b, _ := selectBestAnchorLine(targetLines); b >= 0 {
+			add(b)
+		}
+	}
+	return out
+}
+
+func lAt(s []string, i int) string {
+	if i >= 0 && i < len(s) {
+		return s[i]
+	}
+	return ""
+}
+
+func scoreLineSimilarity(ft, anchor, anchorLower string, anchorRunes int, words []string, anchorBigrams map[string]struct{}) int {
+	if ft == "" {
+		return 0
+	}
+	if ft == anchor {
+		return 100
+	}
+	flLower := strings.ToLower(ft)
+	if flLower == anchorLower {
+		return 90
+	}
+	score := 0
+	if strings.Contains(flLower, anchorLower) {
+		s := 75
+		if len(flLower) > 0 {
+			s += (10 * len(anchorLower)) / len(flLower)
+		}
+		if s > score {
+			score = s
+		}
+	} else if strings.Contains(anchorLower, flLower) {
+		flRunes := utf8.RuneCountInString(flLower)
+		if flRunes >= 8 && flRunes*3 >= anchorRunes {
+			s := 30 + (45*flRunes)/anchorRunes
+			if s > score {
+				score = s
+			}
+		}
+	}
+	if len(words) > 0 {
+		matched := 0
+		for _, w := range words {
+			if utf8.RuneCountInString(w) >= 3 && strings.Contains(flLower, w) {
+				matched++
+			}
+		}
+		if matched > 0 {
+			ws := (matched * 65) / len(words)
+			if ws > score {
+				score = ws
+			}
+		}
+	}
+	if len(anchorBigrams) > 0 {
+		flBigrams := runeBigrams(flLower)
+		if len(flBigrams) > 0 {
+			overlap := 0
+			for bg := range anchorBigrams {
+				if _, ok := flBigrams[bg]; ok {
+					overlap++
+				}
+			}
+			if overlap > 0 {
+				bs := (2 * overlap * 80) / (len(anchorBigrams) + len(flBigrams))
+				if bs > score {
+					score = bs
+				}
+			}
+		}
+	}
+	return score
+}
+
+func truncateHintLine(s string) string {
+	if len(s) > 120 {
+		return output.SliceUTF8Bytes(s, 120) + "…"
+	}
+	return s
+}
+
+func describeLeadWhitespace(s string) string {
+	spaces, tabs := 0, 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == ' ' {
+			spaces++
+		} else if s[i] == '\t' {
+			tabs++
+		} else {
+			break
+		}
+	}
+	switch {
+	case spaces > 0 && tabs > 0:
+		return fmt.Sprintf("%d space(s) + %d tab(s)", spaces, tabs)
+	case tabs > 0:
+		return fmt.Sprintf("%d tab(s)", tabs)
+	default:
+		return fmt.Sprintf("%d space(s)", spaces)
+	}
+}
+
+func simulateJSEscapeLoss(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			switch s[i] {
+			case 'n':
+				b.WriteByte('\n')
+			case 't':
+				b.WriteByte('\t')
+			case 'r':
+				b.WriteByte('\r')
+			case '\\', '"', '\'', '`':
+				b.WriteByte(s[i])
+			default:
+				b.WriteByte(s[i])
+			}
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
 func closestLineHint(fileText, target string) string {
-	targetLines := strings.Split(target, "\n")
-	anchorIdx, anchor := selectBestAnchorLine(targetLines)
-	if anchor == "" {
+	trimmedTarget := strings.TrimSuffix(target, "\n")
+	targetLines := strings.Split(trimmedTarget, "\n")
+	anchors := selectDiverseAnchors(targetLines)
+	if len(anchors) == 0 {
 		return ""
 	}
 	fileLines := strings.Split(fileText, "\n")
-	bestIdx := -1
-	bestScore := 0
-	anchorLower := strings.ToLower(anchor)
-	anchorRunes := utf8.RuneCountInString(anchorLower)
-	words := strings.Fields(anchorLower)
-	anchorBigrams := runeBigrams(anchorLower)
-
-	for i, fl := range fileLines {
-		ft := strings.TrimSpace(fl)
-		if ft == "" {
-			continue
-		}
-		flLower := strings.ToLower(ft)
-		score := 0
-		if ft == anchor {
-			score = 100
-		} else if flLower == anchorLower {
-			score = 90
-		} else {
-			if strings.Contains(flLower, anchorLower) {
-				s := 75
-				if len(flLower) > 0 {
-					s += (10 * len(anchorLower)) / len(flLower)
-				}
-				if s > score {
-					score = s
-				}
-			} else if strings.Contains(anchorLower, flLower) {
-				// Only reward candidate-inside-anchor containment when the candidate line
-				// is substantial (prevents 1-char punctuation lines like `]` or `}` from
-				// hijacking the closest hint for a long target line).
-				flRunes := utf8.RuneCountInString(flLower)
-				if flRunes >= 8 && flRunes*3 >= anchorRunes {
-					s := 30 + (45*flRunes)/anchorRunes
-					if s > score {
-						score = s
-					}
-				}
-			}
-			if len(words) > 0 {
-				matched := 0
-				for _, w := range words {
-					if utf8.RuneCountInString(w) >= 3 && strings.Contains(flLower, w) {
-						matched++
-					}
-				}
-				if matched > 0 {
-					ws := (matched * 65) / len(words)
-					if ws > score {
-						score = ws
-					}
-				}
-			}
-			if len(anchorBigrams) > 0 {
-				flBigrams := runeBigrams(flLower)
-				if len(flBigrams) > 0 {
-					overlap := 0
-					for bg := range anchorBigrams {
-						if _, ok := flBigrams[bg]; ok {
-							overlap++
-						}
-					}
-					if overlap > 0 {
-						bs := (2 * overlap * 80) / (len(anchorBigrams) + len(flBigrams))
-						if bs > score {
-							score = bs
-						}
-					}
-				}
-			}
-		}
-		// Multi-line neighborhood tie-breaker when target has multiple lines.
-		if score >= 35 && len(targetLines) > 1 {
-			bonus := 0
-			for off := -3; off <= 3; off++ {
-				if off == 0 {
-					continue
-				}
-				ti := anchorIdx + off
-				fi := i + off
-				if ti >= 0 && ti < len(targetLines) && fi >= 0 && fi < len(fileLines) {
-					tt := strings.TrimSpace(targetLines[ti])
-					if tt != "" && strings.TrimSpace(fileLines[fi]) == tt {
-						bonus += 5
-					}
-				}
-			}
-			score += minInt(bonus, 25)
-		}
-		if score > bestScore {
-			bestScore = score
-			bestIdx = i
-		}
-	}
-	if bestIdx < 0 || bestScore < 35 {
+	if len(fileLines) == 0 {
 		return ""
 	}
-	hunkTop := maxInt(0, bestIdx-anchorIdx)
-	from := maxInt(0, hunkTop-1)
-	to := minInt(len(fileLines)-1, maxInt(bestIdx+2, hunkTop+minInt(len(targetLines), 8)))
+
+	candidateTops := map[int]int{}
+	for _, aIdx := range anchors {
+		anchor := strings.TrimSpace(targetLines[aIdx])
+		anchorLower := strings.ToLower(anchor)
+		anchorRunes := utf8.RuneCountInString(anchorLower)
+		words := strings.Fields(anchorLower)
+		bgs := runeBigrams(anchorLower)
+
+		type hit struct {
+			fileIdx int
+			score   int
+		}
+		var topHits []hit
+		for i, fl := range fileLines {
+			sc := scoreLineSimilarity(strings.TrimSpace(fl), anchor, anchorLower, anchorRunes, words, bgs)
+			if sc < 35 {
+				continue
+			}
+			if isBoilerplateAnchorLine(anchor) && sc < 100 {
+				continue
+			}
+			topHits = append(topHits, hit{fileIdx: i, score: sc})
+		}
+		sort.Slice(topHits, func(a, b int) bool { return topHits[a].score > topHits[b].score })
+		if len(topHits) > 12 {
+			topHits = topHits[:12]
+		}
+		for _, h := range topHits {
+			top := maxInt(0, h.fileIdx-aIdx)
+			if h.score > candidateTops[top] {
+				candidateTops[top] = h.score
+			}
+		}
+	}
+	if len(candidateTops) == 0 {
+		return ""
+	}
+
+	bestTop := -1
+	bestWindowScore := -1
+	bestSingleScore := 0
+	for top, singleSc := range candidateTops {
+		winScore := singleSc
+		if len(targetLines) > 1 {
+			fCursor := top
+			for _, tl := range targetLines {
+				tt := strings.TrimSpace(tl)
+				if tt == "" {
+					fCursor++
+					continue
+				}
+				bestDelta := 0
+				bestMatch := 0
+				for d := -1; d <= 2; d++ {
+					fi := fCursor + d
+					if fi < 0 || fi >= len(fileLines) {
+						continue
+					}
+					ft := strings.TrimSpace(fileLines[fi])
+					if ft == tt {
+						m := 35
+						if isBoilerplateAnchorLine(tt) {
+							m = 6
+						}
+						if d == 0 {
+							m += 5
+						}
+						if m > bestMatch {
+							bestMatch = m
+							bestDelta = d
+						}
+					} else if ft != "" && strings.EqualFold(ft, tt) && 20 > bestMatch {
+						bestMatch = 20
+						bestDelta = d
+					}
+				}
+				winScore += bestMatch
+				fCursor += 1 + bestDelta
+			}
+		}
+		if winScore > bestWindowScore || (winScore == bestWindowScore && top < bestTop) {
+			bestWindowScore = winScore
+			bestTop = top
+			bestSingleScore = singleSc
+		}
+	}
+	if bestTop < 0 || bestSingleScore < 35 {
+		return ""
+	}
+
+	firstCodeDiff := -1
+	firstRawDiff := -1
+	matchedPrefix := 0
+	for j := 0; j < len(targetLines); j++ {
+		fi := bestTop + j
+		if fi >= len(fileLines) {
+			if firstCodeDiff < 0 {
+				firstCodeDiff = j
+			}
+			break
+		}
+		if targetLines[j] != fileLines[fi] && firstRawDiff < 0 {
+			firstRawDiff = j
+		}
+		if strings.TrimSpace(targetLines[j]) != strings.TrimSpace(fileLines[fi]) {
+			if firstCodeDiff < 0 {
+				firstCodeDiff = j
+			}
+		} else if firstCodeDiff < 0 {
+			matchedPrefix++
+		}
+	}
+
+	diffTargetIdx := firstCodeDiff
+	pureWhitespaceDiff := false
+	if diffTargetIdx < 0 {
+		pureWhitespaceDiff = true
+		if firstRawDiff >= 0 {
+			diffTargetIdx = firstRawDiff
+		} else {
+			diffTargetIdx = 0
+		}
+	}
+	diffFileIdx := minInt(len(fileLines)-1, bestTop+diffTargetIdx)
+
+	var extraNotes []string
+	tDiffLine := targetLines[diffTargetIdx]
+	fDiffLine := fileLines[diffFileIdx]
+	if pureWhitespaceDiff && strings.TrimSpace(tDiffLine) == strings.TrimSpace(fDiffLine) {
+		tWS := describeLeadWhitespace(tDiffLine)
+		fWS := describeLeadWhitespace(fDiffLine)
+		if tWS != fWS {
+			extraNotes = append(extraNotes, fmt.Sprintf("indent differs at L%d: target has %s, file has %s", diffFileIdx+1, tWS, fWS))
+		}
+	}
+	if strings.Contains(fDiffLine, `\`) && fDiffLine != tDiffLine {
+		sim := simulateJSEscapeLoss(fDiffLine)
+		if sim == tDiffLine || strings.TrimSpace(sim) == strings.TrimSpace(tDiffLine) {
+			extraNotes = append(extraNotes, "Hint: backslashes in 'target' were consumed by JS string escaping; pass raw text via top-level 'payloads' (P.old / P.new) or String.raw")
+		}
+	} else if strings.Contains(fileText, `\`) && strings.Contains(simulateJSEscapeLoss(fileText), trimmedTarget) {
+		extraNotes = append(extraNotes, "Hint: backslashes in 'target' were consumed by JS string escaping; pass raw text via top-level 'payloads' (P.old / P.new) or String.raw")
+	}
+
+	var from, to int
+	if len(targetLines) <= 8 {
+		from = maxInt(0, bestTop-1)
+		if bestTop > 0 && isBoilerplateAnchorLine(strings.TrimSpace(targetLines[0])) {
+			from = bestTop
+		}
+		to = minInt(len(fileLines)-1, bestTop+len(targetLines)+1)
+	} else {
+		from = maxInt(bestTop, diffFileIdx-2)
+		to = minInt(len(fileLines)-1, diffFileIdx+4)
+	}
 	var snip []string
 	for i := from; i <= to; i++ {
-		line := fileLines[i]
-		if len(line) > 120 {
-			line = output.SliceUTF8Bytes(line, 120) + "…"
-		}
-		snip = append(snip, fmt.Sprintf("    %d: %s", i+1, line))
+		snip = append(snip, fmt.Sprintf("    %d: %s", i+1, truncateHintLine(fileLines[i])))
 	}
-	return fmt.Sprintf("; closest L%d-%d:\n%s", from+1, to+1, strings.Join(snip, "\n"))
+
+	var b strings.Builder
+	if len(targetLines) > 1 && matchedPrefix > 0 && !pureWhitespaceDiff {
+		fmt.Fprintf(&b, "; matched first %d/%d line(s) from L%d, mismatch at target line %d vs L%d:\n",
+			matchedPrefix, len(targetLines), bestTop+1, diffTargetIdx+1, diffFileIdx+1)
+		fmt.Fprintf(&b, "  - target (%d): %s\n  + file  L%-4d: %s\n",
+			diffTargetIdx+1, truncateHintLine(tDiffLine), diffFileIdx+1, truncateHintLine(fDiffLine))
+		fmt.Fprintf(&b, "  closest L%d-%d:\n%s", from+1, to+1, strings.Join(snip, "\n"))
+	} else {
+		fmt.Fprintf(&b, "; closest L%d-%d", from+1, to+1)
+		if len(extraNotes) > 0 && pureWhitespaceDiff {
+			fmt.Fprintf(&b, " (%s)", extraNotes[0])
+			extraNotes = extraNotes[1:]
+		}
+		fmt.Fprintf(&b, ":\n  - target (%d): %s\n  + file  L%-4d: %s\n%s",
+			diffTargetIdx+1, truncateHintLine(tDiffLine), diffFileIdx+1, truncateHintLine(fDiffLine), strings.Join(snip, "\n"))
+	}
+	for _, note := range extraNotes {
+		b.WriteString("\n  " + note)
+	}
+	return b.String()
 }
 
 // runeBigrams builds a bounded set of non-whitespace Unicode character bigrams for
@@ -1671,6 +2603,14 @@ func decodeHunks(arr []any) ([]EditHunk, error) {
 
 func decodeSingleHunk(m map[string]any) (EditHunk, error) {
 	target := firstString(m, "target", "oldText", "old_string", "old", "from")
+	endTarget := firstString(m, "endTarget", "end_target")
+	replaceSym := optBool(m, "replaceSymbol", false)
+	sym := firstString(m, "symbol", "in")
+	startLine := optInt(m, "startLine", 0)
+	endLine := optInt(m, "endLine", 0)
+	replaceAll := optBool(m, "replaceAll", optBool(m, "all", false))
+	nth := optInt(m, "nth", optInt(m, "occurrence", 0))
+
 	var repl string
 	foundRepl := false
 	for _, k := range []string{"replacement", "newText", "new_string", "new", "to"} {
@@ -1684,9 +2624,6 @@ func decodeSingleHunk(m map[string]any) (EditHunk, error) {
 			break
 		}
 	}
-	if target == "" {
-		return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "hunk requires non-empty 'target' (or 'oldText')")
-	}
 	if !foundRepl {
 		for _, typo := range []string{"replace", "replaceWith", "replacementText", "text", "value", "content", "body"} {
 			if _, exists := m[typo]; exists {
@@ -1695,13 +2632,39 @@ func decodeSingleHunk(m map[string]any) (EditHunk, error) {
 		}
 		return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "hunk missing required 'replacement' field (pass replacement: \"\" explicitly to delete target)")
 	}
+
+	if replaceSym {
+		if strings.TrimSpace(sym) == "" {
+			return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "replaceSymbol: true requires non-empty 'symbol'")
+		}
+		if target != "" || endTarget != "" {
+			return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "replaceSymbol: true cannot be combined with 'target' or 'endTarget' (omit target to replace the whole symbol, or remove replaceSymbol: true)")
+		}
+		if replaceAll || nth > 0 || startLine > 0 || endLine > 0 {
+			return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "replaceSymbol: true cannot be combined with startLine, endLine, nth, or replaceAll")
+		}
+		return EditHunk{
+			Symbol:        sym,
+			ReplaceSymbol: true,
+			Replacement:   repl,
+		}, nil
+	}
+
+	if target == "" {
+		return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "hunk requires non-empty 'target' (or pass { symbol, replaceSymbol: true, replacement } to replace an entire symbol)")
+	}
+	if endTarget != "" && (replaceAll || nth > 0) {
+		return EditHunk{}, sandbox.NewHostError(sandbox.KindBadArgs, nil, "endTarget cannot be combined with replaceAll or nth")
+	}
+
 	return EditHunk{
 		Target:      target,
+		EndTarget:   endTarget,
 		Replacement: repl,
-		StartLine:   optInt(m, "startLine", 0),
-		EndLine:     optInt(m, "endLine", 0),
-		ReplaceAll:  optBool(m, "replaceAll", optBool(m, "all", false)),
-		Nth:         optInt(m, "nth", optInt(m, "occurrence", 0)),
-		Symbol:      firstString(m, "symbol", "in"),
+		StartLine:   startLine,
+		EndLine:     endLine,
+		ReplaceAll:  replaceAll,
+		Nth:         nth,
+		Symbol:      sym,
 	}, nil
 }

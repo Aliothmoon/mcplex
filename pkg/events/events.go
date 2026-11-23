@@ -121,6 +121,7 @@ type Hub struct {
 	capacity       int
 	instanceID     string
 	alwaysRecord   atomic.Bool
+	sink           atomic.Pointer[func(Event)]
 	subCount       atomic.Int32
 	seq            atomic.Int64
 	nextSubID      atomic.Int64
@@ -200,13 +201,26 @@ func (h *Hub) SetAlwaysRecord(on bool) {
 	h.alwaysRecord.Store(on)
 }
 
-// Active returns true when events should be computed and emitted (either live subscribers exist
-// or alwaysRecord is enabled). Callers can check Active() to avoid diff/preview work when idle.
+// SetSink registers an optional external event sink (e.g. JSONL persistence for cross-process TUI tailing).
+// The sink is invoked outside h.mu for every emitted event.
+func (h *Hub) SetSink(fn func(Event)) {
+	if h == nil {
+		return
+	}
+	if fn == nil {
+		h.sink.Store(nil)
+		return
+	}
+	h.sink.Store(&fn)
+}
+
+// Active returns true when events should be computed and emitted (live subscribers exist,
+// alwaysRecord is enabled, or a persistent sink is attached).
 func (h *Hub) Active() bool {
 	if h == nil {
 		return false
 	}
-	return h.alwaysRecord.Load() || h.subCount.Load() > 0
+	return h.alwaysRecord.Load() || h.subCount.Load() > 0 || h.sink.Load() != nil
 }
 
 // isTerminalLifecycleEvent identifies run/task/shell completion events that must never be dropped
@@ -250,6 +264,9 @@ func (h *Hub) Emit(ev Event) Event {
 		}
 	}
 	h.mu.Unlock()
+	if sp := h.sink.Load(); sp != nil && *sp != nil {
+		(*sp)(ev)
+	}
 	return ev
 }
 
