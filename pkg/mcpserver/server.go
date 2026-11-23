@@ -638,7 +638,7 @@ func (s *Server) handleSingle(ctx context.Context, req jsonRPCRequest) *jsonRPCR
 func (s *Server) execToolDefinition() map[string]any {
 	desc := strings.TrimSpace(s.opts.ExecDescription)
 	if desc == "" {
-		desc = "Execute a TypeScript program in an isolated Programmatic Tool Calling (PTC) sandbox to compose search, AST outline, file reads, multi-file atomic edits, transactions (edit -> concurrent verify -> auto-rollback), read-only git, shell checks, session state, and external MCP calls in ONE turn. Intermediate data stays in sandbox memory; return a compact structured summary."
+		desc = "Execute a TypeScript program in an isolated Programmatic Tool Calling (PTC) sandbox to compose search, AST outline, file reads, low-token multi-file atomic edits (edit.apply + sh.checks; opt-in tx rollback), read-only git, shell checks, session state, and external MCP calls in ONE turn. Intermediate data stays in sandbox memory; return a compact structured summary."
 	}
 	timeoutDesc := "Optional execution deadline in milliseconds (default 20000, max 120000). Subprocess trees are automatically killed on timeout. For >15s builds/tests or daemons, use built-in run_command + manage_task."
 	maxOutDesc := "Optional max UTF-8 bytes returned inline (default 9600). Above ~10000 Antigravity spills the response to output.txt, so keep the default: long text is paged (print(state.page(key, 2)) for the next page) and whole files are best read with native read_file."

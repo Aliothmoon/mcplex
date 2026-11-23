@@ -93,6 +93,7 @@ Example:
   - ` + "`{ symbol?: \"fn\", target: \"<start line>\", endTarget: \"<end line>\", replacement: P.newBlock }`" + ` (replaces closed span ` + "`[target .. endTarget]`" + ` without copying middle lines).
 - **Scoped multi-file / micro-hunk edits**:
   - ` + "`await edit.apply({ edits: [{ path, hunks: [{ target, endTarget?, replacement, symbol?, replaceSymbol?, nth?, startLine?, endLine?, replaceAll? }], create?, overwrite? }], dryRun?, bestEffort?, verify? })`" + `
+  - Default for multi-file edits (and new files via ` + "`{ path, create: P.content, overwrite: true }`" + `): every hunk across all files is validated before any write, then run ` + "`sh.checks`" + `; if a check fails, keep edits on disk and send only the fix next turn.
   - ` + "`symbol: \"Type::method\"`" + ` restricts matching to that symbol; ` + "`nth: 2`" + ` targets the Nth occurrence; ` + "`dryRun: true`" + ` previews ` + "`.diff`" + `.
 - Single hunk shortcut: ` + "`await edit.replace(path, target, replacement, { symbol?, endTarget?, nth?, replaceAll? })`" + `
 - Always pass multiline replacement code in ` + "`payloads`" + ` (` + "`P.newCode`" + `) to avoid JS backslash escaping issues.
@@ -102,10 +103,11 @@ Example:
 	},
 	{
 		ID:      "tx",
-		Title:   "tx — Atomic Multi-File Transactions with Auto-Rollback",
+		Title:   "tx — Opt-In All-or-Nothing Transactions with Rollback",
 		Summary: "tx.begin() -> replaceSymbol, edit, write, rm, rename, verify, diff, status, commit, rollback",
 		Aliases: []string{"transaction", "transactions", "rollback", "commit", "diff", "verify"},
-		Body: `- ` + "`const t = await tx.begin();`" + `
+		Body: `- **Opt-in only when a failed check must leave the tree untouched** (rollback discards every edit, so a retry must resend the whole payload; for normal iterative edits use ` + "`edit.apply` + `sh.checks`" + `).
+- ` + "`const t = await tx.begin();`" + `
 - Operations: ` + "`t.replaceSymbol(path, symbol, replacement)`" + `, ` + "`t.edit(pathOrSpecs, hunks?)`" + `, ` + "`t.write(path, content, { eol? })`" + `, ` + "`t.rm(path)`" + `, ` + "`t.rename(from, to)`" + `
   - Prefer ` + "`t.replaceSymbol`" + ` (0 ` + "`target`" + ` tokens) for whole functions/methods, ` + "`{ symbol, target, endTarget, replacement }`" + ` for 10–120 line blocks, and ` + "`{ symbol, target, replacement }`" + ` for 1–5 line tweaks.
   - Pass all files to one ` + "`await t.edit([{ path, hunks }, ...])`" + ` — every hunk across every file is validated upfront before anything is written.
@@ -210,8 +212,8 @@ Example (start dev server and wait for ready):
 		Body: `### 1. Parallel Codebase Survey (` + "`Promise.all`" + `)
 ` + "```ts\nconst [hits, status, files] = await Promise.all([\n  search.rg(\"HandleAuth\", { glob: \"*.go\" }),\n  git.status(),\n  search.glob(\"pkg/**/*.go\"),\n]);\nreturn { branch: status.branch, files: files.length, hits: hits.slice(0, 10) };\n```" + `
 
-### 2. Read Symbol -> Atomic Transaction -> Verify -> Commit
-` + "```ts\nconst t = await tx.begin();\nawait t.edit([\n  { path: \"pkg/auth.go\", hunks: [{ target: P.oldFn, replacement: P.newFn, symbol: \"CheckToken\" }] },\n  { path: \"pkg/auth_test.go\", hunks: [{ target: P.oldTest, replacement: P.newTest }] },\n]);\nconst v = await t.verify([\"go vet ./...\", \"go test ./pkg/...\"]);\nif (!v.ok) { await t.rollback(); print(v.failures); return { ok: false }; }\nawait t.commit();\nreturn { ok: true, summary: v.summary };\n```",
+### 2. Low-Token Multi-File Edit + Fast Checks (Default — Keeps Edits on Check Failure)
+` + "```ts\nawait edit.apply({\n  edits: [\n    { path: \"pkg/auth.go\", hunks: [{ symbol: \"CheckToken\", replaceSymbol: true, replacement: P.newFn }] },\n    { path: \"pkg/auth_test.go\", hunks: [{ symbol: \"TestCheckToken\", target: \"want := false\", replacement: \"want := true\" }] },\n  ],\n});\nconst check = await sh.checks([\"go vet ./...\", \"go test ./pkg/...\"]);\nreturn check.ok ? { ok: true, summary: check.summary } : { ok: false, failures: check.failures };\n```",
 	},
 }
 
@@ -406,11 +408,11 @@ func InstructionsForToolset(hasRead, hasTasks, hasDocs bool) string {
 	}
 	docHint := "Read resource `mcplex://skill` if you need full API signatures or examples."
 	if hasDocs {
-		docHint = "Call `docs({ topic })` (e.g. `tx`, `edit`, `sh`, `search`, `ast`, `errors`, `patterns`) or `docs({ query })` whenever you need exact signatures or examples."
+		docHint = "Call `docs({ topic })` (e.g. `edit`, `sh`, `search`, `ast`, `tx`, `errors`, `patterns`) or `docs({ query })` whenever you need exact signatures or examples."
 	}
 	return fmt.Sprintf(
 		"MCPlex Code Mode Proxy:\n%s\n\nInside `exec`, globals include: %s (plus Buffer, crypto, path, URL, sleep, P/payloads). "+
-			"Always `await t.commit()` for `tx.begin()` edits. %s",
+			"Prefer `edit.apply` + `sh.checks`; with `tx`, call `await t.commit()`. %s",
 		strings.Join(routes, "\n"),
 		ns,
 		docHint,
