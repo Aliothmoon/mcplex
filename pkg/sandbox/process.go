@@ -5,12 +5,122 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
+	"unsafe"
+
+	"github.com/dop251/goja"
 )
 
 // installProcessOS adds read-only Node-style `process` (platform, arch, env, cwd()) and `os`
 // (platform(), arch(), homedir(), tmpdir(), EOL) globals so programs read env vars and paths without
 // spawning a shell. `process.env` is a frozen snapshot (case-insensitive on Windows, like Node);
 // pass `{ env }` to sh.exec / sh.run to change a child's environment.
+var sandboxBootTime = time.Now()
+
+var processOSProg = goja.MustCompile("process_os.js", `(function () {
+	const h = globalThis.__ptcHostInfo;
+	delete globalThis.__ptcHostInfo;
+	let envObj = Object.freeze(Object.assign({}, h.env));
+	if (h.platform === "win32") {
+		// The Proxy target must stay EXTENSIBLE: reporting case-variant keys ("path" for "Path") from
+		// getOwnPropertyDescriptor on a frozen target violates Proxy invariants and makes Object.hasOwn /
+		// hasOwnProperty throw. Immutability is enforced by the mutation traps below instead of freeze().
+		const base = Object.assign({}, h.env);
+		const upper = {};
+		for (const k of Object.keys(base)) upper[k.toUpperCase()] = base[k];
+		const readOnly = () => false;
+		envObj = new Proxy(base, {
+			set: readOnly,
+			defineProperty: readOnly,
+			deleteProperty: readOnly,
+			preventExtensions: readOnly,
+			get(t, p) {
+				if (typeof p !== "string" || p in t || p === "toJSON" || p === "then" || p in Object.prototype) {
+					return t[p];
+				}
+				return upper[p.toUpperCase()];
+			},
+			has(t, p) {
+				return typeof p === "string" ? (p in t) || (p.toUpperCase() in upper) : (p in t);
+			},
+			ownKeys(t) {
+				return Reflect.ownKeys(t);
+			},
+			getOwnPropertyDescriptor(t, p) {
+				if (typeof p === "string" && !(p in t) && (p.toUpperCase() in upper)) {
+					return { value: upper[p.toUpperCase()], enumerable: true, configurable: true, writable: false };
+				}
+				return Object.getOwnPropertyDescriptor(t, p);
+			},
+		});
+	}
+	const B1e9 = BigInt(1000000000);
+	const hrtime = function hrtime(prev) {
+		let ns = BigInt(h.hrtimeNs());
+		if (Array.isArray(prev) && prev.length === 2) {
+			ns -= BigInt(prev[0]) * B1e9 + BigInt(prev[1]);
+		}
+		return [Number(ns / B1e9), Number(ns % B1e9)];
+	};
+	hrtime.bigint = () => BigInt(h.hrtimeNs());
+
+	const makeStream = (lvl) => Object.freeze({
+		isTTY: false,
+		columns: 120,
+		rows: 40,
+		write(chunk) {
+			const s = typeof chunk === "string" ? chunk : (chunk instanceof Uint8Array ? Buffer.from(chunk).toString("utf8") : String(chunk));
+			h.writeLog(lvl, s.endsWith("\n") ? s.slice(0, -1) : s);
+			return true;
+		},
+	});
+
+	globalThis.process = Object.freeze({
+		platform: h.platform,
+		arch: h.arch,
+		env: envObj,
+		cwd: () => h.cwd,
+		pid: h.pid,
+		ppid: h.ppid,
+		version: "v22.0.0",
+		versions: Object.freeze({ node: "22.0.0", v8: "goja", modules: "127" }),
+		argv: Object.freeze(["mcplex", "user_program.ts"]),
+		argv0: "mcplex",
+		execPath: "mcplex",
+		execArgv: Object.freeze([]),
+		nextTick: (cb, ...args) => {
+			if (typeof cb !== "function") throw new TypeError("process.nextTick: callback must be a function");
+			Promise.resolve().then(() => cb(...args));
+		},
+		uptime: () => h.uptimeSec(),
+		hrtime,
+		memoryUsage: () => h.memUsage(),
+		stdout: makeStream("log"),
+		stderr: makeStream("error"),
+	});
+
+	const cpuTemplate = Object.freeze({ model: "virtual-cpu", speed: 3000, times: Object.freeze({ user: 0, nice: 0, sys: 0, idle: 0, irq: 0 }) });
+	globalThis.os = Object.freeze({
+		platform: () => h.platform,
+		arch: () => h.arch,
+		type: () => h.osType,
+		release: () => "1.0.0",
+		machine: () => h.machine,
+		hostname: () => h.hostname,
+		endianness: () => h.endian,
+		homedir: () => h.home,
+		tmpdir: () => h.tmp,
+		cpus: () => Array.from({ length: h.numCPU }, () => cpuTemplate),
+		availableParallelism: () => h.availPar,
+		EOL: h.eol,
+		devNull: h.devNull,
+		constants: Object.freeze({
+			signals: Object.freeze({ SIGINT: 2, SIGTERM: 15, SIGKILL: 9, SIGHUP: 1 }),
+			errno: Object.freeze({ ENOENT: 2, EACCES: 13, EEXIST: 17, EINVAL: 22, EPERM: 1 }),
+		}),
+	});
+})()`, false)
+
 func installProcessOS(env *ExecutionEnv) error {
 	vm := env.VM
 	vars := map[string]any{}
@@ -25,67 +135,82 @@ func installProcessOS(env *ExecutionEnv) error {
 		}
 	}
 	home, _ := os.UserHomeDir()
+	hostname, _ := os.Hostname()
 	eol := "\n"
+	devNull := "/dev/null"
 	if runtime.GOOS == "windows" {
 		eol = "\r\n"
+		devNull = `\\.\nul`
 	}
+	endian := "LE"
+	var x uint16 = 1
+	if *(*byte)(unsafe.Pointer(&x)) == 0 {
+		endian = "BE"
+	}
+	numCPU := max(1, runtime.NumCPU())
+	availPar := max(1, runtime.GOMAXPROCS(0))
+
 	info := map[string]any{
-		"platform": nodePlatform(),
-		"arch":     nodeArch(),
-		"env":      vars,
-		"cwd":      env.Cwd,
-		"home":     home,
-		"tmp":      os.TempDir(),
-		"eol":      eol,
+		"platform":  nodePlatform(),
+		"arch":      nodeArch(),
+		"osType":    nodeOSType(),
+		"machine":   nodeMachine(),
+		"hostname":  hostname,
+		"endian":    endian,
+		"numCPU":    numCPU,
+		"availPar":  availPar,
+		"pid":       os.Getpid(),
+		"ppid":      os.Getppid(),
+		"env":       vars,
+		"cwd":       env.Cwd,
+		"home":      home,
+		"tmp":       os.TempDir(),
+		"eol":       eol,
+		"devNull":   devNull,
+		"hrtimeNs":  func() int64 { return time.Since(env.startedAt).Nanoseconds() },
+		"uptimeSec": func() float64 { return time.Since(sandboxBootTime).Seconds() },
+		"memUsage": func() map[string]any {
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			return map[string]any{
+				"rss":          int64(ms.Sys),
+				"heapTotal":    int64(ms.HeapSys),
+				"heapUsed":     int64(ms.HeapAlloc),
+				"external":     int64(0),
+				"arrayBuffers": int64(0),
+			}
+		},
+		"writeLog": func(lvl, text string) {
+			env.appendLog(lvl, []goja.Value{vm.ToValue(text)})
+		},
 	}
 	if err := vm.Set("__ptcHostInfo", info); err != nil {
 		return err
 	}
-	_, err := vm.RunString(`(function () {
-		const h = globalThis.__ptcHostInfo;
-		delete globalThis.__ptcHostInfo;
-		let envObj = Object.freeze(Object.assign({}, h.env));
-		if (h.platform === "win32") {
-			// The Proxy target must stay EXTENSIBLE: reporting case-variant keys ("path" for "Path") from
-			// getOwnPropertyDescriptor on a frozen target violates Proxy invariants and makes Object.hasOwn /
-			// hasOwnProperty throw. Immutability is enforced by the mutation traps below instead of freeze().
-			const base = Object.assign({}, h.env);
-			const upper = {};
-			for (const k of Object.keys(base)) upper[k.toUpperCase()] = base[k];
-			const readOnly = () => false;
-			envObj = new Proxy(base, {
-				set: readOnly,
-				defineProperty: readOnly,
-				deleteProperty: readOnly,
-				preventExtensions: readOnly,
-				get(t, p) {
-					if (typeof p !== "string" || p in t || p === "toJSON" || p === "then" || p in Object.prototype) {
-						return t[p];
-					}
-					return upper[p.toUpperCase()];
-				},
-				has(t, p) {
-					return typeof p === "string" ? (p in t) || (p.toUpperCase() in upper) : (p in t);
-				},
-				ownKeys(t) {
-					return Reflect.ownKeys(t);
-				},
-				getOwnPropertyDescriptor(t, p) {
-					if (typeof p === "string" && !(p in t) && (p.toUpperCase() in upper)) {
-						return { value: upper[p.toUpperCase()], enumerable: true, configurable: true, writable: false };
-					}
-					return Object.getOwnPropertyDescriptor(t, p);
-				},
-			});
-		}
-		globalThis.process = Object.freeze({
-			platform: h.platform, arch: h.arch, env: envObj, cwd: () => h.cwd,
-		});
-		globalThis.os = Object.freeze({
-			platform: () => h.platform, arch: () => h.arch, homedir: () => h.home, tmpdir: () => h.tmp, EOL: h.eol,
-		});
-	})()`)
+	_, err := vm.RunProgram(processOSProg)
 	return err
+}
+
+func nodeOSType() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "Windows_NT"
+	case "darwin":
+		return "Darwin"
+	default:
+		return "Linux"
+	}
+}
+
+func nodeMachine() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "x86_64"
+	case "386":
+		return "i686"
+	default:
+		return runtime.GOARCH
+	}
 }
 
 // redacted replaces secret-looking env values so `return process.env` never leaks tokens into the

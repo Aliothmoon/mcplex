@@ -168,12 +168,15 @@ func installStandardGlobals(env *ExecutionEnv) error {
 	})
 
 	_ = codec.Set("cwd", env.Cwd)
+	registerExtraCodecFuncs(env, codec)
 	if err := vm.Set("__ptcCodec", codec); err != nil {
 		return err
 	}
 
-	_, err := vm.RunString(stdlibBootstrapJS)
-	return err
+	if _, err := vm.RunProgram(stdlibBootstrapProg); err != nil {
+		return err
+	}
+	return installNodeExtraModules(vm)
 }
 
 func extractGoBytes(vm *goja.Runtime, val goja.Value) []byte {
@@ -343,9 +346,10 @@ func stripBase64Whitespace(s string) string {
 	return b.String()
 }
 
+var stdlibBootstrapProg = goja.MustCompile("stdlib.js", stdlibBootstrapJS, false)
+
 const stdlibBootstrapJS = `(function() {
 	const codec = globalThis.__ptcCodec;
-	delete globalThis.__ptcCodec;
 
 	class Buffer extends Uint8Array {
 		static from(value, encodingOrOffset, length) {

@@ -13,6 +13,8 @@ const maxActiveTimers = 1024
 type timerEntry struct {
 	id         int64
 	due        time.Time
+	interval   time.Duration
+	repeat     bool
 	fn         goja.Callable
 	extra      []goja.Value
 	dispatched bool
@@ -31,26 +33,57 @@ type OrderedMap struct {
 // habit (`await new Promise(r => setTimeout(r, 500))`).
 // Active timers are capped at 1024, dispatched via a single deterministic coordinator so same-delay timers
 // strictly preserve FIFO registration order, and cleaned up immediately when `Execute` exits.
+var timersCloneProg = goja.MustCompile("timers_clone.js", `(function () {
+	function clone(v, seen) {
+		if (v === null || typeof v !== "object") return v;
+		if (seen.has(v)) return seen.get(v);
+		if (v instanceof Date) return new Date(v.getTime());
+		if (v instanceof RegExp) return new RegExp(v.source, v.flags);
+		if (typeof Buffer === "function" && v instanceof Buffer) return Buffer.from(v);
+		if (ArrayBuffer.isView(v)) return v.slice();
+		if (v instanceof ArrayBuffer) return v.slice(0);
+		if (v instanceof Map) { const m = new Map(); seen.set(v, m); v.forEach((x, k) => m.set(clone(k, seen), clone(x, seen))); return m; }
+		if (v instanceof Set) { const s = new Set(); seen.set(v, s); v.forEach((x) => s.add(clone(x, seen))); return s; }
+		const out = Array.isArray(v) ? [] : {};
+		seen.set(v, out);
+		for (const k of Object.keys(v)) out[k] = clone(v[k], seen);
+		return out;
+	}
+	globalThis.structuredClone = function structuredClone(v) { return clone(v, new Map()); };
+	globalThis.queueMicrotask = function queueMicrotask(cb) {
+		if (typeof cb !== "function") throw new TypeError("queueMicrotask: callback must be a function");
+		Promise.resolve().then(() => cb());
+	};
+})()`, false)
+
 func installTimers(env *ExecutionEnv) error {
 	vm := env.VM
 	maxDelay := EffectiveMaxTimeout()
 	rangeErrCtor, _ := goja.AssertConstructor(vm.Get("RangeError"))
 
-	setTimeout := func(call goja.FunctionCall) goja.Value {
+	registerTimer := func(opName string, call goja.FunctionCall, hasDelay bool, repeat bool) goja.Value {
 		fn, ok := goja.AssertFunction(call.Argument(0))
 		if !ok {
-			panic(vm.NewTypeError("setTimeout: callback must be a function"))
+			panic(vm.NewTypeError(opName + ": callback must be a function"))
 		}
-		delay := time.Duration(call.Argument(1).ToInteger()) * time.Millisecond
+		var delay time.Duration
+		argStart := 1
+		if hasDelay {
+			delay = time.Duration(call.Argument(1).ToInteger()) * time.Millisecond
+			argStart = 2
+		}
 		if delay < 0 {
 			delay = 0
+		}
+		if repeat && delay < time.Millisecond {
+			delay = time.Millisecond
 		}
 		if delay > maxDelay {
 			delay = maxDelay
 		}
 		var extra []goja.Value
-		if len(call.Arguments) > 2 {
-			extra = append(extra, call.Arguments[2:]...)
+		if len(call.Arguments) > argStart {
+			extra = append(extra, call.Arguments[argStart:]...)
 		}
 
 		env.startTimerCoordinator()
@@ -62,7 +95,7 @@ func installTimers(env *ExecutionEnv) error {
 		}
 		if len(env.timers) >= maxActiveTimers {
 			env.timersMu.Unlock()
-			msg := fmt.Sprintf("setTimeout: active timer limit (%d) exceeded", maxActiveTimers)
+			msg := fmt.Sprintf("%s: active timer limit (%d) exceeded", opName, maxActiveTimers)
 			if rangeErrCtor != nil {
 				if errObj, err := rangeErrCtor(nil, vm.ToValue(msg)); err == nil {
 					panic(errObj)
@@ -73,10 +106,12 @@ func installTimers(env *ExecutionEnv) error {
 		env.nextTimerID++
 		id := env.nextTimerID
 		entry := &timerEntry{
-			id:    id,
-			due:   time.Now().Add(delay),
-			fn:    fn,
-			extra: extra,
+			id:       id,
+			due:      time.Now().Add(delay),
+			interval: delay,
+			repeat:   repeat,
+			fn:       fn,
+			extra:    extra,
 		}
 		env.timers[id] = entry
 		env.pendingOps.Add(1)
@@ -86,7 +121,7 @@ func installTimers(env *ExecutionEnv) error {
 		return vm.ToValue(id)
 	}
 
-	clearTimeout := func(call goja.FunctionCall) goja.Value {
+	clearTimer := func(call goja.FunctionCall) goja.Value {
 		id := call.Argument(0).ToInteger()
 		env.timersMu.Lock()
 		if entry, ok := env.timers[id]; ok {
@@ -101,29 +136,32 @@ func installTimers(env *ExecutionEnv) error {
 		return goja.Undefined()
 	}
 
-	if err := vm.Set("setTimeout", setTimeout); err != nil {
+	if err := vm.Set("setTimeout", func(call goja.FunctionCall) goja.Value {
+		return registerTimer("setTimeout", call, true, false)
+	}); err != nil {
 		return err
 	}
-	if err := vm.Set("clearTimeout", clearTimeout); err != nil {
+	if err := vm.Set("clearTimeout", clearTimer); err != nil {
+		return err
+	}
+	if err := vm.Set("setInterval", func(call goja.FunctionCall) goja.Value {
+		return registerTimer("setInterval", call, true, true)
+	}); err != nil {
+		return err
+	}
+	if err := vm.Set("clearInterval", clearTimer); err != nil {
+		return err
+	}
+	if err := vm.Set("setImmediate", func(call goja.FunctionCall) goja.Value {
+		return registerTimer("setImmediate", call, false, false)
+	}); err != nil {
+		return err
+	}
+	if err := vm.Set("clearImmediate", clearTimer); err != nil {
 		return err
 	}
 
-	_, err := vm.RunString(`(function () {
-		function clone(v, seen) {
-			if (v === null || typeof v !== "object") return v;
-			if (seen.has(v)) return seen.get(v);
-			if (v instanceof Date) return new Date(v.getTime());
-			if (v instanceof RegExp) return new RegExp(v.source, v.flags);
-			if (ArrayBuffer.isView(v)) return v.slice();
-			if (v instanceof Map) { const m = new Map(); seen.set(v, m); v.forEach((x, k) => m.set(clone(k, seen), clone(x, seen))); return m; }
-			if (v instanceof Set) { const s = new Set(); seen.set(v, s); v.forEach((x) => s.add(clone(x, seen))); return s; }
-			const out = Array.isArray(v) ? [] : {};
-			seen.set(v, out);
-			for (const k of Object.keys(v)) out[k] = clone(v[k], seen);
-			return out;
-		}
-		globalThis.structuredClone = function structuredClone(v) { return clone(v, new Map()); };
-	})()`)
+	_, err := vm.RunProgram(timersCloneProg)
 	return err
 }
 
@@ -161,6 +199,24 @@ func (env *ExecutionEnv) settleTimerEntry(e *timerEntry) bool {
 	}
 	delete(env.timers, e.id)
 	return canceled
+}
+
+func (env *ExecutionEnv) isTimerCanceled(e *timerEntry) bool {
+	env.timersMu.Lock()
+	defer env.timersMu.Unlock()
+	return e.canceled || env.timersClosed
+}
+
+func (env *ExecutionEnv) rearmIntervalEntry(e *timerEntry) {
+	env.timersMu.Lock()
+	if e.canceled || env.timersClosed {
+		env.timersMu.Unlock()
+		return
+	}
+	e.due = time.Now().Add(e.interval)
+	e.dispatched = false
+	env.timersMu.Unlock()
+	env.signalTimerWake()
 }
 
 func (env *ExecutionEnv) runTimerCoordinator() {
@@ -216,12 +272,22 @@ func (env *ExecutionEnv) runTimerCoordinator() {
 							env.setAsyncErr(recoveredToError(env.VM, r))
 						}
 					}()
-					if env.settleTimerEntry(picked) {
+					if picked.repeat {
+						if env.isTimerCanceled(picked) {
+							return
+						}
+					} else if env.settleTimerEntry(picked) {
 						return
 					}
 					if _, err := picked.fn(goja.Undefined(), picked.extra...); err != nil {
+						if picked.repeat {
+							env.settleTimerEntry(picked)
+						}
 						env.setAsyncErr(err)
 						return
+					}
+					if picked.repeat {
+						env.rearmIntervalEntry(picked)
 					}
 					if _, dErr := env.deliverFn(goja.Undefined()); dErr != nil {
 						env.setAsyncErr(dErr)

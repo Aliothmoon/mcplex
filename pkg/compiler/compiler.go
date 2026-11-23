@@ -19,8 +19,8 @@ const wrapperPrefixLines = 2
 
 var (
 	importTypeLineRegex    = regexp.MustCompile(`^\s*import\s+type\s+[^;]+;?\s*$`)
-	importDefaultShimRegex = regexp.MustCompile(`^\s*import\s+(?:\*\s+as\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+["'](?:node:)?(buffer|path|crypto|url|os|process|fs(?:/promises)?)["']\s*;?\s*$`)
-	importNamedShimRegex   = regexp.MustCompile(`^\s*import\s*\{([^}]+)\}\s*from\s+["'](?:node:)?(buffer|path|crypto|url|os|process|fs(?:/promises)?)["']\s*;?\s*$`)
+	importDefaultShimRegex = regexp.MustCompile(`^\s*import\s+(?:\*\s+as\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+["'](?:node:)?(buffer|path(?:/posix|/win32)?|crypto|url|os|process|fs(?:/promises)?|util(?:/types)?|assert(?:/strict)?|zlib|events|querystring|string_decoder|perf_hooks|timers(?:/promises)?)["']\s*;?\s*$`)
+	importNamedShimRegex   = regexp.MustCompile(`^\s*import\s*\{([^}]+)\}\s*from\s+["'](?:node:)?(buffer|path(?:/posix|/win32)?|crypto|url|os|process|fs(?:/promises)?|util(?:/types)?|assert(?:/strict)?|zlib|events|querystring|string_decoder|perf_hooks|timers(?:/promises)?)["']\s*;?\s*$`)
 
 	jsStackLocRegex = regexp.MustCompile(`user_program\.ts:(\d+):(\d+)`)
 )
@@ -137,33 +137,69 @@ func Compile(code string, payloads map[string]string) (*CompileResult, error) {
 	}, nil
 }
 
+func builtinModuleTargetExpr(mod string) (expr string, identMatchesGlobal bool) {
+	switch mod {
+	case "buffer":
+		return "{ Buffer: (globalThis as any).Buffer }", false
+	case "url":
+		return "{ URL: (globalThis as any).URL, URLSearchParams: (globalThis as any).URLSearchParams }", false
+	case "fs", "fs/promises":
+		return "(globalThis as any).fs", mod == "fs"
+	case "path/posix":
+		return "(globalThis as any).path.posix", false
+	case "path/win32":
+		return "(globalThis as any).path.win32", false
+	case "util/types":
+		return "(globalThis as any).util.types", false
+	case "assert", "assert/strict":
+		return "(globalThis as any).assert", mod == "assert"
+	case "events":
+		return "(globalThis as any).events", true
+	case "timers":
+		return "{ setTimeout: (globalThis as any).setTimeout, clearTimeout: (globalThis as any).clearTimeout, setInterval: (globalThis as any).setInterval, clearInterval: (globalThis as any).clearInterval, setImmediate: (globalThis as any).setImmediate, clearImmediate: (globalThis as any).clearImmediate }", false
+	case "timers/promises":
+		return "{ setTimeout: (globalThis as any).sleep, scheduler: { wait: (globalThis as any).sleep } }", false
+	default:
+		return fmt.Sprintf("(globalThis as any).%s", mod), true
+	}
+}
+
+var globalShadowSameNames = map[string]map[string]bool{
+	"buffer":         {"Buffer": true},
+	"url":            {"URL": true, "URLSearchParams": true},
+	"util":           {"TextEncoder": true, "TextDecoder": true},
+	"events":         {"EventEmitter": true},
+	"perf_hooks":     {"performance": true},
+	"string_decoder": {"StringDecoder": true},
+	"timers":         {"setTimeout": true, "clearTimeout": true, "setInterval": true, "clearInterval": true, "setImmediate": true, "clearImmediate": true},
+}
+
 func rewriteBuiltinImportLine(line string) (string, bool) {
 	if m := importDefaultShimRegex.FindStringSubmatch(line); m != nil {
 		ident := m[1]
 		mod := m[2]
-		switch mod {
-		case "buffer":
-			if ident == "Buffer" {
-				return "// [builtin Buffer active]", true
-			}
-			return fmt.Sprintf("const %s = { Buffer: (globalThis as any).Buffer };", ident), true
-		case "url":
-			return fmt.Sprintf("const %s = { URL: (globalThis as any).URL, URLSearchParams: (globalThis as any).URLSearchParams };", ident), true
-		case "fs", "fs/promises":
-			if ident == "fs" {
-				return "// [sandbox fs active]", true
-			}
-			return fmt.Sprintf("const %s = (globalThis as any).fs;", ident), true
-		default:
-			if ident == mod {
-				return fmt.Sprintf("// [builtin %s active]", mod), true
-			}
-			return fmt.Sprintf("const %s = (globalThis as any).%s;", ident, mod), true
+		if mod == "buffer" && ident == "Buffer" {
+			return "// [builtin Buffer active]", true
 		}
+		if (mod == "fs" || mod == "fs/promises") && ident == "fs" {
+			return "// [sandbox fs active]", true
+		}
+		if (mod == "assert" || mod == "assert/strict") && ident == "assert" {
+			return "// [builtin assert active]", true
+		}
+		if mod == "events" && (ident == "events" || ident == "EventEmitter") {
+			return "// [builtin events active]", true
+		}
+		expr, matchesGlobal := builtinModuleTargetExpr(mod)
+		if matchesGlobal && ident == mod {
+			return fmt.Sprintf("// [builtin %s active]", mod), true
+		}
+		return fmt.Sprintf("const %s = %s;", ident, expr), true
 	}
 	if m := importNamedShimRegex.FindStringSubmatch(line); m != nil {
 		specList := strings.TrimSpace(m[1])
 		mod := m[2]
+		sameGlobal := globalShadowSameNames[mod]
 		var rewrittenSpecs []string
 		for _, part := range strings.Split(specList, ",") {
 			p := strings.TrimSpace(part)
@@ -173,32 +209,22 @@ func rewriteBuiltinImportLine(line string) (string, bool) {
 			if idx := strings.Index(p, " as "); idx > 0 {
 				orig := strings.TrimSpace(p[:idx])
 				alias := strings.TrimSpace(p[idx+4:])
+				if orig == alias && sameGlobal[orig] {
+					continue
+				}
 				rewrittenSpecs = append(rewrittenSpecs, orig+": "+alias)
 			} else {
+				if sameGlobal[p] {
+					continue
+				}
 				rewrittenSpecs = append(rewrittenSpecs, p)
 			}
 		}
 		if len(rewrittenSpecs) == 0 {
-			return "// [type import stripped]", true
+			return fmt.Sprintf("// [builtin %s globals active]", mod), true
 		}
-		joined := strings.Join(rewrittenSpecs, ", ")
-		switch mod {
-		case "buffer", "url":
-			var filtered []string
-			for _, rs := range rewrittenSpecs {
-				if rs != "Buffer" && rs != "URL" && rs != "URLSearchParams" {
-					filtered = append(filtered, rs)
-				}
-			}
-			if len(filtered) == 0 {
-				return fmt.Sprintf("// [builtin %s globals active]", mod), true
-			}
-			return fmt.Sprintf("const { %s } = globalThis as any;", strings.Join(filtered, ", ")), true
-		case "fs", "fs/promises":
-			return fmt.Sprintf("const { %s } = (globalThis as any).fs;", joined), true
-		default:
-			return fmt.Sprintf("const { %s } = (globalThis as any).%s;", joined, mod), true
-		}
+		expr, _ := builtinModuleTargetExpr(mod)
+		return fmt.Sprintf("const { %s } = %s;", strings.Join(rewrittenSpecs, ", "), expr), true
 	}
 	return "", false
 }

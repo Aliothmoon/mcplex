@@ -464,3 +464,125 @@ return { ok: true };
 		t.Fatalf("unexpected Python insertSymbol('inside') output:\ngot:\n%s\nwant:\n%s", string(gotPyBytes), wantPy)
 	}
 }
+
+func TestInnermostEndTargetAndParallelOutlines(t *testing.T) {
+	ws := t.TempDir()
+
+	// 1. Java class with two sibling methods sharing the exact same closing `return out;` line (live VM02 GuestImage.java case)
+	javaPath := filepath.Join(ws, "GuestImage.java")
+	javaSrc := strings.Join([]string{
+		"package io.vm02.probe;",
+		"public class GuestImage {",
+		"    public int writeAtomicReadOnly(int x) {",
+		"        int out = x + 1;",
+		"        out += 2;",
+		"        return out;",
+		"    }",
+		"    public int submitVimgExtract(int y) {",
+		"        int out = y * 3;",
+		"        return out;",
+		"    }",
+		"}",
+		"",
+	}, "\n")
+	if err := os.WriteFile(javaPath, []byte(javaSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. C file with two short neighbor functions sharing `return rc;\n}` (live VM02 runtime_files.c case)
+	cPath := filepath.Join(ws, "runtime_files.c")
+	cSrc := strings.Join([]string{
+		"static int import_ofd(int fd) {",
+		"    int rc = fd + 1;",
+		"    rc += 2;",
+		"    return rc;",
+		"}",
+		"",
+		"static int import_named(int fd) {",
+		"    int rc = fd + 9;",
+		"    return rc;",
+		"}",
+		"",
+	}, "\n")
+	if err := os.WriteFile(cPath, []byte(cSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Generate 10 extra files for parallel ast.outlines order verification
+	for i := 0; i < 10; i++ {
+		fn := filepath.Join(ws, fmt.Sprintf("mod_%02d.go", i))
+		src := fmt.Sprintf("package p\nfunc Fn%02d() int { return %d }\n", i, i)
+		if err := os.WriteFile(fn, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pol := policy.NewEngineWithOptions(ws, policy.Options{StrictWorkspace: true})
+	editBinder := &EditTxBinder{Policy: pol, Locks: NewFileLockTable()}
+	astBinder := &ASTBinder{Policy: pol}
+
+	res, err := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd:     ws,
+		Timeout: 10 * time.Second,
+		Code: `
+await edit.apply({
+  edits: [
+    {
+      path: "GuestImage.java",
+      hunks: [
+        {
+          target: "        int out = x + 1;",
+          endTarget: "        return out;",
+          replacement: "        return x + 100;",
+        },
+      ],
+    },
+    {
+      path: "runtime_files.c",
+      hunks: [
+        {
+          target: "    int rc = fd + 1;",
+          endTarget: "    return rc;\n}",
+          replacement: "    return fd + 42;\n}",
+        },
+      ],
+    },
+  ],
+});
+
+const paths = Array.from({ length: 10 }, (_, i) => "mod_" + String(i).padStart(2, "0") + ".go");
+paths.push("missing_mod.go");
+const outlines = await ast.outlines(paths);
+const names = outlines.slice(0, 10).map(o => o.symbols[0]?.name);
+
+return {
+  names,
+  missingEmpty: Array.isArray(outlines[10].symbols) && outlines[10].symbols.length === 0 && Boolean(outlines[10].error),
+};
+`,
+	}, editBinder, astBinder)
+	if err != nil {
+		t.Fatalf("sandbox Execute failed: %v", err)
+	}
+	m := res.Value.(map[string]any)
+	javaBytes, _ := os.ReadFile(javaPath)
+	javaAfter := string(javaBytes)
+	if !strings.Contains(javaAfter, "return x + 100;") || !strings.Contains(javaAfter, "int out = y * 3;\n        return out;") {
+		t.Fatalf("unexpected GuestImage.java after innermost endTarget edit:\n%s", javaAfter)
+	}
+	cBytes, _ := os.ReadFile(cPath)
+	cAfter := string(cBytes)
+	if !strings.Contains(cAfter, "return fd + 42;") || !strings.Contains(cAfter, "int rc = fd + 9;\n    return rc;") {
+		t.Fatalf("unexpected runtime_files.c after innermost endTarget edit:\n%s", cAfter)
+	}
+	names, _ := m["names"].([]any)
+	for i := 0; i < 10; i++ {
+		want := fmt.Sprintf("Fn%02d", i)
+		if len(names) <= i || names[i] != want {
+			t.Fatalf("parallel ast.outlines broke order at %d: got %v, want %s", i, names, want)
+		}
+	}
+	if m["missingEmpty"] != true {
+		t.Fatalf("expected missingEmpty=true, got %+v", m)
+	}
+}

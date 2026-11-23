@@ -680,7 +680,7 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 		}
 	}()
 
-	deliverVal, err := vm.RunString(`(function __flushMicrotasks() {})`)
+	deliverVal, err := vm.RunProgram(deliverProg)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap deliver failed: %w", err)
 	}
@@ -690,19 +690,7 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 	}
 	env.deliverFn = deliverFn
 
-	// Guest-visible host error: `name` = semantic kind, `message` = "op: detail" (one line), `data` = optional details.
-	// Enumerable {name, message, data} so returned/logged errors serialize compactly; toJSON yields the same one-liner.
-	// `stack` points at the user line that issued the call instead of this internal factory frame.
-	makeErrVal, err := vm.RunString(`(function __makeHostError(name, op, msg, line, data) {
-		const e = new Error(op + ": " + msg);
-		Object.defineProperty(e, "name", { value: name, enumerable: true, writable: true, configurable: true });
-		Object.defineProperty(e, "message", { value: e.message, enumerable: true, writable: true, configurable: true });
-		Object.defineProperty(e, "op", { value: op, writable: true, configurable: true });
-		if (data) e.data = data;
-		Object.defineProperty(e, "stack", { value: name + ": " + e.message + (line > 0 ? "\n    at code:" + line : ""), writable: true, configurable: true });
-		Object.defineProperty(e, "toJSON", { value: function () { return this.name + ": " + this.message; }, configurable: true });
-		return e;
-	})`)
+	makeErrVal, err := vm.RunProgram(makeErrProg)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap makeHostError failed: %w", err)
 	}
@@ -985,6 +973,9 @@ func installConsoleAndTimers(env *ExecutionEnv) error {
 	if err := env.VM.Set("console", consoleObj); err != nil {
 		return err
 	}
+	if _, err := env.VM.RunProgram(consoleExtrasProg); err != nil {
+		return err
+	}
 	if err := env.VM.Set("print", func(call goja.FunctionCall) goja.Value {
 		env.appendLog("log", call.Arguments)
 		return goja.Undefined()
@@ -1026,32 +1017,7 @@ func buildPayloadProxy(vm *goja.Runtime, payloads map[string]string) (goja.Value
 		raw[k] = v
 	}
 	_ = vm.Set("__rawPayloads", raw)
-	proxyVal, err := vm.RunString(`(function() {
-		const target = Object.freeze(Object.assign({}, __rawPayloads));
-		delete globalThis.__rawPayloads;
-		const keys = Object.keys(target);
-		return new Proxy(target, {
-			get(t, prop) {
-				if (typeof prop === "symbol" || prop === "then" || prop === "toJSON" || prop in Object.prototype) {
-					return t[prop];
-				}
-				if (!(prop in t)) {
-					throw new Error("PayloadError: key '" + String(prop) + "' does not exist in payloads. Provided keys: " + (keys.length ? keys.join(", ") : "(none)"));
-				}
-				return t[prop];
-			},
-			has(t, prop) {
-				return prop in t;
-			},
-			ownKeys(t) {
-				return Reflect.ownKeys(t);
-			},
-			getOwnPropertyDescriptor(t, prop) {
-				return Object.getOwnPropertyDescriptor(t, prop);
-			}
-		});
-	})()`)
-	return proxyVal, err
+	return vm.RunProgram(payloadProxyProg)
 }
 
 // newJSHostError creates a genuine JavaScript Error instance with .message, .stack, and .toJSON()
@@ -1079,7 +1045,32 @@ func opBudgetMessage(maxOps int) string {
 // 3. Common LLM method aliases (`fs.readFile` -> `fs.read`, `search.grep` -> `search.rg`, etc.) + clear `UnknownMethodError` listing valid methods!
 func installBootstrapWrappers(env *ExecutionEnv) error {
 	vm := env.VM
-	_, err := vm.RunString(`(function() {
+	_, err := vm.RunProgram(bootstrapWrappersProg)
+	if err != nil {
+		return err
+	}
+	if protoVal := vm.Get("__ptcHostObjProto"); protoVal != nil && !goja.IsUndefined(protoVal) && !goja.IsNull(protoVal) {
+		env.hostObjProto = protoVal.ToObject(vm)
+	}
+	_ = vm.GlobalObject().Delete("__ptcHostObjProto")
+	return nil
+}
+
+var (
+	deliverProg = goja.MustCompile("deliver.js", `(function __flushMicrotasks() {})`, false)
+	makeErrProg = goja.MustCompile("makeErr.js", `(function __makeHostError(name, op, msg, line, data) {
+		const e = new Error(op + ": " + msg);
+		Object.defineProperty(e, "name", { value: name, enumerable: true, writable: true, configurable: true });
+		Object.defineProperty(e, "message", { value: e.message, enumerable: true, writable: true, configurable: true });
+		Object.defineProperty(e, "op", { value: op, writable: true, configurable: true });
+		if (data) e.data = data;
+		Object.defineProperty(e, "stack", { value: name + ": " + e.message + (line > 0 ? "\n    at code:" + line : ""), writable: true, configurable: true });
+		Object.defineProperty(e, "toJSON", { value: function () { return this.name + ": " + this.message; }, configurable: true });
+		return e;
+	})`, false)
+	consoleExtrasProg     = goja.MustCompile("console_extras.js", consoleExtrasJS, false)
+	payloadProxyProg      = goja.MustCompile("payload_proxy.js", payloadProxyJS, false)
+	bootstrapWrappersProg = goja.MustCompile("wrappers.js", `(function() {
 		if (typeof globalThis.mcp === "object" && globalThis.mcp !== null) {
 			const baseMcp = globalThis.mcp;
 			globalThis.mcp = new Proxy(baseMcp, {
@@ -1131,7 +1122,8 @@ func installBootstrapWrappers(env *ExecutionEnv) error {
 		const aliasMap = {
 			fs: { readFile: "read", writeFile: "write", readdir: "list", ls: "list", dir: "list", readMany: "cat", readFiles: "cat",
 				mv: "rename", move: "rename", copy: "cp", copyFile: "cp", unlink: "rm", remove: "rm", mkdirp: "mkdir",
-				readBytes: "bytes", readBinary: "bytes", readBuffer: "bytes", checksum: "hash", digest: "hash" },
+				readBytes: "bytes", readBinary: "bytes", readBuffer: "bytes", checksum: "hash", digest: "hash",
+				existsSync: "exists", lstat: "stat" },
 			search: { grep: "rg", find: "glob", files: "glob" },
 			ast: { symbols: "outline", parse: "outline", readSymbol: "read", symbol: "read", getSymbol: "read" },
 			edit: { edit: "apply", patch: "apply" },
@@ -1243,16 +1235,71 @@ func installBootstrapWrappers(env *ExecutionEnv) error {
 				}
 			});
 		}
-	})()`)
-	if err != nil {
-		return err
-	}
-	if protoVal := vm.Get("__ptcHostObjProto"); protoVal != nil && !goja.IsUndefined(protoVal) && !goja.IsNull(protoVal) {
-		env.hostObjProto = protoVal.ToObject(vm)
-	}
-	_, _ = vm.RunString(`delete globalThis.__ptcHostObjProto;`)
-	return nil
-}
+	})()`, false)
+)
+
+const consoleExtrasJS = `(function() {
+	const c = globalThis.console;
+	if (!c) return;
+	const timers = new Map();
+	const counts = new Map();
+	c.dir = (obj) => c.log(obj);
+	c.table = (data) => c.log(data);
+	c.clear = () => {};
+	c.assert = (cond, ...args) => { if (!cond) c.error("Assertion failed:", ...args); };
+	c.time = (label = "default") => { timers.set(String(label), typeof performance !== "undefined" ? performance.now() : Date.now()); };
+	c.timeLog = (label = "default", ...args) => {
+		const k = String(label);
+		const start = timers.get(k);
+		if (start !== undefined) {
+			const elapsed = (typeof performance !== "undefined" ? performance.now() : Date.now()) - start;
+			c.log(k + ": " + elapsed.toFixed(2) + "ms", ...args);
+		}
+	};
+	c.timeEnd = (label = "default") => {
+		const k = String(label);
+		const start = timers.get(k);
+		if (start !== undefined) {
+			timers.delete(k);
+			const elapsed = (typeof performance !== "undefined" ? performance.now() : Date.now()) - start;
+			c.log(k + ": " + elapsed.toFixed(2) + "ms");
+		}
+	};
+	c.count = (label = "default") => {
+		const k = String(label);
+		const n = (counts.get(k) || 0) + 1;
+		counts.set(k, n);
+		c.log(k + ": " + n);
+	};
+	c.countReset = (label = "default") => { counts.delete(String(label)); };
+	c.trace = (...args) => { c.log("Trace:", ...args); };
+})()`
+
+const payloadProxyJS = `(function() {
+	const target = Object.freeze(Object.assign({}, __rawPayloads));
+	delete globalThis.__rawPayloads;
+	const keys = Object.keys(target);
+	return new Proxy(target, {
+		get(t, prop) {
+			if (typeof prop === "symbol" || prop === "then" || prop === "toJSON" || prop in Object.prototype) {
+				return t[prop];
+			}
+			if (!(prop in t)) {
+				throw new Error("PayloadError: key '" + String(prop) + "' does not exist in payloads. Provided keys: " + (keys.length ? keys.join(", ") : "(none)"));
+			}
+			return t[prop];
+		},
+		has(t, prop) {
+			return prop in t;
+		},
+		ownKeys(t) {
+			return Reflect.ownKeys(t);
+		},
+		getOwnPropertyDescriptor(t, prop) {
+			return Object.getOwnPropertyDescriptor(t, prop);
+		}
+	});
+})()`
 
 var (
 	gojaNoMemberRegex  = regexp.MustCompile(`TypeError:\s+Object has no member '([^']+)'`)

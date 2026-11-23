@@ -184,15 +184,16 @@ Example (start dev server and wait for ready):
 	{
 		ID:      "globals",
 		Title:   "Built-in JS/Node Utility Globals",
-		Summary: "P/payloads, Buffer, crypto, path, URL, setTimeout, sleep, process, os",
-		Aliases: []string{"global", "stdlib", "buffer", "crypto", "payloads", "sleep", "env"},
-		Body: `Available globally in ` + "`exec`" + ` without ` + "`import`" + `:
+		Summary: "P/payloads, Buffer, zlib, util, assert, events, crypto, path, URL, timers, process, os",
+		Aliases: []string{"global", "stdlib", "buffer", "crypto", "zlib", "util", "assert", "payloads", "sleep", "env"},
+		Body: `Available globally in ` + "`exec`" + ` (and via ` + "`import ... from \"node:<mod>\"`" + `):
 - ` + "`P`" + ` / ` + "`payloads`" + `: named multiline text/code blocks passed in the ` + "`payloads`" + ` argument
-- ` + "`Buffer`" + ` (` + "`utf8`/`base64`/`base64url`/`hex`/`utf16le`" + `), ` + "`btoa`/`atob`" + `, ` + "`TextEncoder`/`TextDecoder`" + `
-- ` + "`path`" + ` (` + "`join`/`resolve`/`dirname`/`basename`/`extname`" + `)
-- ` + "`crypto`" + ` (` + "`randomUUID`/`createHash`" + `), ` + "`URL`/`URLSearchParams`" + `, ` + "`structuredClone`" + `
-- ` + "`setTimeout`/`clearTimeout`" + `, ` + "`await sleep(ms)`" + `
-- Read-only ` + "`process`" + ` (` + "`platform`" + `, ` + "`arch`" + `, ` + "`cwd()`" + `, ` + "`env`" + ` with secret-looking values redacted) and ` + "`os`" + ` (` + "`homedir()`" + `, ` + "`tmpdir()`" + `, ` + "`EOL`" + `)`,
+- ` + "`Buffer`" + ` (` + "`utf8`/`base64`/`base64url`/`hex`/`utf16le`" + `, full ` + "`read/write[U]Int{8,16,32}LE/BE`" + `, ` + "`read/writeBig[U]Int64LE/BE`" + `, ` + "`read/writeFloat/DoubleLE/BE`" + `, ` + "`indexOf`/`includes`/`copy`/`swap*`" + `), ` + "`btoa`/`atob`" + `, ` + "`TextEncoder`/`TextDecoder`" + `
+- ` + "`zlib`" + ` (` + "`gzipSync`/`gunzipSync`/`deflateSync`/`inflateSync`/`deflateRawSync`/`inflateRawSync`/`unzipSync`" + ` + async), ` + "`util`" + ` (` + "`format`/`inspect`/`promisify`/`parseArgs`/`stripVTControlCharacters`/`types`" + `), ` + "`assert`" + ` (` + "`deepStrictEqual`/`throws`/`rejects`" + `), ` + "`events`" + ` (` + "`EventEmitter`" + `), ` + "`querystring`" + `, ` + "`string_decoder`" + `
+- ` + "`path`" + ` (` + "`join`/`resolve`/`relative`/`dirname`/`basename`/`extname`/`parse`/`format`" + `)
+- ` + "`crypto`" + ` (` + "`randomUUID`/`randomBytes`/`randomInt`/`createHash`/`createHmac`/`hash`/`timingSafeEqual`" + `), ` + "`URL`/`URLSearchParams`" + `, ` + "`structuredClone`" + `
+- ` + "`performance.now()`" + `, ` + "`setTimeout`/`clearTimeout`" + `, ` + "`setInterval`/`clearInterval`" + `, ` + "`setImmediate`" + `, ` + "`queueMicrotask`" + `, ` + "`await sleep(ms)`" + `
+- Read-only ` + "`process`" + ` (` + "`platform`" + `, ` + "`arch`" + `, ` + "`pid`" + `, ` + "`hrtime`" + `, ` + "`stdout.write`" + `, ` + "`cwd()`" + `, ` + "`env`" + ` with secret-looking values redacted) and ` + "`os`" + ` (` + "`cpus()`" + `, ` + "`availableParallelism()`" + `, ` + "`endianness()`" + `, ` + "`homedir()`" + `, ` + "`tmpdir()`" + `, ` + "`EOL`" + `)`,
 	},
 	{
 		ID:      "errors",

@@ -8,8 +8,11 @@ import (
 	"go/token"
 	"os"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/aliothmoon/mcplex/pkg/policy"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
@@ -65,19 +68,40 @@ func (b *ASTBinder) Bind(env *sandbox.ExecutionEnv) error {
 				paths = paths[:50]
 			}
 			results := make([]FileOutline, len(paths))
-			for i, p := range paths {
+			outlineOne := func(i int, p string) {
 				absPath, err := b.Policy.ResolveAndCheckRead(env.Cwd, p)
 				if err != nil {
 					results[i] = FileOutline{File: p, Symbols: []SymbolInfo{}, Error: err.Error()}
-					continue
+					return
 				}
 				ol, err := extractFileOutline(env.Cwd, absPath)
 				if err != nil {
 					results[i] = FileOutline{File: p, Symbols: []SymbolInfo{}, Error: err.Error()}
-					continue
+					return
 				}
 				results[i] = ol
 			}
+			if len(paths) == 1 {
+				outlineOne(0, paths[0])
+				return results, nil
+			}
+			workers := minInt(len(paths), minInt(8, maxInt(2, runtime.GOMAXPROCS(0))))
+			var nextIdx atomic.Int32
+			var wg sync.WaitGroup
+			wg.Add(workers)
+			for w := 0; w < workers; w++ {
+				go func() {
+					defer wg.Done()
+					for {
+						idx := int(nextIdx.Add(1) - 1)
+						if idx >= len(paths) {
+							return
+						}
+						outlineOne(idx, paths[idx])
+					}
+				}()
+			}
+			wg.Wait()
 			return results, nil
 		},
 		// ast.read(path, "Type::method" | "Type.method" | "name", { lineNumbers? }) -> { kind, name, startLine, endLine, text }

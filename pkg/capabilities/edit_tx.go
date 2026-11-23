@@ -1754,26 +1754,63 @@ func resolveEndTargetHunk(
 	afterOff := sRel[1]
 	subEnd := len(windowText)
 	cappedBy120 := false
+	var endSpans [][2]int
+	var endLines []int
+	resolvedInner := false
+
 	if h.Symbol == "" && h.EndLine == 0 {
-		maxLine := sEndLine + defaultMaxEndTargetSpanLines
-		// If `target` sits inside an AST symbol (e.g. a 250-line C/Java/Rust function or class), allow `endTarget`
-		// anywhere up to the end of that enclosing symbol without requiring an explicit `symbol` parameter.
+		var enclosing []SymbolInfo
 		for _, sym := range outline() {
-			if sLine >= sym.StartLine && sLine <= sym.EndLine && sym.EndLine > maxLine {
-				maxLine = sym.EndLine
+			if !sym.unclosed && sLine >= sym.StartLine && sLine <= sym.EndLine {
+				enclosing = append(enclosing, sym)
 			}
 		}
-		if maxLine < len(lineStarts) {
-			capRel := lineStarts[maxLine] - winStart
-			if capRel < subEnd && capRel >= afterOff {
-				subEnd = capRel
-				cappedBy120 = true
+		sort.SliceStable(enclosing, func(i, j int) bool {
+			return (enclosing[i].EndLine - enclosing[i].StartLine) < (enclosing[j].EndLine - enclosing[j].StartLine)
+		})
+		// Try innermost enclosing AST symbol first (e.g. a method inside a class, or a short C function)
+		// so sibling methods / neighbor functions cannot cause spurious Ambiguous endTarget collisions;
+		// if 0 matches exist inside the inner symbol, widen to outer symbols / default 120-line span.
+		for _, sym := range enclosing {
+			symEndOff := len(windowText)
+			if sym.EndLine < len(lineStarts) {
+				if rel := lineStarts[sym.EndLine] - winStart; rel < symEndOff {
+					symEndOff = rel
+				}
+			}
+			if symEndOff < afterOff {
+				continue
+			}
+			candSpans, candLines, _ := findAnchorCandidates(windowText[afterOff:symEndOff], normEnd, relPath, winStart+afterOff, lineStarts, getPyStates)
+			if len(candSpans) > 0 {
+				subEnd = symEndOff
+				endSpans = candSpans
+				endLines = candLines
+				resolvedInner = true
+				break
+			}
+		}
+		if !resolvedInner {
+			maxLine := sEndLine + defaultMaxEndTargetSpanLines
+			for _, sym := range enclosing {
+				if sym.EndLine > maxLine {
+					maxLine = sym.EndLine
+				}
+			}
+			if maxLine < len(lineStarts) {
+				capRel := lineStarts[maxLine] - winStart
+				if capRel < subEnd && capRel >= afterOff {
+					subEnd = capRel
+					cappedBy120 = true
+				}
 			}
 		}
 	}
 
 	subWindow := windowText[afterOff:subEnd]
-	endSpans, endLines, _ := findAnchorCandidates(subWindow, normEnd, relPath, winStart+afterOff, lineStarts, getPyStates)
+	if !resolvedInner {
+		endSpans, endLines, _ = findAnchorCandidates(subWindow, normEnd, relPath, winStart+afterOff, lineStarts, getPyStates)
+	}
 	if len(endSpans) == 0 {
 		if cappedBy120 && subEnd < len(windowText) {
 			farSpans, farLines, _ := findAnchorCandidates(windowText[subEnd:], normEnd, relPath, winStart+subEnd, lineStarts, getPyStates)
