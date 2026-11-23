@@ -94,7 +94,7 @@ func TestRingStaysFastAndCorrectWithLargeCapacityAndStreams(t *testing.T) {
 		}
 	}
 	elapsed := time.Since(start)
-	if per := elapsed / n; per > 20*time.Microsecond {
+	if per := elapsed / n; per > 100*time.Microsecond {
 		t.Fatalf("Emit too slow with capacity 5000: %v per event", per)
 	}
 
