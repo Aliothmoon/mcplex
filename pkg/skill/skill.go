@@ -43,7 +43,7 @@ var docTopics = []DocTopic{
 		Title:   "fs — Files, Binary Slices & Streaming Hash",
 		Summary: "read, cat, write, exists [sync], bytes, hash, stat, list, tree, mkdir, rm, rename, cp",
 		Aliases: []string{"file", "files", "read", "write", "hash", "tree"},
-		Body: `- ` + "`await fs.read(path, { startLine?, endLine?, limit?, tail?, lineNumbers? }) -> string`" + ` (up to 2 MB; ` + "`tail: N`" + ` reads last N lines of any file size)
+		Body: `- ` + "`await fs.read(path, { startLine?, endLine?, limit?, tail?, lineNumbers? }) -> string`" + ` (up to 2 MB; ` + "`tail: N`" + ` reads last N lines of any file size; ` + "`.gz`" + ` text files auto-decompressed)
 - ` + "`await fs.cat(paths, opts?) -> { [path]: string | null }`" + ` (parallel multi-read; failed paths return ` + "`null`" + ` + warning)
 - ` + "`await fs.write(path, content, { eol?: \"lf\" | \"crlf\" })`" + ` (preserves existing EOL style by default; new ` + "`.bat`/`.cmd`" + ` -> CRLF)
 - ` + "`fs.exists(path) -> boolean`" + ` (**sync**, no ` + "`await`" + ` needed)

@@ -1318,12 +1318,41 @@ func hasWindowsAlternateDataStream(p string) bool {
 	return strings.Contains(s, ":")
 }
 
+// DedupEmbeddedDrivePrefix handles cross-repo path joins where a caller accidentally prefixes an
+// already-absolute external path returned by `search.glob` / `search.rg` with the same root again
+// (e.g. "F:/Project/MaaMeow" + "/" + "F:/Project/MaaMeow/app/Foo.kt" -> "F:/Project/MaaMeow/app/Foo.kt").
+// If a *different* drive prefix is embedded ("C:/foo/D:/bar"), it returns a clear BadArgs-friendly error
+// instead of falling through to the NTFS Alternate Data Stream `DecisionDeny` check.
+func DedupEmbeddedDrivePrefix(p string) (string, error) {
+	norm := strings.ReplaceAll(strings.TrimSpace(p), "\\", "/")
+	if len(norm) < 4 || !isASCIIAlpha(norm[0]) || norm[1] != ':' || norm[2] != '/' {
+		return p, nil
+	}
+	for i := 2; i+3 <= len(norm); i++ {
+		if norm[i] == '/' && isASCIIAlpha(norm[i+1]) && norm[i+2] == ':' && (i+3 == len(norm) || norm[i+3] == '/') {
+			prefix := strings.TrimRight(norm[:i], "/")
+			rest := norm[i+1:]
+			if prefix != "" && (strings.EqualFold(rest, prefix) ||
+				(len(rest) > len(prefix) && strings.EqualFold(rest[:len(prefix)], prefix) && rest[len(prefix)] == '/')) {
+				return rest, nil
+			}
+			return "", errors.New("invalid path '" + p + "': contains embedded Windows drive prefix '" + norm[i+1:min(len(norm), i+4)] + "' (search.glob and search.rg already return full paths for external directories)")
+		}
+	}
+	return p, nil
+}
+
 func resolveWithSymlinks(baseDir, p string) (absPath string, realPath string, err error) {
 	p = strings.TrimSpace(p)
 	if p == "" {
 		return "", "", errors.New("path cannot be empty")
 	}
 	if runtime.GOOS == "windows" {
+		deduped, dErr := DedupEmbeddedDrivePrefix(p)
+		if dErr != nil {
+			return "", "", dErr
+		}
+		p = deduped
 		cleaned, blocked := normalizeWindowsExtendedPath(p)
 		if blocked || hasWindowsAlternateDataStream(cleaned) {
 			return "", "", &PolicyError{

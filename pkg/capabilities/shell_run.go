@@ -136,8 +136,15 @@ func (b *ShellGitBinder) RunArgv(parentCtx context.Context, env *sandbox.Executi
 	if in, ok := opts["stdin"].(string); ok {
 		cmd.Stdin = strings.NewReader(in)
 	}
-	stdout := newLimitedSyncBuffer(512 * 1024)
-	stderr := newLimitedSyncBuffer(256 * 1024)
+	maxOutBytes := optInt(opts, "maxBytes", 8*1024*1024)
+	if maxOutBytes < 64*1024 {
+		maxOutBytes = 64 * 1024
+	}
+	if maxOutBytes > 32*1024*1024 {
+		maxOutBytes = 32 * 1024 * 1024
+	}
+	stdout := newLimitedSyncBuffer(maxOutBytes)
+	stderr := newLimitedSyncBuffer(512 * 1024)
 	var live *events.LiveStream
 	streamID := ""
 	if b.Events.Active() {
@@ -239,7 +246,7 @@ func (b *ShellGitBinder) RunArgv(parentCtx context.Context, env *sandbox.Executi
 	}
 	for name, buf := range map[string]*limitedSyncBuffer{"stdout": stdout, "stderr": stderr} {
 		if d := buf.droppedBytes(); d > 0 {
-			env.AddWarning(fmt.Sprintf("sh.run: %s middle truncated (%d bytes dropped); redirect to a file or filter output", name, d))
+			env.AddWarning(fmt.Sprintf("sh.run: %s middle truncated (%d bytes dropped); pass { maxBytes } or redirect to a file", name, d))
 		}
 	}
 
@@ -250,6 +257,9 @@ func (b *ShellGitBinder) RunArgv(parentCtx context.Context, env *sandbox.Executi
 		"stdout":     cleanOut,
 		"stderr":     cleanErr,
 		"durationMs": durMs,
+	}
+	if dropped := stdout.droppedBytes() + stderr.droppedBytes(); dropped > 0 {
+		res["truncated"] = dropped
 	}
 	if ok, _ := res["ok"].(bool); !ok && (optBool(opts, "throwOnError", false) || !optBool(opts, "settle", true)) {
 		kind := sandbox.KindCmdFailed

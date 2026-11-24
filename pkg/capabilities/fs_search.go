@@ -3,10 +3,12 @@ package capabilities
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -98,7 +100,11 @@ func (b *FSSearchBinder) readText(cwd, targetPath string, opts map[string]any) (
 	limit := optInt(opts, "limit", 0)
 	hasRange := startLine > 0 || endLine > 0 || limit > 0
 	withNumbers := optBool(opts, "lineNumbers", false)
-	if tail := optInt(opts, "tail", 0); tail > 0 {
+	tail := optInt(opts, "tail", 0)
+	if isGzipFile(absPath) {
+		return readGzippedText(absPath, targetPath, startLine, endLine, limit, tail, withNumbers)
+	}
+	if tail > 0 {
 		return readTailLines(absPath, targetPath, tail, withNumbers)
 	}
 	if info.Size() > MaxSandboxReadBytes {
@@ -148,6 +154,141 @@ func (b *FSSearchBinder) readText(cwd, targetPath string, opts map[string]any) (
 		return strings.Join(selected, "\n"), nil
 	}
 	return text, nil
+}
+
+const maxGzipScanBytes = 64 * 1024 * 1024 // 64 MB streaming gunzip cap for range/tail reads
+
+func isGzipFile(absPath string) bool {
+	low := strings.ToLower(absPath)
+	if !strings.HasSuffix(low, ".gz") && !strings.HasSuffix(low, ".gzip") {
+		return false
+	}
+	f, err := os.Open(absPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var hdr [2]byte
+	n, err := io.ReadFull(f, hdr[:])
+	return err == nil && n == 2 && hdr[0] == 0x1f && hdr[1] == 0x8b
+}
+
+func readGzippedText(absPath, targetPath string, startLine, endLine, limit, tail int, withNumbers bool) (string, error) {
+	f, err := os.Open(absPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return "", fmt.Errorf("invalid gzip file %s: %w", targetPath, err)
+	}
+	defer gr.Close()
+
+	hasRange := startLine > 0 || endLine > 0 || limit > 0
+	if tail <= 0 && !hasRange {
+		lr := &io.LimitedReader{R: gr, N: MaxSandboxReadBytes + 1}
+		raw, rErr := io.ReadAll(lr)
+		if rErr != nil {
+			return "", rErr
+		}
+		if len(raw) > MaxSandboxReadBytes {
+			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil,
+				"%s decompresses to >2MB; pass { startLine, endLine }, { tail: N }, or use zlib.gunzipSync", targetPath)
+		}
+		if bytes.IndexByte(raw, 0) >= 0 || !utf8.Valid(raw) {
+			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", targetPath)
+		}
+		text := strings.ReplaceAll(string(raw), "\r\n", "\n")
+		if withNumbers {
+			lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
+			for i, l := range lines {
+				lines[i] = fmt.Sprintf("%d: %s", i+1, l)
+			}
+			return strings.Join(lines, "\n"), nil
+		}
+		return text, nil
+	}
+
+	sc := bufio.NewScanner(&io.LimitedReader{R: gr, N: maxGzipScanBytes})
+	sc.Buffer(make([]byte, 64*1024), MaxSandboxReadBytes)
+
+	if tail > 0 {
+		if tail > 5000 {
+			tail = 5000
+		}
+		ring := make([]string, tail)
+		total := 0
+		for sc.Scan() {
+			rawLine := sc.Bytes()
+			if bytes.IndexByte(rawLine, 0) >= 0 || !utf8.Valid(rawLine) {
+				return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", targetPath)
+			}
+			ring[total%tail] = string(rawLine)
+			total++
+		}
+		if scanErr := sc.Err(); scanErr != nil {
+			return "", scanErr
+		}
+		if total == 0 {
+			return "", nil
+		}
+		count := minInt(total, tail)
+		startIdx := 0
+		if total > tail {
+			startIdx = total % tail
+		}
+		firstLineNo := total - count + 1
+		out := make([]string, count)
+		for i := 0; i < count; i++ {
+			line := ring[(startIdx+i)%tail]
+			if withNumbers {
+				line = fmt.Sprintf("%d: %s", firstLineNo+i, line)
+			}
+			out[i] = line
+		}
+		return strings.Join(out, "\n"), nil
+	}
+
+	s := maxInt(1, startLine)
+	e := endLine
+	if e <= 0 && limit > 0 {
+		e = s + limit - 1
+	}
+	if e <= 0 {
+		e = s + 499
+	}
+	if e < s {
+		return "", fmt.Errorf("invalid range: startLine (%d) > endLine (%d)", s, e)
+	}
+	var selected []string
+	totalBytes := 0
+	lineNum := 0
+	for sc.Scan() {
+		rawLine := sc.Bytes()
+		lineNum++
+		if bytes.IndexByte(rawLine, 0) >= 0 || !utf8.Valid(rawLine) {
+			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", targetPath)
+		}
+		if lineNum >= s && lineNum <= e {
+			clean := string(rawLine)
+			if withNumbers {
+				clean = fmt.Sprintf("%d: %s", lineNum, clean)
+			}
+			totalBytes += len(clean) + 1
+			if totalBytes > MaxSandboxReadBytes {
+				return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "requested line range from '%s' exceeds 2MB sandbox read cap; request fewer lines", targetPath)
+			}
+			selected = append(selected, clean)
+		}
+		if lineNum >= e {
+			break
+		}
+	}
+	if scanErr := sc.Err(); scanErr != nil {
+		return "", scanErr
+	}
+	return strings.Join(selected, "\n"), nil
 }
 
 func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {

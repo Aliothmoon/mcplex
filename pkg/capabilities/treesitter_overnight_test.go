@@ -1,6 +1,8 @@
 package capabilities
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"os"
@@ -660,5 +662,103 @@ return {
 	}
 	if len(fallbackHits) != 2 || fallbackHits[0].Line != 5 || fallbackHits[1].Line != 6 {
 		t.Fatalf("unexpected regexp2 fallback hits: %+v", fallbackHits)
+	}
+}
+
+func TestShRunLargeBase64GzipReadAndDuplicateDrivePath(t *testing.T) {
+	ws := t.TempDir()
+
+	// 1. Create a real .txt.gz log file & a binary .bin.gz file
+	var gzBuf bytes.Buffer
+	gw := gzip.NewWriter(&gzBuf)
+	for i := 1; i <= 10; i++ {
+		_, _ = fmt.Fprintf(gw, "logcat line %02d\n", i)
+	}
+	_ = gw.Close()
+	if err := os.WriteFile(filepath.Join(ws, "art~keystore-logcat.txt.gz"), gzBuf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var binGz bytes.Buffer
+	bgw := gzip.NewWriter(&binGz)
+	_, _ = bgw.Write([]byte{0x7f, 'E', 'L', 'F', 0x00, 0x01})
+	_ = bgw.Close()
+	if err := os.WriteFile(filepath.Join(ws, "payload.bin.gz"), binGz.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Test DedupEmbeddedDrivePrefix directly across all platforms
+	dedup, dErr := policy.DedupEmbeddedDrivePrefix("F:/Project/Android/MaaMeow/F:/Project/Android/MaaMeow/app/Foo.kt")
+	if dErr != nil || dedup != "F:/Project/Android/MaaMeow/app/Foo.kt" {
+		t.Fatalf("expected duplicate drive prefix collapsed, got %q err=%v", dedup, dErr)
+	}
+	if _, mismatchErr := policy.DedupEmbeddedDrivePrefix("C:/Project/Foo/D:/Other/Bar.kt"); mismatchErr == nil || !strings.Contains(mismatchErr.Error(), "embedded Windows drive prefix") {
+		t.Fatalf("expected mismatched embedded drive error, got: %v", mismatchErr)
+	}
+
+	pol := policy.NewEngineWithOptions(ws, policy.Options{StrictWorkspace: false})
+	fsBinder := &FSSearchBinder{Policy: pol}
+	shBinder := &ShellGitBinder{Policy: pol}
+
+	res, err := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd:     ws,
+		Timeout: 15 * time.Second,
+		Code: `
+// A. Verify sh.run preserves >256KB (600KB Base64 = 450KB raw bytes) intact without middle-truncation corruption!
+const raw450k = Buffer.alloc(450 * 1024, 0x5a);
+const b64In = raw450k.toString("base64"); // 614,400 chars (> 512KB old cap & > 262,144 half cap!)
+await fs.write("big.b64", b64In);
+let stdoutB64 = "";
+if (process.platform === "win32") {
+  const r = await sh.run("cmd.exe", ["/d", "/s", "/c", "type big.b64"]);
+  stdoutB64 = r.stdout.trim();
+} else {
+  const r = await sh.run("cat", ["big.b64"]);
+  stdoutB64 = r.stdout.trim();
+}
+const decoded = Buffer.from(stdoutB64, "base64");
+assert.strictEqual(decoded.length, 450 * 1024);
+assert.strictEqual(decoded[0], 0x5a);
+assert.strictEqual(decoded[decoded.length - 1], 0x5a);
+
+// B. Verify fs.read transparently decompresses .txt.gz in full, range, and tail modes!
+const fullGz = await fs.read("art~keystore-logcat.txt.gz");
+const rangeGz = await fs.read("art~keystore-logcat.txt.gz", { startLine: 3, endLine: 4, lineNumbers: true });
+const tailGz = await fs.read("art~keystore-logcat.txt.gz", { tail: 2, lineNumbers: true });
+
+let binGzBlocked = false;
+try {
+  await fs.read("payload.bin.gz");
+} catch (e: any) {
+  binGzBlocked = e.name === "BadArgs" && e.message.includes("is binary");
+}
+
+// C. On Windows, verify accidental double-prefixed absolute path resolves cleanly in fs.read!
+let winDedupOk = true;
+if (process.platform === "win32") {
+  const slashWs = process.cwd().replace(/\\/g, "/");
+  const doubled = slashWs + "/" + slashWs + "/art~keystore-logcat.txt.gz";
+  const viaDoubled = await fs.read(doubled, { tail: 1 });
+  winDedupOk = viaDoubled === "logcat line 10";
+}
+
+return {
+  fullLines: fullGz.trim().split("\n").length,
+  rangeGz,
+  tailGz,
+  binGzBlocked,
+  winDedupOk,
+};
+`,
+	}, fsBinder, shBinder)
+	if err != nil {
+		t.Fatalf("TestShRunLargeBase64GzipReadAndDuplicateDrivePath failed: %v", err)
+	}
+	m := res.Value.(map[string]any)
+	if m["fullLines"] != int64(10) || m["rangeGz"] != "3: logcat line 03\n4: logcat line 04" || m["tailGz"] != "9: logcat line 09\n10: logcat line 10" {
+		t.Fatalf("unexpected .gz fs.read results: %+v", m)
+	}
+	if m["binGzBlocked"] != true || m["winDedupOk"] != true {
+		t.Fatalf("unexpected binGzBlocked/winDedupOk: %+v", m)
 	}
 }
