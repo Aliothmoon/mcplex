@@ -586,3 +586,79 @@ return {
 		t.Fatalf("expected missingEmpty=true, got %+v", m)
 	}
 }
+
+func TestSearchRgPCRE2LookaroundAndErrorDetail(t *testing.T) {
+	ws := t.TempDir()
+	cSrc := strings.Join([]string{
+		"static const int kMagic = 7;",
+		"static inline int fast_add(int a, int b) { return a + b; }",
+		"static __attribute__((unused)) int g_unused = 0;",
+		"static pthread_mutex_t g_lock;",
+		"static int g_slot_count = 0;",
+		"static char *g_boot_path = NULL;",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(ws, "dyn_exec.c"), []byte(cSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pol := policy.NewEngineWithOptions(ws, policy.Options{StrictWorkspace: true})
+	searchBinder := &FSSearchBinder{Policy: pol}
+
+	// 1. Live VM02 negative-lookahead regex via search.rg (hits + count + filesOnly) + full error reason on broken regex!
+	res, err := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd:     ws,
+		Timeout: 10 * time.Second,
+		Code: `
+const pat = "^\\s*static\\s+(?!const\\b)(?!inline\\b)(?!__attribute__)(?!pthread_mutex_t\\b)[^(\\n]*;";
+const [hits, counts, files] = await Promise.all([
+  search.rg(pat, { path: "dyn_exec.c" }),
+  search.rg(pat, { count: true }),
+  search.rg(pat, { filesOnly: true }),
+]);
+
+let badErr = "";
+try {
+  await search.rg("(unclosed_group");
+} catch (e: any) {
+  badErr = e.message;
+}
+
+return {
+  lines: hits.map((h: any) => h.line),
+  texts: hits.map((h: any) => h.text.trim()),
+  count: counts["dyn_exec.c"],
+  filesLen: files.length,
+  badErr,
+};
+`,
+	}, searchBinder)
+	if err != nil {
+		t.Fatalf("search.rg PCRE2 lookahead failed: %v", err)
+	}
+	m := res.Value.(map[string]any)
+	lines, _ := m["lines"].([]any)
+	if len(lines) != 2 || lines[0] != int64(5) || lines[1] != int64(6) {
+		t.Fatalf("expected lines [5, 6] matched by negative lookahead, got: %+v", m)
+	}
+	if m["count"] != int64(2) || m["filesLen"] != int64(1) {
+		t.Fatalf("expected count=2 and filesLen=1 with PCRE2 lookahead, got: %+v", m)
+	}
+	badErr, _ := m["badErr"].(string)
+	if !strings.Contains(strings.ToLower(badErr), "unclosed") && !strings.Contains(strings.ToLower(badErr), "missing )") {
+		t.Fatalf("expected invalidRegexError to preserve actual unclosed-group diagnostic line, got: %q", badErr)
+	}
+
+	// 2. Pure-Go regexp2 fallback when rg is unavailable / built without PCRE2!
+	fallbackHits, err := runGoFallbackSearch(context.Background(), pol, ws, ws, searchQuery{
+		pattern:       `^\s*static\s+(?!const\b)(?!inline\b)(?!__attribute__)(?!pthread_mutex_t\b)[^(\n]*;`,
+		caseSensitive: true,
+		maxResults:    50,
+	})
+	if err != nil {
+		t.Fatalf("runGoFallbackSearch with regexp2 lookahead failed: %v", err)
+	}
+	if len(fallbackHits) != 2 || fallbackHits[0].Line != 5 || fallbackHits[1].Line != 6 {
+		t.Fatalf("unexpected regexp2 fallback hits: %+v", fallbackHits)
+	}
+}

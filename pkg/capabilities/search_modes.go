@@ -5,11 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/aliothmoon/mcplex/pkg/policy"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
@@ -91,45 +89,13 @@ func (b *FSSearchBinder) runListSearch(ctx context.Context, env *sandbox.Executi
 
 // runRgCounts runs `rg --count` (matching lines per file); files mode reuses it since rg -l is just count > 0.
 func runRgCounts(ctx context.Context, pol *policy.Engine, rgBin, workspaceCwd, searchRoot string, q searchQuery) ([]fileCount, bool, error) {
-	args := []string{"--count", "--with-filename", "--no-heading", "--color=never"}
-	if q.literal {
-		args = append(args, "--fixed-strings")
-	}
-	if !q.caseSensitive {
-		args = append(args, "--ignore-case")
-	} else {
-		args = append(args, "--case-sensitive")
-	}
-	if q.glob != "" {
-		args = append(args, "-g", q.glob)
-	}
-	args = append(args, "--", q.pattern, searchRoot)
-
-	rgCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(rgCtx, rgBin, args...)
-	setSysProcAttrHide(cmd)
-	stdout := newLimitedSyncBuffer(8 * 1024 * 1024)
-	stderr := newLimitedSyncBuffer(64 * 1024)
-	cmd.Stdout, cmd.Stderr = stdout, stderr
-	if err := cmd.Run(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && rgCtx.Err() == nil {
-			switch exitErr.ExitCode() {
-			case 1:
-				return []fileCount{}, false, nil
-			case 2:
-				msg := strings.TrimSpace(stderr.String())
-				if strings.Contains(strings.ToLower(msg), "regex") {
-					return nil, false, invalidRegexError(q.pattern, msg)
-				}
-				return nil, false, fmt.Errorf("invalid search pattern: %s", msg)
-			}
-		}
-		if rgCtx.Err() != nil {
-			return nil, false, fmt.Errorf("search.rg timed out: %w", rgCtx.Err())
-		}
+	baseFlags := []string{"--count", "--with-filename", "--no-heading", "--color=never"}
+	stdout, noMatches, err := execRgSearch(ctx, rgBin, baseFlags, q, searchRoot, 8*1024*1024)
+	if err != nil {
 		return nil, false, err
+	}
+	if noMatches {
+		return []fileCount{}, false, nil
 	}
 	var out []fileCount
 	checker := newFastPathChecker(pol, workspaceCwd)

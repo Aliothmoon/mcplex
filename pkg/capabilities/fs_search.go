@@ -24,6 +24,7 @@ import (
 	"github.com/aliothmoon/mcplex/pkg/output"
 	"github.com/aliothmoon/mcplex/pkg/policy"
 	"github.com/aliothmoon/mcplex/pkg/sandbox"
+	"github.com/dlclark/regexp2/v2"
 )
 
 const (
@@ -466,6 +467,7 @@ type searchQuery struct {
 	path          string
 	glob          string
 	literal       bool
+	pcre2         bool
 	caseSensitive bool
 	contextLines  int
 	maxResults    int
@@ -504,6 +506,7 @@ func parseSearchQuery(args []any) (searchQuery, error) {
 		}
 		q.glob = firstString(opts, "glob", "globPattern", "include")
 		q.literal = optBool(opts, "literal", optBool(opts, "fixedStrings", false))
+		q.pcre2 = optBool(opts, "pcre2", optBool(opts, "P", false))
 		if optBool(opts, "ignoreCase", optBool(opts, "ic", false)) {
 			q.caseSensitive = false
 		} else if v, exists := opts["caseSensitive"]; exists {
@@ -543,7 +546,7 @@ func invalidRegexError(pattern, detail string) error {
 		for _, l := range strings.Split(detail, "\n") {
 			if t := strings.TrimSpace(l); t != "" {
 				kept = append(kept, t)
-				if len(kept) >= 3 {
+				if len(kept) >= 6 {
 					break
 				}
 			}
@@ -553,6 +556,125 @@ func invalidRegexError(pattern, detail string) error {
 	return sandbox.NewHostError(sandbox.KindBadArgs, nil,
 		"invalid regex %q: %s (in JS strings/templates escape backslashes as \\\\ or pass { literal: true })",
 		pattern, detail)
+}
+
+var errRgPCRE2Unavailable = errors.New("ripgrep compiled without PCRE2")
+
+// patternLikelyNeedsPCRE2 detects unescaped ECMAScript/PCRE2 lookarounds (`(?=`, `(?!`, `(?<=`, `(?<!`)
+// and backreferences (`\1`..`\9`, `\k<`) that Rust's default `regex` crate rejects without `--pcre2`.
+func patternLikelyNeedsPCRE2(pat string) bool {
+	inClass := false
+	for i := 0; i < len(pat); i++ {
+		c := pat[i]
+		if c == '\\' {
+			if i+1 < len(pat) {
+				next := pat[i+1]
+				if !inClass && ((next >= '1' && next <= '9') || next == 'k') {
+					return true
+				}
+				i++
+			}
+			continue
+		}
+		if c == '[' && !inClass {
+			inClass = true
+			continue
+		}
+		if c == ']' && inClass {
+			inClass = false
+			continue
+		}
+		if !inClass && c == '(' && i+2 < len(pat) && pat[i+1] == '?' {
+			switch pat[i+2] {
+			case '=', '!':
+				return true
+			case '<':
+				if i+3 < len(pat) && (pat[i+3] == '=' || pat[i+3] == '!') {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// execRgSearch runs `rg` with automatic `--pcre2` promotion when the regex uses look-around/backreferences
+// (either detected upfront or when Rust `regex` reports `"is not supported"`), and returns `errRgPCRE2Unavailable`
+// if the installed `rg` binary lacks PCRE2 support so callers seamlessly fall back to Go `regexp2`.
+func execRgSearch(ctx context.Context, rgBin string, baseFlags []string, q searchQuery, searchRoot string, maxStdout int) (*limitedSyncBuffer, bool, error) {
+	usePCRE2 := !q.literal && (q.pcre2 || patternLikelyNeedsPCRE2(q.pattern))
+
+	runOnce := func(withPCRE2 bool) (*limitedSyncBuffer, string, int, error) {
+		args := make([]string, 0, len(baseFlags)+8)
+		args = append(args, baseFlags...)
+		if q.literal {
+			args = append(args, "--fixed-strings")
+		} else if withPCRE2 {
+			args = append(args, "--pcre2")
+		}
+		if !q.caseSensitive {
+			args = append(args, "--ignore-case")
+		} else {
+			args = append(args, "--case-sensitive")
+		}
+		if q.glob != "" {
+			args = append(args, "-g", q.glob)
+		}
+		args = append(args, "--", q.pattern, searchRoot)
+
+		rgCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(rgCtx, rgBin, args...)
+		setSysProcAttrHide(cmd)
+		stdout := newLimitedSyncBuffer(maxStdout)
+		stderr := newLimitedSyncBuffer(128 * 1024)
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+		err := cmd.Run()
+		if err == nil {
+			return stdout, "", 0, nil
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && rgCtx.Err() == nil {
+			return stdout, strings.TrimSpace(stderr.String()), exitErr.ExitCode(), err
+		}
+		if rgCtx.Err() != nil {
+			return nil, "", -1, fmt.Errorf("search.rg timed out: %w", rgCtx.Err())
+		}
+		return nil, "", -1, err
+	}
+
+	stdout, errMsg, code, err := runOnce(usePCRE2)
+	if err == nil {
+		return stdout, false, nil
+	}
+	if code == 1 {
+		return stdout, true, nil
+	}
+	if code == 2 && !q.literal {
+		low := strings.ToLower(errMsg)
+		if !usePCRE2 && strings.Contains(low, "is not supported") {
+			stdout, errMsg, code, err = runOnce(true)
+			if err == nil {
+				return stdout, false, nil
+			}
+			if code == 1 {
+				return stdout, true, nil
+			}
+			low = strings.ToLower(errMsg)
+		}
+		if strings.Contains(low, "pcre2 is not available") {
+			return nil, false, errRgPCRE2Unavailable
+		}
+		if strings.Contains(low, "regex") || strings.Contains(low, "pcre2") {
+			return nil, false, invalidRegexError(q.pattern, errMsg)
+		}
+		return nil, false, fmt.Errorf("invalid search pattern: %s", errMsg)
+	}
+	if code == 2 {
+		return nil, false, fmt.Errorf("invalid search pattern: %s", errMsg)
+	}
+	return nil, false, err
 }
 
 // runTextOrRegexSearch returns hits and the total number of matches (-1 when unknown, e.g. Go fallback).
@@ -657,52 +779,16 @@ func (c *fastPathChecker) allowFile(p string) bool {
 }
 
 func runRgJSON(ctx context.Context, pol *policy.Engine, rgBin, workspaceCwd, searchRoot string, q searchQuery) ([]SearchHit, int, error) {
-	rgArgs := []string{"--json", "--line-number", "--column", "--no-heading", "--color=never"}
-	if q.literal {
-		rgArgs = append(rgArgs, "--fixed-strings")
-	}
-	if !q.caseSensitive {
-		rgArgs = append(rgArgs, "--ignore-case")
-	} else {
-		rgArgs = append(rgArgs, "--case-sensitive")
-	}
+	baseFlags := []string{"--json", "--line-number", "--column", "--no-heading", "--color=never"}
 	if q.contextLines > 0 {
-		rgArgs = append(rgArgs, fmt.Sprintf("-C%d", q.contextLines))
+		baseFlags = append(baseFlags, fmt.Sprintf("-C%d", q.contextLines))
 	}
-	if q.glob != "" {
-		rgArgs = append(rgArgs, "-g", q.glob)
-	}
-	rgArgs = append(rgArgs, "--", q.pattern, searchRoot)
-
-	rgCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(rgCtx, rgBin, rgArgs...)
-	setSysProcAttrHide(cmd)
-	stdout := newLimitedSyncBuffer(2 * 1024 * 1024)
-	stderr := newLimitedSyncBuffer(128 * 1024)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	err := cmd.Run()
-	// rg exit code 1 means 0 matches; exit code 2 means regex/syntax error.
+	stdout, noMatches, err := execRgSearch(ctx, rgBin, baseFlags, q, searchRoot, 2*1024*1024)
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && rgCtx.Err() == nil {
-			if exitErr.ExitCode() == 1 {
-				return []SearchHit{}, 0, nil
-			}
-			if exitErr.ExitCode() == 2 {
-				msg := strings.TrimSpace(stderr.String())
-				if strings.Contains(strings.ToLower(msg), "regex") {
-					return nil, -1, invalidRegexError(q.pattern, msg)
-				}
-				return nil, -1, fmt.Errorf("invalid search pattern: %s", msg)
-			}
-		}
-		if rgCtx.Err() != nil {
-			return nil, -1, fmt.Errorf("search.rg timed out: %w", rgCtx.Err())
-		}
 		return nil, -1, err
+	}
+	if noMatches {
+		return []SearchHit{}, 0, nil
 	}
 
 	type rgEvent struct {
@@ -809,17 +895,54 @@ func runRgJSON(ctx context.Context, pol *policy.Engine, rgBin, workspaceCwd, sea
 
 func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, searchRoot string, q searchQuery) ([]SearchHit, error) {
 	var re *regexp.Regexp
+	var re2 *regexp2.Regexp
 	var err error
+
 	pat := q.pattern
 	if q.literal {
 		pat = regexp.QuoteMeta(pat)
 	}
+	goPat := pat
 	if !q.caseSensitive {
-		pat = "(?i)" + pat
+		goPat = "(?i)" + goPat
 	}
-	re, err = regexp.Compile(pat)
+	if !q.pcre2 && !patternLikelyNeedsPCRE2(q.pattern) {
+		re, err = regexp.Compile(goPat)
+	} else {
+		err = errRgPCRE2Unavailable
+	}
 	if err != nil {
-		return nil, invalidRegexError(q.pattern, err.Error())
+		opts := regexp2.None
+		if !q.caseSensitive {
+			opts |= regexp2.IgnoreCase
+		}
+		var err2 error
+		re2, err2 = regexp2.Compile(pat, opts)
+		if err2 != nil {
+			detail := err.Error()
+			if errors.Is(err, errRgPCRE2Unavailable) {
+				detail = err2.Error()
+			}
+			return nil, invalidRegexError(q.pattern, detail)
+		}
+		re2.MatchTimeout = 100 * time.Millisecond
+	}
+
+	matchLine := func(line string) (int, int, bool) {
+		if re != nil {
+			loc := re.FindStringIndex(line)
+			if loc == nil {
+				return 0, 0, false
+			}
+			return loc[0], loc[1], true
+		}
+		m, mErr := re2.FindStringMatch(line)
+		if mErr != nil || m == nil {
+			return 0, 0, false
+		}
+		bOff, bLen := m.ByteRange()
+		bOff = maxInt(0, minInt(bOff, len(line)))
+		return bOff, minInt(len(line), bOff+maxInt(0, bLen)), true
 	}
 
 	var globMatcher *compiledGlob
@@ -870,8 +993,8 @@ func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, 
 		lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
 		rel := relDisplayPath(workspaceCwd, f)
 		for idx, line := range lines {
-			loc := re.FindStringIndex(line)
-			if loc == nil {
+			bStart, bEnd, ok := matchLine(line)
+			if !ok {
 				continue
 			}
 			var before, after []string
@@ -890,11 +1013,11 @@ func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, 
 			hits = append(hits, SearchHit{
 				File:    rel,
 				Line:    idx + 1,
-				Column:  loc[0] + 1,
+				Column:  bStart + 1,
 				Text:    txt,
 				Before:  before,
 				After:   after,
-				Subtext: line[loc[0]:loc[1]],
+				Subtext: line[bStart:bEnd],
 			})
 			if len(hits) >= q.maxResults {
 				break
