@@ -142,7 +142,7 @@ Example:
 - ` + "`await git.log({ n?, grep?, since?, author?, format?, path?, cwd? }) -> string`" + ` (string flags also accepted)
 - ` + "`await git.show({ ref?, stat?, nameOnly?, cwd? }) -> string`" + `
 - ` + "`await git.blame(path, { cwd?, startLine?, endLine? }) -> string`" + `
-- ` + "`await git.query(\"rev-parse HEAD\", { cwd? }) -> string`" + ` (read-only git subcommands incl. ` + "`worktree list`" + `, ` + "`stash list`" + `, ` + "`branch`" + `, ` + "`tag`" + `, ` + "`remote -v`" + `; destructive git commands are blocked by policy)`,
+- ` + "`await git.query(\"rev-parse HEAD\", { cwd? }) -> string`" + ` (read-only git subcommands incl. ` + "`worktree list`" + `, ` + "`stash list`, `stash show`" + `, ` + "`branch`" + `, ` + "`tag`" + `, ` + "`remote -v`" + `; destructive git commands are blocked by policy)`,
 	},
 	{
 		ID:            "tasks",

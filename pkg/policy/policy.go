@@ -298,6 +298,17 @@ func (e *Engine) ResolveReadWithReal(baseDir, targetPath string) (absPath string
 	if err := e.CheckResolvedRead(targetPath, abs, realPath); err != nil {
 		return "", "", err
 	}
+	if dedupRel, ok := DedupRepeatedRelativePrefix(targetPath, 2); ok {
+		if _, stErr := os.Lstat(abs); stErr != nil && errors.Is(stErr, os.ErrNotExist) {
+			if dAbs, dReal, dErr := resolveWithSymlinks(baseDir, dedupRel); dErr == nil {
+				if e.CheckResolvedRead(dedupRel, dAbs, dReal) == nil {
+					if _, dStErr := os.Stat(dAbs); dStErr == nil {
+						return dAbs, dReal, nil
+					}
+				}
+			}
+		}
+	}
 	return abs, realPath, nil
 }
 
@@ -1340,6 +1351,67 @@ func DedupEmbeddedDrivePrefix(p string) (string, error) {
 		}
 	}
 	return p, nil
+}
+
+// DedupRepeatedRelativePrefix detects workspace-relative paths where a caller accidentally joins a
+// subdirectory `dir` onto a workspace-relative path returned by `search.glob("**/*", { path: dir })`
+// or `search.rg(..., { path: dir })`, producing `<dir>/<dir>/<rest>` (e.g.
+// `build/scratch/run1/device/build/scratch/run1/device/display.json` -> `build/scratch/run1/device/display.json`).
+// Requires at least `minSegs` (>= 1) repeated leading segments AND at least one trailing segment after `<dir>/<dir>/`
+// so directory-existence probes like `fs.exists("a/b/a/b")` never alias `"a/b"`.
+func DedupRepeatedRelativePrefix(targetPath string, minSegs int) (string, bool) {
+	if minSegs < 1 {
+		minSegs = 1
+	}
+	trimmed := strings.TrimSpace(targetPath)
+	if trimmed == "" || strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, `\`) || strings.HasPrefix(trimmed, "~") {
+		return "", false
+	}
+	if len(trimmed) >= 2 && isASCIIAlpha(trimmed[0]) && trimmed[1] == ':' {
+		return "", false
+	}
+	norm := strings.ReplaceAll(trimmed, `\`, "/")
+	for strings.HasPrefix(norm, "./") {
+		norm = norm[2:]
+	}
+	if strings.IndexByte(norm, '/') < 0 {
+		return "", false
+	}
+	rawParts := strings.Split(norm, "/")
+	segs := make([]string, 0, len(rawParts))
+	for _, s := range rawParts {
+		if s == "" {
+			continue
+		}
+		if s == "." || s == ".." {
+			return "", false
+		}
+		segs = append(segs, s)
+	}
+	if len(segs) < 2*minSegs+1 {
+		return "", false
+	}
+	foldCase := runtime.GOOS == "windows" || runtime.GOOS == "darwin"
+	segEq := func(a, b string) bool {
+		if foldCase {
+			return strings.EqualFold(a, b)
+		}
+		return a == b
+	}
+	maxK := (len(segs) - 1) / 2
+	for k := maxK; k >= minSegs; k-- {
+		match := true
+		for i := 0; i < k; i++ {
+			if !segEq(segs[i], segs[k+i]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return strings.Join(segs[k:], "/"), true
+		}
+	}
+	return "", false
 }
 
 func resolveWithSymlinks(baseDir, p string) (absPath string, realPath string, err error) {

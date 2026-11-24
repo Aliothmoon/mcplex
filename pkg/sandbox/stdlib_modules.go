@@ -807,6 +807,7 @@ var stdlibExtraModulesProg = goja.MustCompile("stdlib_modules.js", `(function() 
 		}
 	};
 	assertFn.strict = assertFn;
+	assertFn.default = assertFn;
 	globalThis.assert = assertFn;
 
 	// --- 8. events (EventEmitter), querystring, string_decoder ---
@@ -844,6 +845,7 @@ var stdlibExtraModulesProg = goja.MustCompile("stdlib_modules.js", `(function() 
 		eventNames() { return Object.keys(this._events).filter(k => this._events[k] && this._events[k].length > 0); }
 	}
 	EventEmitter.EventEmitter = EventEmitter;
+	EventEmitter.default = EventEmitter;
 	EventEmitter.once = (emitter, name) => new Promise((resolve, reject) => {
 		const onErr = (err) => { emitter.off(name, onVal); reject(err); };
 		const onVal = (...args) => { if (name !== "error") emitter.off("error", onErr); resolve(args); };
@@ -889,4 +891,101 @@ var stdlibExtraModulesProg = goja.MustCompile("stdlib_modules.js", `(function() 
 	}
 	globalThis.StringDecoder = StringDecoder;
 	globalThis.string_decoder = Object.freeze({ StringDecoder });
+
+	// --- 9. Built-in require(spec), dynamic await import(spec), and node:module ---
+	const builtinNames = [
+		"assert", "assert/strict", "buffer", "crypto", "events", "fs", "fs/promises",
+		"module", "os", "path", "path/posix", "path/win32", "perf_hooks", "process",
+		"querystring", "string_decoder", "timers", "timers/promises", "url", "util",
+		"util/types", "zlib",
+	];
+	const builtinSet = new Set(builtinNames);
+	function normalizeBuiltinSpec(spec) {
+		if (typeof spec !== "string") return "";
+		const s = spec.trim();
+		return s.startsWith("node:") ? s.slice(5) : s;
+	}
+	function isBuiltinModule(spec) {
+		const norm = normalizeBuiltinSpec(spec);
+		return builtinSet.has(norm);
+	}
+	const nodeModuleExport = {};
+	function resolveSandboxBuiltin(spec) {
+		const raw = String(spec ?? "");
+		const norm = normalizeBuiltinSpec(raw);
+		switch (norm) {
+			case "buffer": return { Buffer: globalThis.Buffer };
+			case "path": return globalThis.path;
+			case "path/posix": return globalThis.path.posix;
+			case "path/win32": return globalThis.path.win32;
+			case "crypto": return globalThis.crypto;
+			case "url": return { URL: globalThis.URL, URLSearchParams: globalThis.URLSearchParams };
+			case "os": return globalThis.os;
+			case "process": return globalThis.process;
+			case "fs":
+			case "fs/promises": return globalThis.fs;
+			case "util": return globalThis.util;
+			case "util/types": return globalThis.util.types;
+			case "assert":
+			case "assert/strict": return globalThis.assert;
+			case "zlib": return globalThis.zlib;
+			case "events": return globalThis.events;
+			case "querystring": return globalThis.querystring;
+			case "string_decoder": return globalThis.string_decoder;
+			case "perf_hooks": return { performance: globalThis.performance };
+			case "timers": return {
+				setTimeout: globalThis.setTimeout,
+				clearTimeout: globalThis.clearTimeout,
+				setInterval: globalThis.setInterval,
+				clearInterval: globalThis.clearInterval,
+				setImmediate: globalThis.setImmediate,
+				clearImmediate: globalThis.clearImmediate,
+			};
+			case "timers/promises": return {
+				setTimeout: globalThis.sleep,
+				scheduler: { wait: globalThis.sleep },
+			};
+			case "module": return nodeModuleExport;
+			default: {
+				const err = new Error(
+					"ModuleError: cannot load external module '" + raw + "' in the isolated PTC sandbox " +
+					"(built-in node:* modules are preloaded; use sh.run(\"node\", [...]) to execute scripts requiring node_modules or project JS files)"
+				);
+				err.name = "ModuleError";
+				err.code = "ERR_MODULE_NOT_FOUND";
+				throw err;
+			}
+		}
+	}
+	function createRequire(_filename) {
+		const req = function require(id) { return resolveSandboxBuiltin(id); };
+		req.resolve = function resolve(id) {
+			if (!isBuiltinModule(id)) resolveSandboxBuiltin(id);
+			return String(id);
+		};
+		return req;
+	}
+	Object.assign(nodeModuleExport, {
+		builtinModules: Object.freeze(builtinNames.slice()),
+		isBuiltin: isBuiltinModule,
+		createRequire,
+	});
+	nodeModuleExport.default = nodeModuleExport;
+	Object.freeze(nodeModuleExport);
+
+	globalThis.__ptcNodeModule = nodeModuleExport;
+	globalThis.require = createRequire("sandbox:///user_program.ts");
+	globalThis.__ptcImport = async function __ptcImport(spec) {
+		const mod = resolveSandboxBuiltin(spec);
+		if (typeof mod === "function" || (mod && typeof mod === "object" && "default" in mod)) {
+			return mod;
+		}
+		const ns = { default: mod };
+		if (mod && typeof mod === "object") {
+			for (const k of Object.getOwnPropertyNames(mod)) {
+				if (k !== "default") ns[k] = mod[k];
+			}
+		}
+		return ns;
+	};
 })()`, false)

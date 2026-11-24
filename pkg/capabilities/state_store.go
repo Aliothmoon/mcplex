@@ -123,12 +123,20 @@ func (s *StateStore) loadFromDisk() {
 	var loaded map[string]stateEntry
 	if err := json.Unmarshal(raw, &loaded); err == nil && loaded != nil {
 		// Drop legacy persisted auto-spills so a fresh session never inherits stale output from prior runs.
-		for k := range loaded {
+		var maxSeq int64
+		for k, e := range loaded {
 			if isReservedSpillKey(k) {
 				delete(loaded, k)
+				continue
+			}
+			if e.Seq > maxSeq {
+				maxSeq = e.Seq
 			}
 		}
 		s.entries = loaded
+		if maxSeq > s.globalSeq {
+			s.globalSeq = maxSeq
+		}
 	}
 }
 
@@ -180,23 +188,30 @@ func cloneValue(val any) any {
 
 // Set stores a JSON-serializable value under key. Reserved spill keys (`__last_result`, `__result_N`) are rejected.
 func (s *StateStore) Set(key string, val any) error {
+	_, err := s.SetWithEvict(key, val)
+	return err
+}
+
+// SetWithEvict stores a JSON-serializable value under key, automatically evicting the oldest workspace entries
+// in FIFO/LRU order if adding key would exceed MaxStateTotalBytes (8 MB). Returns any evicted key names.
+func (s *StateStore) SetWithEvict(key string, val any) ([]string, error) {
 	key = strings.TrimSpace(key)
 	if key == "" {
-		return errors.New("state key cannot be empty")
+		return nil, errors.New("state key cannot be empty")
 	}
 	if isReservedSpillKey(key) {
-		return fmt.Errorf("state key %q is reserved for automatic output spills (choose a custom key name)", key)
+		return nil, fmt.Errorf("state key %q is reserved for automatic output spills (choose a custom key name)", key)
 	}
 	if val == nil {
 		s.Delete(key)
-		return nil
+		return nil, nil
 	}
 	raw, err := json.Marshal(val)
 	if err != nil {
-		return fmt.Errorf("state value must be JSON-serializable: %w", err)
+		return nil, fmt.Errorf("state value must be JSON-serializable: %w", err)
 	}
 	if len(raw) > MaxStateEntryBytes {
-		return fmt.Errorf("state value for '%s' (%d bytes) exceeds per-key limit (%d bytes)", key, len(raw), MaxStateEntryBytes)
+		return nil, fmt.Errorf("state value for '%s' (%d bytes) exceeds per-key limit (%d bytes)", key, len(raw), MaxStateEntryBytes)
 	}
 
 	detached := detachValue(val, raw)
@@ -210,17 +225,62 @@ func (s *StateStore) Set(key string, val any) error {
 			total += e.Bytes
 		}
 	}
+	var evicted []string
 	if total > MaxStateTotalBytes {
-		return fmt.Errorf("state store total size (%d bytes) exceeds session limit (%d bytes); call state.clear() or state.delete(key)", total, MaxStateTotalBytes)
+		type cand struct {
+			key      string
+			reserved bool
+			updated  string
+			seq      int64
+			bytes    int
+		}
+		cands := make([]cand, 0, len(s.entries))
+		for k, e := range s.entries {
+			if k == key {
+				continue
+			}
+			cands = append(cands, cand{
+				key:      k,
+				reserved: isReservedSpillKey(k),
+				updated:  e.UpdatedAt,
+				seq:      e.Seq,
+				bytes:    e.Bytes,
+			})
+		}
+		sort.Slice(cands, func(i, j int) bool {
+			if cands[i].reserved != cands[j].reserved {
+				return cands[i].reserved
+			}
+			if cands[i].updated != cands[j].updated {
+				return cands[i].updated < cands[j].updated
+			}
+			if cands[i].seq != cands[j].seq {
+				return cands[i].seq < cands[j].seq
+			}
+			return cands[i].key < cands[j].key
+		})
+		for _, c := range cands {
+			if total <= MaxStateTotalBytes {
+				break
+			}
+			delete(s.entries, c.key)
+			total -= c.bytes
+			evicted = append(evicted, c.key)
+		}
+	}
+	if total > MaxStateTotalBytes {
+		return nil, fmt.Errorf("state store total size (%d bytes) exceeds session limit (%d bytes); call state.clear() or state.delete(key)", total, MaxStateTotalBytes)
 	}
 
+	s.globalSeq++
 	s.entries[key] = stateEntry{
 		Value:     detached,
 		Bytes:     len(raw),
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Seq:       s.globalSeq,
 	}
 	s.dirty = true
-	return nil
+	return evicted, nil
 }
 
 func (s *StateStore) getOrCreateBucketLocked(sessionID string) *sessionSpillBucket {
@@ -628,10 +688,16 @@ func (b *StateBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if len(args) > 1 {
 				val = args[1]
 			}
-			if err := b.Store.Set(key, val); err != nil {
+			evicted, err := b.Store.SetWithEvict(key, val)
+			if err != nil {
 				return nil, err
 			}
-			return map[string]any{"ok": true, "key": key}, nil
+			out := map[string]any{"ok": true, "key": key}
+			if len(evicted) > 0 {
+				env.AddWarning(fmt.Sprintf("state.set: auto-evicted %d oldest key(s) (%s) to stay within the 8MB workspace limit", len(evicted), joinLimited(evicted, 5)))
+				out["evicted"] = evicted
+			}
+			return out, nil
 		},
 		"delete": func(_ context.Context, args []any) (any, error) {
 			key, err := requireStringArg(args, 0, "key")

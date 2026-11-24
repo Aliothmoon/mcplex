@@ -1484,6 +1484,14 @@ func enrichTypeHint(vm *goja.Runtime, formattedMsg string, cr *compiler.CompileR
 	if !strings.Contains(formattedMsg, "TypeError:") || strings.Contains(formattedMsg, "UnknownMethodError:") || strings.Contains(formattedMsg, "Cannot read property ") {
 		return formattedMsg
 	}
+	if strings.Contains(formattedMsg, "TypeError: object is not iterable") && !strings.Contains(formattedMsg, "Object.values") {
+		return strings.Replace(
+			formattedMsg,
+			"TypeError: object is not iterable",
+			"TypeError: object is not iterable (plain objects are not iterable with for..of — use Object.values(obj) or Object.entries(obj), or check Array.isArray(x))",
+			1,
+		)
+	}
 
 	if vm != nil {
 		var exported any

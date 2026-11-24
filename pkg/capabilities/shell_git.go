@@ -678,7 +678,72 @@ var (
 		"--max-count": true, "--since": true, "--after": true, "--until": true, "--before": true,
 		"--grep": true, "--format": true, "--pretty": true,
 	}
+	gitStashShowOpts = map[string]bool{
+		"--patch": false, "--stat": false, "--shortstat": false, "--numstat": false,
+		"--summary": false, "--name-only": false, "--name-status": false, "--raw": false,
+		"--include-untracked": false, "--no-include-untracked": false, "--only-untracked": false,
+		"--no-color": false, "--color": false, "--quiet": false, "--verbose": false,
+		"--function-context": false, "--ignore-all-space": false, "--ignore-space-change": false,
+		"--ignore-space-at-eol": false, "--ignore-cr-at-eol": false, "--ignore-blank-lines": false,
+		"--find-renames": false, "--find-copies": false, "--word-diff": false, "--no-abbrev": false,
+		"--word-diff-regex": true, "--unified": true, "--stat-width": true,
+		"--stat-name-width": true, "--stat-count": true, "--abbrev": true,
+	}
+	gitStashMutatingSubcmds = map[string]bool{
+		"push": true, "save": true, "pop": true, "apply": true,
+		"drop": true, "clear": true, "branch": true, "create": true, "store": true,
+	}
 )
+
+func validateGitStashShowArgs(args []string) error {
+	const shortFlags = "puqvwbWRDCzMsB"
+	stashRefs := 0
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			return nil
+		}
+		if a == "-U" && i+1 < len(args) {
+			i++
+			continue
+		}
+		if strings.HasPrefix(a, "-U") && len(a) > 2 && strings.Trim(a[2:], "0123456789") == "" {
+			continue
+		}
+		if (strings.HasPrefix(a, "-M") || strings.HasPrefix(a, "-C") || strings.HasPrefix(a, "-B")) && len(a) > 2 {
+			if strings.Trim(a[2:], "0123456789/%") == "" {
+				continue
+			}
+		}
+		if strings.HasPrefix(a, "--") {
+			name, _, hasVal := strings.Cut(a, "=")
+			takesVal, ok := gitStashShowOpts[name]
+			if !ok {
+				return fmt.Errorf("git stash show option '%s' is not allowed in read-only git.*", a)
+			}
+			if takesVal && !hasVal && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			for _, c := range a[1:] {
+				if !strings.ContainsRune(shortFlags, c) {
+					return fmt.Errorf("git stash show flag '-%c' is not allowed in read-only git.*", c)
+				}
+			}
+			continue
+		}
+		if gitStashMutatingSubcmds[a] {
+			return fmt.Errorf("git stash '%s' is not allowed in read-only git.*", a)
+		}
+		stashRefs++
+		if stashRefs > 1 {
+			return fmt.Errorf("git stash show accepts at most one stash reference before '--' (got '%s')", a)
+		}
+	}
+	return nil
+}
 
 // validateReadOnlyGitArgs rejects any git invocation that could mutate the repository, read outside the repo, or execute helpers.
 func validateReadOnlyGitArgs(gitArgs []string) error {
@@ -744,8 +809,11 @@ func validateReadOnlyGitArgs(gitArgs []string) error {
 		}
 		return nil
 	case "stash":
-		if len(rest) == 0 || rest[0] != "list" {
-			return fmt.Errorf("only read-only 'git stash list' is allowed in git.* (use sh.exec for stash mutations)")
+		if len(rest) == 0 || (rest[0] != "list" && rest[0] != "show") {
+			return fmt.Errorf("only read-only 'git stash list' and 'git stash show' are allowed in git.* (use sh.exec for stash mutations)")
+		}
+		if rest[0] == "show" {
+			return validateGitStashShowArgs(rest[1:])
 		}
 		for i := 1; i < len(rest); i++ {
 			a := rest[i]
@@ -819,7 +887,8 @@ func (b *ShellGitBinder) validateGitReadPaths(repoDir string, gitArgs []string) 
 			}
 		}
 	}
-	if (sub == "worktree" || sub == "stash") && len(preDash) > 0 && preDash[0] == "list" {
+	if (sub == "worktree" && len(preDash) > 0 && preDash[0] == "list") ||
+		(sub == "stash" && len(preDash) > 0 && (preDash[0] == "list" || preDash[0] == "show")) {
 		preDash = preDash[1:]
 	} else if sub == "remote" {
 		i := 0
@@ -855,9 +924,13 @@ func (b *ShellGitBinder) validateGitReadPaths(repoDir string, gitArgs []string) 
 	}
 
 	for _, pos := range positionals {
-		// Check <rev>:<path> syntax (e.g. `HEAD:vault/secret.txt` or `:0:vault/secret.txt`).
+		// Check <rev>:<path> syntax (e.g. `HEAD:vault/secret.txt` or `stash@{0}:vault/secret.txt`),
+		// ignoring colons inside reflog braces like `HEAD@{10:30}`.
 		if !isWindowsVolumeArg(pos) && strings.Contains(pos, ":") {
 			idx := strings.LastIndexByte(pos, ':')
+			if closeBrace := strings.LastIndexByte(pos, '}'); closeBrace >= 0 && idx < closeBrace {
+				continue
+			}
 			revPath := pos[idx+1:]
 			if revPath != "" {
 				if _, err := b.Policy.ResolveAndCheckRead(repoDir, revPath); err != nil {

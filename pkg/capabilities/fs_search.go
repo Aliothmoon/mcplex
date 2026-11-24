@@ -89,6 +89,17 @@ func (b *FSSearchBinder) readText(cwd, targetPath string, opts map[string]any) (
 		return "", err
 	}
 	info, err := os.Stat(absPath)
+	if err != nil && errors.Is(err, os.ErrNotExist) {
+		if dedupRel, ok := policy.DedupRepeatedRelativePrefix(targetPath, 1); ok {
+			if dAbs, dErr := b.Policy.ResolveAndCheckRead(cwd, dedupRel); dErr == nil {
+				if dInfo, dStErr := os.Stat(dAbs); dStErr == nil {
+					absPath = dAbs
+					info = dInfo
+					err = nil
+				}
+			}
+		}
+	}
 	if err != nil {
 		return "", err
 	}
@@ -514,19 +525,21 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 		fsAsync[name] = fn
 	}
 	// Sync: fs.exists returns a boolean directly, so `if (fs.exists(p))` works even without `await`.
+	existsFn := func(_ context.Context, args []any) (any, error) {
+		targetPath, err := requireStringArg(args, 0, "path")
+		if err != nil {
+			return nil, err
+		}
+		absPath, err := b.Policy.ResolveAndCheckRead(env.Cwd, targetPath)
+		if err != nil {
+			return nil, err // Denied / NeedsApproval: don't pretend a blocked path is missing
+		}
+		_, statErr := os.Stat(absPath)
+		return statErr == nil, nil
+	}
 	fsSync := map[string]sandbox.SyncHostFunc{
-		"exists": func(_ context.Context, args []any) (any, error) {
-			targetPath, err := requireStringArg(args, 0, "path")
-			if err != nil {
-				return nil, err
-			}
-			absPath, err := b.Policy.ResolveAndCheckRead(env.Cwd, targetPath)
-			if err != nil {
-				return nil, err // Denied / NeedsApproval: don't pretend a blocked path is missing
-			}
-			_, statErr := os.Stat(absPath)
-			return statErr == nil, nil
-		},
+		"exists":     existsFn,
+		"existsSync": existsFn,
 	}
 	if err := env.SetNamespace("fs", fsAsync, fsSync); err != nil {
 		return err

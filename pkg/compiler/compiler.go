@@ -19,8 +19,8 @@ const wrapperPrefixLines = 2
 
 var (
 	importTypeLineRegex    = regexp.MustCompile(`^\s*import\s+type\s+[^;]+;?\s*$`)
-	importDefaultShimRegex = regexp.MustCompile(`^\s*import\s+(?:\*\s+as\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+["'](?:node:)?(buffer|path(?:/posix|/win32)?|crypto|url|os|process|fs(?:/promises)?|util(?:/types)?|assert(?:/strict)?|zlib|events|querystring|string_decoder|perf_hooks|timers(?:/promises)?)["']\s*;?\s*$`)
-	importNamedShimRegex   = regexp.MustCompile(`^\s*import\s*\{([^}]+)\}\s*from\s+["'](?:node:)?(buffer|path(?:/posix|/win32)?|crypto|url|os|process|fs(?:/promises)?|util(?:/types)?|assert(?:/strict)?|zlib|events|querystring|string_decoder|perf_hooks|timers(?:/promises)?)["']\s*;?\s*$`)
+	importDefaultShimRegex = regexp.MustCompile(`^\s*import\s+(?:\*\s+as\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+["'](?:node:)?(buffer|path(?:/posix|/win32)?|crypto|url|os|process|fs(?:/promises)?|util(?:/types)?|assert(?:/strict)?|zlib|events|querystring|string_decoder|perf_hooks|timers(?:/promises)?|module)["']\s*;?\s*$`)
+	importNamedShimRegex   = regexp.MustCompile(`^\s*import\s*\{([^}]+)\}\s*from\s+["'](?:node:)?(buffer|path(?:/posix|/win32)?|crypto|url|os|process|fs(?:/promises)?|util(?:/types)?|assert(?:/strict)?|zlib|events|querystring|string_decoder|perf_hooks|timers(?:/promises)?|module)["']\s*;?\s*$`)
 
 	jsStackLocRegex = regexp.MustCompile(`user_program\.ts:(\d+):(\d+)`)
 )
@@ -123,6 +123,10 @@ func Compile(code string, payloads map[string]string) (*CompileResult, error) {
 				details = append(details, "  Hint: pass multiline code, C/SQL/HTML snippets, or replacement text in top-level 'payloads' (e.g. payloads: { snippet: \"...\" }) and reference P.snippet instead of inline string literals.")
 				break
 			}
+			if strings.Contains(msg.Text, "\"import\"") {
+				details = append(details, "  Hint: built-in node:* modules work via import/require; external npm packages or local disk JS modules are not available in the isolated PTC sandbox — use sh.run(\"node\", [...]) instead.")
+				break
+			}
 		}
 		return nil, &CompileError{
 			Message: "TypeScript syntax check failed (0 side effects executed):",
@@ -131,7 +135,7 @@ func Compile(code string, payloads map[string]string) (*CompileResult, error) {
 	}
 
 	return &CompileResult{
-		JSCode:     string(res.Code),
+		JSCode:     rewriteDynamicImports(string(res.Code)),
 		SourceMap:  res.Map,
 		SourceLine: srcLines,
 	}, nil
@@ -159,6 +163,8 @@ func builtinModuleTargetExpr(mod string) (expr string, identMatchesGlobal bool) 
 		return "{ setTimeout: (globalThis as any).setTimeout, clearTimeout: (globalThis as any).clearTimeout, setInterval: (globalThis as any).setInterval, clearInterval: (globalThis as any).clearInterval, setImmediate: (globalThis as any).setImmediate, clearImmediate: (globalThis as any).clearImmediate }", false
 	case "timers/promises":
 		return "{ setTimeout: (globalThis as any).sleep, scheduler: { wait: (globalThis as any).sleep } }", false
+	case "module":
+		return "(globalThis as any).__ptcNodeModule", false
 	default:
 		return fmt.Sprintf("(globalThis as any).%s", mod), true
 	}
@@ -227,6 +233,77 @@ func rewriteBuiltinImportLine(line string) (string, bool) {
 		return fmt.Sprintf("const { %s } = %s;", strings.Join(rewrittenSpecs, ", "), expr), true
 	}
 	return "", false
+}
+
+// rewriteDynamicImports rewrites runtime dynamic `import(spec)` call expressions in esbuild's JS output
+// to `__ptcImport(spec)` so Goja (which does not parse dynamic `import(...)`) can resolve built-in `node:*`
+// modules while preserving exact line numbers and leaving strings, templates, regexes, comments, `obj.import()`,
+// `import.meta`, and method definitions (`{ import() {} }`) untouched.
+func rewriteDynamicImports(js string) string {
+	if !strings.Contains(js, "import") {
+		return js
+	}
+	tokens, _ := lexTypeScript(js, strings.Count(js, "\n")+1)
+	var spans [][2]int
+	for k := 0; k < len(tokens); k++ {
+		t := tokens[k]
+		if t.kind != tokIdent || t.text != "import" || t.end <= t.start {
+			continue
+		}
+		if isPropertyNameAt(tokens, k) {
+			continue
+		}
+		if k+1 >= len(tokens) || tokens[k+1].kind != tokPunct || tokens[k+1].text != "(" {
+			continue
+		}
+		// Exclude object-literal / class method definitions named `import(args) { ... }`.
+		if isMethodDefNamedImport(tokens, k) {
+			continue
+		}
+		spans = append(spans, [2]int{t.start, t.end})
+	}
+	if len(spans) == 0 {
+		return js
+	}
+	var b strings.Builder
+	b.Grow(len(js) + len(spans)*6)
+	prev := 0
+	for _, sp := range spans {
+		b.WriteString(js[prev:sp[0]])
+		b.WriteString("__ptcImport")
+		prev = sp[1]
+	}
+	b.WriteString(js[prev:])
+	return b.String()
+}
+
+func isMethodDefNamedImport(tokens []jsToken, k int) bool {
+	if k > 0 {
+		p := tokens[k-1]
+		validMethodPrefix := (p.kind == tokPunct && (p.text == "{" || p.text == "," || p.text == ";" || p.text == "}" || p.text == "*")) ||
+			(p.kind == tokIdent && (p.text == "async" || p.text == "static" || p.text == "get" || p.text == "set"))
+		if !validMethodPrefix {
+			return false
+		}
+	}
+	depth := 0
+	for i := k + 1; i < len(tokens); i++ {
+		if tokens[i].kind == tokPunct {
+			switch tokens[i].text {
+			case "(":
+				depth++
+			case ")":
+				depth--
+				if depth == 0 {
+					return i+1 < len(tokens) &&
+						tokens[i+1].kind == tokPunct &&
+						tokens[i+1].text == "{" &&
+						tokens[i+1].line == tokens[i].line
+				}
+			}
+		}
+	}
+	return false
 }
 
 func isJSIdentStart(c byte) bool {
@@ -330,6 +407,8 @@ type jsToken struct {
 	unquoted   string // unescaped literal content for simple string tokens without escapes
 	plainQuote bool   // true if tokString had no backslash escapes
 	line       int    // 0-based normalized line index
+	start      int    // byte start offset (populated for tokIdent)
+	end        int    // byte end offset (populated for tokIdent)
 }
 
 func isMemberAccessTok(t jsToken) bool {
@@ -793,7 +872,7 @@ func lexTypeScript(src string, numLines int) ([]jsToken, []bool) {
 			}
 			ident := src[start:i]
 			afterDot := len(tokens) > 0 && isMemberAccessTok(tokens[len(tokens)-1])
-			emit(tokIdent, ident)
+			tokens = append(tokens, jsToken{kind: tokIdent, text: ident, line: lineIdx, start: start, end: i})
 			if !afterDot && ident == "class" && keywordInExpressionPosition(tokens, len(tokens)-1) {
 				pendingClassDepth = len(ctx)
 			}
