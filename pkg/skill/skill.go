@@ -179,6 +179,7 @@ Example (start dev server and wait for ready):
 		Body: `- ` + "`await tools.search(query)`" + ` -> discover available built-in and downstream MCP tools
 - ` + "`await tools.describe(ref)`" + ` -> inspect exact JSON input schema for a tool
 - ` + "`await mcp.servers()`" + ` -> list connected downstream MCP servers
+- Remote OAuth HTTP MCP servers without static ` + "`Authorization`" + ` headers in ` + "`mcp_config.json`" + ` (e.g. ` + "`sentry`" + `) use OAuth credentials managed privately by the host CLI — call them via native ` + "`call_mcp_tool`" + ` (no re-login needed) rather than ` + "`mcp.<server>.*`" + ` inside ` + "`exec`" + `.
 - ` + "`await mcp.<server>.<tool>(args)`" + ` or ` + "`await mcp.call(\"server.tool\", args)`" + ` -> ` + "`{ text, data? }`" + ` (` + "`res.data`" + ` holds auto-parsed JSON or ` + "`structuredContent`" + ` when the tool outputs JSON; ` + "`res.text`" + ` holds raw text; safe for ` + "`Promise.all`" + ` multiplexing!).`,
 	},
 	{

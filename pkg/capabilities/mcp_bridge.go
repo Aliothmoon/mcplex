@@ -32,6 +32,7 @@ type ToolDescriptor struct {
 	Server      string         `json:"server,omitempty"`
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
+	AuthHint    string         `json:"authHint,omitempty"`
 	InputSchema map[string]any `json:"inputSchema,omitempty"`
 }
 
@@ -205,10 +206,15 @@ func (m *MCPBridge) Bind(env *sandbox.ExecutionEnv) error {
 				{"name": "sh", "description": "Policy-checked shell execution and concurrent build/lint/test check pools"},
 				{"name": "state", "description": "Cross-turn workspace session key-value store"},
 			}
+			cfgs := m.loadConfiguredServers(env.Cwd)
 			for _, srv := range m.listCachedOrConfiguredServerNames(env.Cwd) {
+				desc := fmt.Sprintf("External MCP server '%s'", srv)
+				if cfg, ok := cfgs[srv]; ok && isRemoteHTTPWithoutAuthHeader(cfg) {
+					desc += " (remote HTTP without static Authorization header; if OAuth-managed by host CLI, use native call_mcp_tool)"
+				}
 				out = append(out, map[string]any{
 					"name":        "mcp." + srv,
-					"description": fmt.Sprintf("External MCP server '%s'", srv),
+					"description": desc,
 				})
 			}
 			return out, nil
@@ -255,9 +261,15 @@ func (m *MCPBridge) Bind(env *sandbox.ExecutionEnv) error {
 			catalog := m.buildCatalog(ctx, env.Cwd, true)
 			normRef := normalizeRefLookup(ref)
 			normBare := strings.TrimPrefix(normRef, "mcp.")
+			cfgs := m.loadConfiguredServers(env.Cwd)
 			for _, item := range catalog {
 				itemNorm := normalizeRefLookup(item.Ref)
 				if itemNorm == normRef || strings.TrimPrefix(itemNorm, "mcp.") == normBare || normalizeRefLookup(item.Name) == normRef {
+					if item.Server != "" {
+						if cfg, ok := cfgs[item.Server]; ok && isRemoteHTTPWithoutAuthHeader(cfg) && m.hasNativeEscalationHint() {
+							item.AuthHint = fmt.Sprintf("Remote HTTP server without static Authorization header in mcp_config.json; if '%s' uses host-managed OAuth, call native call_mcp_tool(ServerName: %q, ToolName: %q, ...) instead of mcp.%s.*", item.Server, item.Server, item.Name, sanitizeIdentifier(item.Server))
+						}
+					}
 					return item, nil
 				}
 			}
@@ -627,24 +639,32 @@ func (m *MCPBridge) listCachedOrConfiguredServerNames(cwd string) []string {
 func (m *MCPBridge) loadConfiguredServers(cwd string) map[string]externalServerCfg {
 	merged := map[string]externalServerCfg{}
 	home := homeDir()
-	var paths []string
+	type configSource struct {
+		path       string
+		pluginRoot string
+	}
+	var sources []configSource
 	if m.IncludeAntigravityPaths && home != "" {
-		paths = append(paths, filepath.Join(home, ".gemini", "config", "mcp_config.json"))
+		// Load enabled Antigravity plugin MCP configs first so user's global mcp_config.json takes precedence.
+		for _, pSrc := range discoverAntigravityPluginMCPConfigs(home, m.SelfName) {
+			sources = append(sources, configSource{path: pSrc.path, pluginRoot: pSrc.pluginRoot})
+		}
+		sources = append(sources, configSource{path: filepath.Join(home, ".gemini", "config", "mcp_config.json")})
 	}
 	for _, p := range m.ConfigPaths {
 		if strings.TrimSpace(p) != "" {
-			paths = append(paths, p)
+			sources = append(sources, configSource{path: p})
 		}
 	}
 	// Workspace-level config lives inside the (possibly cloned, untrusted) repository and can declare arbitrary
 	// `command`s, so it is only honored after an explicit opt-in (see policy.Engine.TrustWorkspaceMCP).
 	if ws := m.workspaceDirFor(cwd); ws != "" {
 		if pol := m.currentPolicy(); pol != nil && pol.TrustWorkspaceMCP() {
-			paths = append(paths, filepath.Join(ws, ".agents", "mcp_config.json"))
+			sources = append(sources, configSource{path: filepath.Join(ws, ".agents", "mcp_config.json")})
 		}
 	}
-	for _, p := range paths {
-		raw, err := os.ReadFile(p)
+	for _, src := range sources {
+		raw, err := os.ReadFile(src.path)
 		if err != nil {
 			continue
 		}
@@ -656,10 +676,101 @@ func (m *MCPBridge) loadConfiguredServers(cwd string) map[string]externalServerC
 			if entry.Disabled || m.isSelfServer(name) {
 				continue
 			}
+			if src.pluginRoot != "" {
+				entry = expandPluginRootInServerCfg(entry, src.pluginRoot)
+			}
 			merged[name] = entry
 		}
 	}
 	return merged
+}
+
+type pluginMCPSource struct {
+	path       string
+	pluginRoot string
+}
+
+func discoverAntigravityPluginMCPConfigs(home, selfName string) []pluginMCPSource {
+	configRoot := filepath.Join(home, ".gemini", "config")
+	pluginsDir := filepath.Join(configRoot, "plugins")
+	entries, err := os.ReadDir(pluginsDir)
+	if err != nil {
+		return nil
+	}
+	userToggle := map[string]bool{}
+	if rawCfg, rErr := os.ReadFile(filepath.Join(configRoot, "config.json")); rErr == nil {
+		var parsed struct {
+			Plugins map[string]struct {
+				Enabled *bool `json:"enabled"`
+			} `json:"plugins"`
+		}
+		if json.Unmarshal(rawCfg, &parsed) == nil {
+			for k, v := range parsed.Plugins {
+				if v.Enabled != nil {
+					userToggle[k] = *v.Enabled
+				}
+			}
+		}
+	}
+	var out []pluginMCPSource
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dirName := e.Name()
+		if strings.EqualFold(dirName, selfName) || strings.EqualFold(dirName, "agy-ptc") || strings.EqualFold(dirName, "mcplex") {
+			continue
+		}
+		plugRoot := filepath.Join(pluginsDir, dirName)
+		mcpPath := filepath.Join(plugRoot, "mcp_config.json")
+		if _, stErr := os.Stat(mcpPath); stErr != nil {
+			continue
+		}
+		defaultEnabled := true
+		if rawManifest, mErr := os.ReadFile(filepath.Join(plugRoot, "plugin.json")); mErr == nil {
+			var manifest struct {
+				Disabled bool `json:"disabled"`
+			}
+			if json.Unmarshal(rawManifest, &manifest) == nil && manifest.Disabled {
+				defaultEnabled = false
+			}
+		}
+		enabled := defaultEnabled
+		if explicit, ok := userToggle[dirName]; ok {
+			enabled = explicit
+		}
+		if enabled {
+			out = append(out, pluginMCPSource{path: mcpPath, pluginRoot: plugRoot})
+		}
+	}
+	return out
+}
+
+func expandPluginRootInServerCfg(cfg externalServerCfg, pluginRoot string) externalServerCfg {
+	slashRoot := filepath.ToSlash(pluginRoot)
+	rep := func(s string) string {
+		if !strings.Contains(s, "${PLUGIN_ROOT}") {
+			return s
+		}
+		return filepath.FromSlash(strings.ReplaceAll(s, "${PLUGIN_ROOT}", slashRoot))
+	}
+	cfg.Command = rep(cfg.Command)
+	cfg.Cwd = rep(cfg.Cwd)
+	if len(cfg.Args) > 0 {
+		args := make([]string, len(cfg.Args))
+		for i, a := range cfg.Args {
+			args[i] = rep(a)
+		}
+		cfg.Args = args
+	}
+	if len(cfg.Env) > 0 {
+		env := make(map[string]string, len(cfg.Env))
+		for k, v := range cfg.Env {
+			env[k] = rep(v)
+		}
+		cfg.Env = env
+	}
+	return cfg
 }
 
 func (m *MCPBridge) workspaceDirFor(cwd string) string {
@@ -687,26 +798,78 @@ func (m *MCPBridge) isSelfServer(name string) bool {
 	return low == "ptc" || low == "mcplex" || strings.HasPrefix(low, "mcplex_") || low == "agy-ptc" || strings.HasPrefix(low, "agy-ptc_")
 }
 
-func (m *MCPBridge) ensureHTTPSession(ctx context.Context, serverName, endpoint string, headers map[string]string) string {
+func (m *MCPBridge) hasNativeEscalationHint() bool {
+	if m.IncludeAntigravityPaths {
+		return true
+	}
+	if pol := m.currentPolicy(); pol != nil {
+		return pol.NativeEscalationHint()
+	}
+	return false
+}
+
+func hasAuthorizationHeader(headers map[string]string) bool {
+	for k, v := range headers {
+		if strings.EqualFold(strings.TrimSpace(k), "Authorization") && strings.TrimSpace(os.ExpandEnv(v)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func isRemoteHTTPWithoutAuthHeader(cfg externalServerCfg) bool {
+	ep := strings.TrimSpace(cfg.ServerURL)
+	if ep == "" {
+		ep = strings.TrimSpace(cfg.URL)
+	}
+	if ep == "" || hasAuthorizationHeader(cfg.Headers) {
+		return false
+	}
+	low := strings.ToLower(ep)
+	if !strings.HasPrefix(low, "https://") && !strings.HasPrefix(low, "http://") {
+		return false
+	}
+	if strings.Contains(low, "://127.0.0.1") || strings.Contains(low, "://localhost") || strings.Contains(low, "://[::1]") {
+		return false
+	}
+	return true
+}
+
+func isAuthStatus(statusCode int, respHeader http.Header) bool {
+	if statusCode == http.StatusUnauthorized {
+		return true
+	}
+	if statusCode == http.StatusForbidden && respHeader != nil && strings.TrimSpace(respHeader.Get("WWW-Authenticate")) != "" {
+		return true
+	}
+	return false
+}
+
+func (m *MCPBridge) ensureHTTPSession(ctx context.Context, serverName, endpoint string, headers map[string]string) (string, error) {
 	m.mu.Lock()
 	if m.httpInited[endpoint] {
 		sid := m.httpSessions[endpoint]
 		m.mu.Unlock()
-		return sid
+		return sid, nil
 	}
 	m.mu.Unlock()
 
 	initCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	_, sid, _, err := m.httpRPCRaw(initCtx, serverName, endpoint, headers, "", "initialize", map[string]any{
+
+	_, sid, statusCode, err := m.httpRPCRaw(initCtx, serverName, endpoint, headers, "", "initialize", map[string]any{
 		"protocolVersion": "2025-11-25",
 		"capabilities":    map[string]any{},
 		"clientInfo":      map[string]any{"name": "mcplex-bridge", "version": version.Version},
 	}, false)
 
-	// Only cache initialization when handshake succeeds so transient startup failures retry on the next call.
 	if err != nil {
-		return ""
+		// Fast-fail on 401/403 auth errors so we don't send a redundant second HTTP request to an OAuth-gated endpoint.
+		if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+			return "", err
+		}
+		// Stateless servers that reject `initialize` (e.g. 404/405) may still accept direct `tools/call`.
+		return "", nil
 	}
 
 	m.mu.Lock()
@@ -720,7 +883,7 @@ func (m *MCPBridge) ensureHTTPSession(ctx context.Context, serverName, endpoint 
 	notifCtx, nCancel := context.WithTimeout(ctx, 3*time.Second)
 	_, _, _, _ = m.httpRPCRaw(notifCtx, serverName, endpoint, headers, stored, "notifications/initialized", nil, true)
 	nCancel()
-	return stored
+	return stored, nil
 }
 
 func (m *MCPBridge) httpRPCRaw(ctx context.Context, serverName, endpoint string, headers map[string]string, sessionID, method string, params map[string]any, isNotification bool) ([]byte, string, int, error) {
@@ -763,6 +926,31 @@ func (m *MCPBridge) httpRPCRaw(ctx context.Context, serverName, endpoint string,
 	}
 	gotSID := strings.TrimSpace(resp.Header.Get("Mcp-Session-Id"))
 	if resp.StatusCode >= 400 {
+		if isAuthStatus(resp.StatusCode, resp.Header) {
+			meta := map[string]any{"status": resp.StatusCode, "server": serverName}
+			if !hasAuthorizationHeader(headers) {
+				if m.hasNativeEscalationHint() {
+					return nil, gotSID, resp.StatusCode, sandbox.NewHostError(
+						sandbox.KindNeedsApproval,
+						meta,
+						"MCP HTTP %s %s returned status %d (mcp_config.json has no static Authorization header; OAuth credentials for '%s' are managed privately by agy CLI — do NOT ask the user to re-login, call native call_mcp_tool(ServerName: %q, ...) instead of mcp.%s.*)",
+						serverName, method, resp.StatusCode, serverName, serverName, sanitizeIdentifier(serverName),
+					)
+				}
+				return nil, gotSID, resp.StatusCode, sandbox.NewHostError(
+					sandbox.KindNeedsApproval,
+					meta,
+					"MCP HTTP %s %s returned status %d (no static Authorization header in mcp_config.json; configure headers.Authorization or invoke via the host client's authenticated MCP channel)",
+					serverName, method, resp.StatusCode,
+				)
+			}
+			return nil, gotSID, resp.StatusCode, sandbox.NewHostError(
+				sandbox.KindNeedsApproval,
+				meta,
+				"MCP HTTP %s %s returned status %d (configured Authorization header was rejected; verify token in mcp_config.json or invoke via native call_mcp_tool)",
+				serverName, method, resp.StatusCode,
+			)
+		}
 		return nil, gotSID, resp.StatusCode, fmt.Errorf("MCP HTTP %s %s returned status %d", serverName, method, resp.StatusCode)
 	}
 	if !isNotification && len(respBytes) > 0 {
@@ -772,7 +960,10 @@ func (m *MCPBridge) httpRPCRaw(ctx context.Context, serverName, endpoint string,
 }
 
 func (m *MCPBridge) httpRPC(ctx context.Context, serverName, endpoint string, headers map[string]string, method string, params map[string]any) ([]byte, error) {
-	sid := m.ensureHTTPSession(ctx, serverName, endpoint, headers)
+	sid, initErr := m.ensureHTTPSession(ctx, serverName, endpoint, headers)
+	if initErr != nil {
+		return nil, initErr
+	}
 	respBytes, gotSID, statusCode, err := m.httpRPCRaw(ctx, serverName, endpoint, headers, sid, method, params, false)
 	// Per MCP Streamable HTTP spec, 404 with an existing session ID signals an expired/restarted session -> re-initialize once.
 	if statusCode == http.StatusNotFound && sid != "" {
@@ -780,7 +971,10 @@ func (m *MCPBridge) httpRPC(ctx context.Context, serverName, endpoint string, he
 		delete(m.httpInited, endpoint)
 		delete(m.httpSessions, endpoint)
 		m.mu.Unlock()
-		sid = m.ensureHTTPSession(ctx, serverName, endpoint, headers)
+		sid, initErr = m.ensureHTTPSession(ctx, serverName, endpoint, headers)
+		if initErr != nil {
+			return nil, initErr
+		}
 		respBytes, gotSID, _, err = m.httpRPCRaw(ctx, serverName, endpoint, headers, sid, method, params, false)
 	}
 	if gotSID != "" && gotSID != sid {
