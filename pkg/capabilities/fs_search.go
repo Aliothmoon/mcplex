@@ -881,8 +881,7 @@ func (b *FSSearchBinder) runTextOrRegexSearch(ctx context.Context, workspaceCwd,
 			return nil, -1, err
 		}
 	}
-	hits, err := runGoFallbackSearch(ctx, b.Policy, workspaceCwd, searchRoot, q)
-	return hits, -1, err
+	return runGoFallbackSearch(ctx, b.Policy, workspaceCwd, searchRoot, q)
 }
 
 func canSearchPath(pol *policy.Engine, workspaceCwd, p string, cache map[string]bool) bool {
@@ -1082,7 +1081,7 @@ func runRgJSON(ctx context.Context, pol *policy.Engine, rgBin, workspaceCwd, sea
 	return hits, total, nil
 }
 
-func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, searchRoot string, q searchQuery) ([]SearchHit, error) {
+func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, searchRoot string, q searchQuery) ([]SearchHit, int, error) {
 	var re *regexp.Regexp
 	var re2 *regexp2.Regexp
 	var err error
@@ -1112,7 +1111,7 @@ func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, 
 			if errors.Is(err, errRgPCRE2Unavailable) {
 				detail = err2.Error()
 			}
-			return nil, invalidRegexError(q.pattern, detail)
+			return nil, 0, invalidRegexError(q.pattern, detail)
 		}
 		re2.MatchTimeout = 100 * time.Millisecond
 	}
@@ -1138,14 +1137,14 @@ func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, 
 	if q.glob != "" {
 		globMatcher, err = compileGlob(q.glob)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 
 	var files []string
 	info, err := os.Stat(searchRoot)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if !info.IsDir() {
 		checker := newFastPathChecker(pol, workspaceCwd)
@@ -1167,8 +1166,9 @@ func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, 
 	}
 
 	hits := []SearchHit{}
+	hasMore := false
 	for _, f := range files {
-		if ctx.Err() != nil || len(hits) >= q.maxResults {
+		if ctx.Err() != nil || hasMore {
 			break
 		}
 		fi, err := os.Stat(f)
@@ -1185,6 +1185,10 @@ func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, 
 			bStart, bEnd, ok := matchLine(line)
 			if !ok {
 				continue
+			}
+			if len(hits) >= q.maxResults {
+				hasMore = true
+				break
 			}
 			var before, after []string
 			if q.contextLines > 0 {
@@ -1208,12 +1212,12 @@ func runGoFallbackSearch(ctx context.Context, pol *policy.Engine, workspaceCwd, 
 				After:   after,
 				Subtext: line[bStart:bEnd],
 			})
-			if len(hits) >= q.maxResults {
-				break
-			}
 		}
 	}
-	return hits, nil
+	if hasMore {
+		return hits, -1, nil
+	}
+	return hits, len(hits), nil
 }
 
 // runGlobSearch returns up to maxResults files plus the total number of matches.

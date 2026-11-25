@@ -652,7 +652,7 @@ return {
 	}
 
 	// 2. Pure-Go regexp2 fallback when rg is unavailable / built without PCRE2!
-	fallbackHits, err := runGoFallbackSearch(context.Background(), pol, ws, ws, searchQuery{
+	fallbackHits, _, err := runGoFallbackSearch(context.Background(), pol, ws, ws, searchQuery{
 		pattern:       `^\s*static\s+(?!const\b)(?!inline\b)(?!__attribute__)(?!pthread_mutex_t\b)[^(\n]*;`,
 		caseSensitive: true,
 		maxResults:    50,

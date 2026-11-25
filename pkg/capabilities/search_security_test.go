@@ -121,7 +121,7 @@ func TestSearchRgAndGlobRespectPerFileReadPolicy(t *testing.T) {
 	}
 
 	// 2. Explicit Go fallback path
-	fbHits, err := runGoFallbackSearch(context.Background(), pol, ws, ws, q)
+	fbHits, _, err := runGoFallbackSearch(context.Background(), pol, ws, ws, q)
 	if err != nil {
 		t.Fatalf("runGoFallbackSearch failed: %v", err)
 	}

@@ -40,7 +40,7 @@ func (b *FSSearchBinder) runListSearch(ctx context.Context, env *sandbox.Executi
 		fq := q
 		fq.contextLines = 0
 		fq.maxResults = 200000
-		hits, ferr := runGoFallbackSearch(ctx, b.Policy, env.Cwd, searchRoot, fq)
+		hits, _, ferr := runGoFallbackSearch(ctx, b.Policy, env.Cwd, searchRoot, fq)
 		if ferr != nil {
 			return nil, ferr
 		}

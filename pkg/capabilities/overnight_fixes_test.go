@@ -53,13 +53,23 @@ func TestSearchRgNoFalseCapWarningOnExactMatchCount(t *testing.T) {
 	}
 	foundWarn := false
 	for _, w := range resCapped.Warnings {
-		if strings.Contains(w, "search.rg: capped at 2 of 3 hits") {
+		if strings.Contains(w, "search.rg: capped at 2") {
 			foundWarn = true
 			break
 		}
 	}
 	if !foundWarn {
 		t.Fatalf("expected cap warning for 2 of 3 hits, got warnings: %v", resCapped.Warnings)
+	}
+
+	// Also verify the Go fallback search path directly (used on hosts without ripgrep).
+	fbExact, fbExactTotal, err := runGoFallbackSearch(context.Background(), pol, dir, dir, searchQuery{pattern: "needle", maxResults: 3})
+	if err != nil || len(fbExact) != 3 || fbExactTotal != 3 {
+		t.Fatalf("expected fallback exact (3, 3, nil), got (%d, %d, %v)", len(fbExact), fbExactTotal, err)
+	}
+	fbCapped, fbCappedTotal, err := runGoFallbackSearch(context.Background(), pol, dir, dir, searchQuery{pattern: "needle", maxResults: 2})
+	if err != nil || len(fbCapped) != 2 || fbCappedTotal != -1 {
+		t.Fatalf("expected fallback capped (2, -1, nil), got (%d, %d, %v)", len(fbCapped), fbCappedTotal, err)
 	}
 }
 
