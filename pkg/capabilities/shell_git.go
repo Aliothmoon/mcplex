@@ -71,8 +71,11 @@ func (b *ShellGitBinder) Bind(env *sandbox.ExecutionEnv) error {
 				}
 				workDir = resolved
 			}
-			cmdTimeout := resolveCommandTimeout(opts, DefaultShellTimeout)
+			cmdTimeout, explicitTimeout := parseCommandTimeout(opts, DefaultShellTimeout)
 			warnTimeoutUnit(env, "sh.exec", opts)
+			if explicitTimeout {
+				env.ExtendDefaultDeadline("sh.exec", cmdTimeout)
+			}
 			// Default settle=true (pi-fabric native style): non-zero exit codes return `{ ok: false, exitCode, output }`
 			// instead of blowing up Promise.all! Callers wanting exceptions can pass `{ throwOnError: true }` or `{ settle: false }`.
 			settle := optBool(opts, "settle", true)
@@ -106,6 +109,7 @@ func (b *ShellGitBinder) Bind(env *sandbox.ExecutionEnv) error {
 		},
 		"checks": func(ctx context.Context, args []any) (any, error) {
 			warnChecksTimeoutUnit(env, "sh.checks", args)
+			extendDeadlineForChecks(env, "sh.checks", args)
 			res, err := b.RunChecksBatch(ctx, env.Cwd, args)
 			if err == nil {
 				warnTruncatedChecks(env, "sh.checks", res)
@@ -247,11 +251,12 @@ const (
 	MaxShellTimeout     = 120 * time.Second
 )
 
-func resolveCommandTimeout(opts map[string]any, fallback time.Duration) time.Duration {
+func parseCommandTimeout(opts map[string]any, fallback time.Duration) (time.Duration, bool) {
 	if opts == nil {
-		return fallback
+		return clampShellTimeout(fallback), false
 	}
 	var dur time.Duration
+	explicit := true
 	if ms := optInt(opts, "timeoutMs", 0); ms > 0 {
 		dur = time.Duration(ms) * time.Millisecond
 	} else if sec := optInt(opts, "timeoutSec", 0); sec > 0 {
@@ -265,14 +270,59 @@ func resolveCommandTimeout(opts map[string]any, fallback time.Duration) time.Dur
 		}
 	} else {
 		dur = fallback
+		explicit = false
 	}
+	return clampShellTimeout(dur), explicit
+}
+
+func clampShellTimeout(dur time.Duration) time.Duration {
 	if dur < 100*time.Millisecond {
-		dur = 100 * time.Millisecond
+		return 100 * time.Millisecond
 	}
 	if dur > MaxShellTimeout {
-		dur = MaxShellTimeout
+		return MaxShellTimeout
 	}
 	return dur
+}
+
+func resolveCommandTimeout(opts map[string]any, fallback time.Duration) time.Duration {
+	dur, _ := parseCommandTimeout(opts, fallback)
+	return dur
+}
+
+func extendDeadlineForChecks(env *sandbox.ExecutionEnv, op string, args []any) {
+	if env == nil || len(args) == 0 {
+		return
+	}
+	var maxExplicit time.Duration
+	consider := func(m map[string]any) {
+		if m == nil {
+			return
+		}
+		if d, ok := parseCommandTimeout(m, DefaultShellTimeout); ok && d > maxExplicit {
+			maxExplicit = d
+		}
+	}
+	var rawList []any
+	if arr, ok := args[0].([]any); ok {
+		rawList = arr
+		if len(args) > 1 {
+			if m, ok := args[1].(map[string]any); ok {
+				consider(m)
+			}
+		}
+	} else if m, ok := args[0].(map[string]any); ok {
+		consider(m)
+		rawList, _ = m["commands"].([]any)
+	}
+	for _, item := range rawList {
+		if m, ok := item.(map[string]any); ok {
+			consider(m)
+		}
+	}
+	if maxExplicit > 0 {
+		env.ExtendDefaultDeadline(op, maxExplicit)
+	}
 }
 
 // RunSingleCommand executes one shell command with a timeout in seconds (compatibility wrapper).

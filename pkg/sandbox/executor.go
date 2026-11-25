@@ -133,6 +133,7 @@ var sandboxExecSeq atomic.Int64
 type ExecutionEnv struct {
 	ExecID        string
 	Ctx           context.Context
+	deadlineCtx   *extendableDeadlineCtx
 	Cwd           string
 	VM            *goja.Runtime
 	loopCh        chan loopAction
@@ -257,7 +258,7 @@ func (env *ExecutionEnv) wrapSync(capability string, fn SyncHostFunc) func(goja.
 		seq := int(env.opSeq.Add(1))
 		line := env.userCallSite()
 		if seq > env.maxOps {
-			panic(env.newJSHostError(KindError, capability, opBudgetMessage(env.maxOps), line, nil))
+			panic(env.newJSHostError(KindError, capability, opBudgetMessage(capability, env.maxOps), line, nil))
 		}
 		exported, argErr := safeExportArgs(env.VM, call.Arguments)
 		if argErr != nil {
@@ -294,7 +295,7 @@ func (env *ExecutionEnv) wrapAsync(capability string, fn AsyncHostFunc) func(goj
 		line := env.userCallSite()
 		if seq > env.maxOps {
 			promise, _, reject := env.VM.NewPromise()
-			errVal := env.newJSHostError(KindError, capability, opBudgetMessage(env.maxOps), line, nil)
+			errVal := env.newJSHostError(KindError, capability, opBudgetMessage(capability, env.maxOps), line, nil)
 			if rErr := reject(errVal); rErr != nil {
 				env.setAsyncErr(rErr)
 			} else if _, dErr := env.deliverFn(goja.Undefined()); dErr != nil {
@@ -588,6 +589,7 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 		}
 	}
 
+	timeoutExplicit := req.Timeout > 0
 	timeout := req.Timeout
 	if timeout <= 0 {
 		timeout = EffectiveDefaultTimeout()
@@ -601,7 +603,8 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 		maxOps = DefaultMaxOps
 	}
 
-	ctx, cancel := context.WithTimeout(parentCtx, timeout)
+	dlCtx, cancel := newExtendableDeadlineCtx(parentCtx, timeout, maxTimeout, timeoutExplicit)
+	var ctx context.Context = dlCtx
 
 	vm := goja.New()
 	vm.SetMaxCallStackSize(MaxCallStackDepth)
@@ -610,6 +613,7 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 	env := &ExecutionEnv{
 		ExecID:        fmt.Sprintf("exec:%d", sandboxExecSeq.Add(1)),
 		Ctx:           ctx,
+		deadlineCtx:   dlCtx,
 		Cwd:           req.Cwd,
 		VM:            vm,
 		loopCh:        make(chan loopAction, 256),
@@ -805,9 +809,14 @@ func Execute(parentCtx context.Context, req ExecRequest, binders ...Binder) (res
 				DurationMs:  time.Since(start).Milliseconds(),
 			}
 		}
+		effTimeout := dlCtx.effectiveTimeout(timeout)
+		clipSuffix := ""
+		if note := dlCtx.clippedTimeoutNote(); note != "" {
+			clipSuffix = "; outer timeoutMs clipped " + note
+		}
 		return &ExecutionError{
 			Phase:       "timeout",
-			Message:     fmt.Sprintf("Timeout: program exceeded %s (timeoutMs=%d, max %d)", timeout, timeout.Milliseconds(), EffectiveMaxTimeout().Milliseconds()),
+			Message:     fmt.Sprintf("Timeout: program exceeded %s (timeoutMs=%d, max %d%s)", effTimeout, effTimeout.Milliseconds(), maxTimeout.Milliseconds(), clipSuffix),
 			TimedOutOps: culprits,
 			Logs:        env.getLogs(),
 			Traces:      env.getTraces(),
@@ -1035,8 +1044,12 @@ func (env *ExecutionEnv) newJSHostError(kind, capability, msg string, line int, 
 	return env.VM.ToValue(kind + ": " + capability + ": " + msg)
 }
 
-func opBudgetMessage(maxOps int) string {
-	return fmt.Sprintf("op budget exceeded (%d host calls); batch work (e.g. ast.outlines, sh.checks) or split the program", maxOps)
+func opBudgetMessage(capability string, maxOps int) string {
+	base := fmt.Sprintf("op budget exceeded (%d host calls); batch work (e.g. ast.outlines, sh.checks) or split the program", maxOps)
+	if capability == "fs.rm" {
+		return base + "; for recursive directory deletion, use built-in run_command instead of looping fs.rm"
+	}
+	return base
 }
 
 // installBootstrapWrappers adds ergonomic JS facades over raw host namespaces:

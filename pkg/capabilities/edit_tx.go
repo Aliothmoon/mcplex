@@ -359,6 +359,7 @@ func (b *EditTxBinder) Bind(env *sandbox.ExecutionEnv) error {
 				checkArgs = args[1:]
 			}
 			warnChecksTimeoutUnit(env, "t.verify", checkArgs)
+			extendDeadlineForChecks(env, "t.verify", checkArgs)
 			res, err := b.ShellRunner.RunChecksBatch(ctx, env.Cwd, checkArgs)
 			if err != nil {
 				return nil, err
@@ -1714,24 +1715,29 @@ func findTargetAnywhereLine(normText, normTarget, relPath string, lineStarts []i
 
 const (
 	defaultMaxEndTargetSpanLines = 120
-	topLevelSymMaxEndTargetLines = 400
+	topLevelSymMaxEndTargetLines = 600
 )
 
-func isTopLevelSymbolBoundarySpan(syms []SymbolInfo, startLine, endLine int) bool {
+func isTopLevelSymbolBoundarySpan(syms []SymbolInfo, startLine, startEndLine, endStartLine, endEndLine int) bool {
 	startsAtSym := false
 	endsAtSym := false
 	for _, s := range syms {
 		if s.unclosed {
 			continue
 		}
-		// Reject if startLine is strictly inside an enclosing symbol that ends before endLine (mid-function leak).
-		if startLine > s.StartLine && startLine <= s.EndLine && s.EndLine < endLine {
+		// Reject if startLine is strictly inside an enclosing symbol that ends before endEndLine (mid-function leak).
+		if startLine > s.StartLine && startLine <= s.EndLine && s.EndLine < endEndLine {
 			return false
 		}
-		if s.StartLine == startLine {
+		// Reject if endEndLine lands strictly inside a later symbol that continues past endEndLine.
+		if s.StartLine > startEndLine && endEndLine >= s.StartLine && endEndLine < s.EndLine && !(endStartLine == endEndLine && s.StartLine == endStartLine) {
+			return false
+		}
+		// Allow target to begin directly at a symbol or include a leading declaration/comment right before it.
+		if s.StartLine >= startLine && s.StartLine <= startEndLine {
 			startsAtSym = true
 		}
-		if s.StartLine == endLine || s.EndLine == endLine {
+		if s.EndLine == endEndLine || (endStartLine == endEndLine && s.StartLine == endStartLine) {
 			endsAtSym = true
 		}
 	}
@@ -1877,12 +1883,23 @@ func resolveEndTargetHunk(
 	if len(endSpans) == 0 {
 		if cappedBy120 && subEnd < len(windowText) {
 			farSpans, farLines, _ := findAnchorCandidates(windowText[subEnd:], normEnd, relPath, winStart+subEnd, lineStarts, getPyStates)
-			if len(farSpans) == 1 && farLines[0]-sLine <= topLevelSymMaxEndTargetLines && countIdentRunes(endBody) >= 8 &&
-				isTopLevelSymbolBoundarySpan(outline(), sLine, farLines[0]) {
-				delta := subEnd - afterOff
-				endSpans = [][2]int{{delta + farSpans[0][0], delta + farSpans[0][1]}}
-				endLines = farLines
-			} else if len(farSpans) > 0 {
+			if len(farSpans) == 1 {
+				farEndLine := offsetToLineNumber(lineStarts, winStart+subEnd+maxInt(farSpans[0][0], farSpans[0][1]-1))
+				isTopSym := countIdentRunes(endBody) >= 8 && isTopLevelSymbolBoundarySpan(outline(), sLine, sEndLine, farLines[0], farEndLine)
+				if isTopSym && farEndLine-sLine <= topLevelSymMaxEndTargetLines {
+					delta := subEnd - afterOff
+					endSpans = [][2]int{{delta + farSpans[0][0], delta + farSpans[0][1]}}
+					endLines = farLines
+				} else {
+					limit := defaultMaxEndTargetSpanLines
+					if isTopSym {
+						limit = topLevelSymMaxEndTargetLines
+					}
+					return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindNoMatch, map[string]any{"lines": []int{farLines[0]}},
+						"%s hunk %d: target matched at L%d, but endTarget is at L%d (%d lines away, exceeds %d-line span limit); set symbol or endLine",
+						relPath, hIdx+1, sLine, farLines[0], farLines[0]-sLine, limit)
+				}
+			} else if len(farSpans) > 1 {
 				return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindNoMatch, map[string]any{"lines": []int{farLines[0]}},
 					"%s hunk %d: target matched at L%d, but endTarget is at L%d (%d lines away, exceeds %d-line span limit); set symbol or endLine",
 					relPath, hIdx+1, sLine, farLines[0], farLines[0]-sLine, defaultMaxEndTargetSpanLines)

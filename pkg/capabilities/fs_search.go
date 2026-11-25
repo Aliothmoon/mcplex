@@ -574,7 +574,7 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 				return b.runListSearch(ctx, env, searchRoot, q)
 			}
 			hits, total, err := b.runTextOrRegexSearch(ctx, env.Cwd, searchRoot, q)
-			if err == nil && len(hits) >= q.maxResults {
+			if err == nil && len(hits) >= q.maxResults && (total < 0 || total > len(hits)) {
 				env.AddWarning(fmt.Sprintf("search.rg: capped at %d%s hits; narrow path/glob, pass { maxResults }, or use { count: true } for totals", q.maxResults, ofTotal(total)))
 			}
 			if cut := countCutLines(hits); cut > 0 {

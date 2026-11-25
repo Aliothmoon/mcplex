@@ -492,7 +492,7 @@ func (e *Engine) RunMCPExec(ctx context.Context, in ExecInput) (text string, isE
 	editTx := &capabilities.EditTxBinder{Policy: pol, ShellRunner: shellGit, Locks: e.fileLocks, Events: e.events, SessionID: evSid, RunID: runID}
 	stateBinder := &capabilities.StateBinder{Store: store, SessionID: sid}
 
-	timeout := sandbox.EffectiveDefaultTimeout()
+	var timeout time.Duration
 	if in.TimeoutMs > 0 {
 		timeout = time.Duration(in.TimeoutMs) * time.Millisecond
 	} else if in.TimeoutSec > 0 {
