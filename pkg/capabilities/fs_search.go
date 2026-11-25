@@ -30,8 +30,9 @@ import (
 )
 
 const (
-	MaxSandboxReadBytes = 2 * 1024 * 1024 // 2 MB per file inside sandbox memory (never directly enters LLM context)
-	MaxSearchLineBytes  = 300             // UTF-8-safe per-line preview cap for search.rg (long lines warn)
+	MaxSandboxReadBytes         = 2 * 1024 * 1024  // 2 MB default per file inside sandbox memory
+	MaxExplicitSandboxReadBytes = 16 * 1024 * 1024 // 16 MB max when caller passes explicit { maxBytes }
+	MaxSearchLineBytes          = 300              // UTF-8-safe per-line preview cap for search.rg (long lines warn)
 )
 
 var skippedWalkDirs = map[string]bool{
@@ -112,15 +113,22 @@ func (b *FSSearchBinder) readText(cwd, targetPath string, opts map[string]any) (
 	hasRange := startLine > 0 || endLine > 0 || limit > 0
 	withNumbers := optBool(opts, "lineNumbers", false)
 	tail := optInt(opts, "tail", 0)
+	readCap := MaxSandboxReadBytes
+	if mb := optInt(opts, "maxBytes", 0); mb > 0 {
+		readCap = minInt(mb, MaxExplicitSandboxReadBytes)
+	}
 	if isGzipFile(absPath) {
-		return readGzippedText(absPath, targetPath, startLine, endLine, limit, tail, withNumbers)
+		return readGzippedText(absPath, targetPath, startLine, endLine, limit, tail, withNumbers, readCap)
 	}
 	if tail > 0 {
 		return readTailLines(absPath, targetPath, tail, withNumbers)
 	}
-	if info.Size() > MaxSandboxReadBytes {
+	if info.Size() > int64(readCap) {
 		if !hasRange {
-			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is %d bytes (>2MB); pass { startLine, endLine }, { tail: N }, or use search.rg", targetPath, info.Size())
+			if readCap <= MaxSandboxReadBytes {
+				return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is %d bytes (>2MB); pass { maxBytes } (up to 16MB), { startLine, endLine }, { tail: N }, or use search.rg", targetPath, info.Size())
+			}
+			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is %d bytes (>%dB maxBytes cap); pass { startLine, endLine }, { tail: N }, or use search.rg", targetPath, info.Size(), readCap)
 		}
 		return readBoundedLineRange(absPath, targetPath, startLine, endLine, limit, withNumbers)
 	}
@@ -184,7 +192,10 @@ func isGzipFile(absPath string) bool {
 	return err == nil && n == 2 && hdr[0] == 0x1f && hdr[1] == 0x8b
 }
 
-func readGzippedText(absPath, targetPath string, startLine, endLine, limit, tail int, withNumbers bool) (string, error) {
+func readGzippedText(absPath, targetPath string, startLine, endLine, limit, tail int, withNumbers bool, readCap int) (string, error) {
+	if readCap <= 0 {
+		readCap = MaxSandboxReadBytes
+	}
 	f, err := os.Open(absPath)
 	if err != nil {
 		return "", err
@@ -198,14 +209,14 @@ func readGzippedText(absPath, targetPath string, startLine, endLine, limit, tail
 
 	hasRange := startLine > 0 || endLine > 0 || limit > 0
 	if tail <= 0 && !hasRange {
-		lr := &io.LimitedReader{R: gr, N: MaxSandboxReadBytes + 1}
+		lr := &io.LimitedReader{R: gr, N: int64(readCap) + 1}
 		raw, rErr := io.ReadAll(lr)
 		if rErr != nil {
 			return "", rErr
 		}
-		if len(raw) > MaxSandboxReadBytes {
+		if len(raw) > readCap {
 			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil,
-				"%s decompresses to >2MB; pass { startLine, endLine }, { tail: N }, or use zlib.gunzipSync", targetPath)
+				"%s decompresses to >2MB; pass { maxBytes } (up to 16MB), { startLine, endLine }, { tail: N }, or use zlib.gunzipSync", targetPath)
 		}
 		if bytes.IndexByte(raw, 0) >= 0 || !utf8.Valid(raw) {
 			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", targetPath)
@@ -431,6 +442,7 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 				"size":    info.Size(),
 				"isDir":   info.IsDir(),
 				"modTime": info.ModTime().UTC().Format("2006-01-02T15:04:05Z"),
+				"mtimeMs": info.ModTime().UnixMilli(),
 			}, nil
 		},
 		"list": func(_ context.Context, args []any) (any, error) {
@@ -587,8 +599,8 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 				return nil, err
 			}
 			maxResults := optInt(opts, "maxResults", optInt(opts, "limit", 500))
-			if maxResults > 5000 {
-				maxResults = 5000
+			if maxResults > 20000 {
+				maxResults = 20000
 			}
 			files, total, note, err := b.runGlobSearch(ctx, env.Cwd, searchRoot, pat, maxResults)
 			if err != nil {
@@ -599,6 +611,29 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			if b.Events.Active() {
 				emitSearchFiles(b.Events, b.SessionID, b.RunID, "search.glob", searchRoot, pat, files, total)
+			}
+			if optBool(opts, "detail", false) {
+				items := make([]map[string]any, 0, len(files))
+				for _, rel := range files {
+					abs := rel
+					if !filepath.IsAbs(abs) {
+						abs = filepath.Join(env.Cwd, filepath.FromSlash(rel))
+					}
+					var sz, mtimeMs int64
+					if st, stErr := os.Stat(abs); stErr == nil {
+						sz = st.Size()
+						mtimeMs = st.ModTime().UnixMilli()
+					}
+					items = append(items, map[string]any{
+						"path":    rel,
+						"size":    sz,
+						"mtimeMs": mtimeMs,
+					})
+				}
+				if optBool(opts, "withMeta", false) {
+					return map[string]any{"files": items, "note": note}, nil
+				}
+				return items, nil
 			}
 			if optBool(opts, "withMeta", false) {
 				return map[string]any{"files": files, "note": note}, nil

@@ -1712,7 +1712,31 @@ func findTargetAnywhereLine(normText, normTarget, relPath string, lineStarts []i
 	return 0
 }
 
-const defaultMaxEndTargetSpanLines = 120
+const (
+	defaultMaxEndTargetSpanLines = 120
+	topLevelSymMaxEndTargetLines = 400
+)
+
+func isTopLevelSymbolBoundarySpan(syms []SymbolInfo, startLine, endLine int) bool {
+	startsAtSym := false
+	endsAtSym := false
+	for _, s := range syms {
+		if s.unclosed {
+			continue
+		}
+		// Reject if startLine is strictly inside an enclosing symbol that ends before endLine (mid-function leak).
+		if startLine > s.StartLine && startLine <= s.EndLine && s.EndLine < endLine {
+			return false
+		}
+		if s.StartLine == startLine {
+			startsAtSym = true
+		}
+		if s.StartLine == endLine || s.EndLine == endLine {
+			endsAtSym = true
+		}
+	}
+	return startsAtSym && endsAtSym
+}
 
 func resolveEndTargetHunk(
 	normText, windowText, normStart, normEnd, normRepl, relPath, scope string,
@@ -1720,14 +1744,16 @@ func resolveEndTargetHunk(
 	outline func() []SymbolInfo, sep string, getPyStates func() []pyLineState,
 ) (absStart, absEnd int, finalRepl string, sLine, eLine int, err error) {
 	endBody := strings.TrimSuffix(normEnd, "\n")
-	if h.EndLine == 0 && !strings.Contains(endBody, "\n") && isBoilerplateAnchorLine(strings.TrimSpace(endBody)) && countIdentRunes(endBody) < 6 {
-		return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindBadArgs, nil,
-			"%s hunk %d: endTarget %q is a bare closing delimiter; include the preceding statement in endTarget (e.g. \"return ok;\\n}\"), set endLine, or use replaceSymbol",
-			relPath, hIdx+1, strings.TrimSpace(endBody))
-	}
+	endTrimmed := strings.TrimSpace(endBody)
+	isBareClose := h.EndLine == 0 && !strings.Contains(endBody, "\n") && isBoilerplateAnchorLine(endTrimmed) && countIdentRunes(endBody) < 6
 
 	startSpans, startLines, startExact := findAnchorCandidates(windowText, normStart, relPath, winStart, lineStarts, getPyStates)
 	if len(startSpans) == 0 {
+		if isBareClose {
+			return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindBadArgs, nil,
+				"%s hunk %d: endTarget %q is a bare closing delimiter; include the preceding statement in endTarget (e.g. \"return ok;\\n}\"), set endLine, or use replaceSymbol",
+				relPath, hIdx+1, endTrimmed)
+		}
 		if h.StartLine > 0 || h.EndLine > 0 || h.Symbol != "" {
 			if actualLine := findTargetAnywhereLine(normText, normStart, relPath, lineStarts, getPyStates); actualLine > 0 {
 				return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindNoMatch, map[string]any{"lines": []int{actualLine}},
@@ -1738,6 +1764,11 @@ func resolveEndTargetHunk(
 		return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindNoMatch, nil, "%s hunk %d: start target not found%s", relPath, hIdx+1, hint)
 	}
 	if len(startSpans) > 1 {
+		if isBareClose {
+			return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindBadArgs, nil,
+				"%s hunk %d: endTarget %q is a bare closing delimiter; include the preceding statement in endTarget (e.g. \"return ok;\\n}\"), set endLine, or use replaceSymbol",
+				relPath, hIdx+1, endTrimmed)
+		}
 		where := make([]string, len(startLines))
 		for i, l := range startLines {
 			where[i] = symbolAt(outline(), l, sep)
@@ -1758,7 +1789,42 @@ func resolveEndTargetHunk(
 	var endLines []int
 	resolvedInner := false
 
-	if h.Symbol == "" && h.EndLine == 0 {
+	// When `endTarget` is a bare closing delimiter (`}` or `};`), ONLY allow it if `target` uniquely opens an
+	// AST symbol (`sym.StartLine == sLine`) whose parser-verified `sym.EndLine` matches `endTrimmed` (e.g.,
+	// `{ target: "struct vm02_gl_hwc_present {", endTarget: "};" }`), avoiding inner `{ ... };` ambiguity!
+	if isBareClose {
+		var matchedSym *SymbolInfo
+		for i, sym := range outline() {
+			if !sym.unclosed && sym.hasBraces && sym.StartLine == sLine && sym.EndLine > sLine {
+				if matchedSym == nil || (sym.EndLine-sym.StartLine) < (matchedSym.EndLine-matchedSym.StartLine) {
+					cp := outline()[i]
+					matchedSym = &cp
+				}
+			}
+		}
+		if matchedSym != nil && matchedSym.EndLine >= 1 && matchedSym.EndLine <= len(lineStarts) {
+			lineAbsStart := lineStarts[matchedSym.EndLine-1]
+			lineAbsEnd := len(normText)
+			if matchedSym.EndLine < len(lineStarts) {
+				lineAbsEnd = lineStarts[matchedSym.EndLine] - 1 // exclude '\n'
+			}
+			if lineAbsStart >= winStart+afterOff && lineAbsEnd <= winStart+len(windowText) {
+				symEndLineStr := normText[lineAbsStart:lineAbsEnd]
+				if strings.TrimSpace(symEndLineStr) == endTrimmed {
+					endSpans = [][2]int{{lineAbsStart - (winStart + afterOff), lineAbsEnd - (winStart + afterOff)}}
+					endLines = []int{matchedSym.EndLine}
+					resolvedInner = true
+				}
+			}
+		}
+		if !resolvedInner {
+			return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindBadArgs, nil,
+				"%s hunk %d: endTarget %q is a bare closing delimiter; include the preceding statement in endTarget (e.g. \"return ok;\\n}\"), set endLine, or use replaceSymbol",
+				relPath, hIdx+1, endTrimmed)
+		}
+	}
+
+	if !resolvedInner && h.Symbol == "" && h.EndLine == 0 {
 		var enclosing []SymbolInfo
 		for _, sym := range outline() {
 			if !sym.unclosed && sLine >= sym.StartLine && sLine <= sym.EndLine {
@@ -1768,9 +1834,6 @@ func resolveEndTargetHunk(
 		sort.SliceStable(enclosing, func(i, j int) bool {
 			return (enclosing[i].EndLine - enclosing[i].StartLine) < (enclosing[j].EndLine - enclosing[j].StartLine)
 		})
-		// Try innermost enclosing AST symbol first (e.g. a method inside a class, or a short C function)
-		// so sibling methods / neighbor functions cannot cause spurious Ambiguous endTarget collisions;
-		// if 0 matches exist inside the inner symbol, widen to outer symbols / default 120-line span.
 		for _, sym := range enclosing {
 			symEndOff := len(windowText)
 			if sym.EndLine < len(lineStarts) {
@@ -1814,15 +1877,22 @@ func resolveEndTargetHunk(
 	if len(endSpans) == 0 {
 		if cappedBy120 && subEnd < len(windowText) {
 			farSpans, farLines, _ := findAnchorCandidates(windowText[subEnd:], normEnd, relPath, winStart+subEnd, lineStarts, getPyStates)
-			if len(farSpans) > 0 {
+			if len(farSpans) == 1 && farLines[0]-sLine <= topLevelSymMaxEndTargetLines && countIdentRunes(endBody) >= 8 &&
+				isTopLevelSymbolBoundarySpan(outline(), sLine, farLines[0]) {
+				delta := subEnd - afterOff
+				endSpans = [][2]int{{delta + farSpans[0][0], delta + farSpans[0][1]}}
+				endLines = farLines
+			} else if len(farSpans) > 0 {
 				return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindNoMatch, map[string]any{"lines": []int{farLines[0]}},
 					"%s hunk %d: target matched at L%d, but endTarget is at L%d (%d lines away, exceeds %d-line span limit); set symbol or endLine",
 					relPath, hIdx+1, sLine, farLines[0], farLines[0]-sLine, defaultMaxEndTargetSpanLines)
 			}
 		}
-		hint := closestLineHint(subWindow, normEnd)
-		return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindNoMatch, nil,
-			"%s hunk %d: target matched at L%d, but endTarget not found after L%d%s", relPath, hIdx+1, sLine, sLine, hint)
+		if len(endSpans) == 0 {
+			hint := closestLineHint(subWindow, normEnd)
+			return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindNoMatch, nil,
+				"%s hunk %d: target matched at L%d, but endTarget not found after L%d%s", relPath, hIdx+1, sLine, sLine, hint)
+		}
 	}
 	if len(endSpans) > 1 {
 		where := make([]string, len(endLines))

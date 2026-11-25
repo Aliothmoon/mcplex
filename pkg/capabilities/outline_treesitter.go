@@ -232,6 +232,7 @@ func (w *tsOutlineWalker) emit(n *gts.Node, kind, name string, hasBraces, unclos
 		EndLine:   end,
 		hasBraces: hasBraces,
 		unclosed:  unclosed,
+		fromAST:   true,
 	})
 }
 
@@ -298,7 +299,7 @@ func isNodeOrBodyUnclosed(n, body *gts.Node, allowSyntaxExt bool) bool {
 		return true
 	}
 	if body == nil {
-		return false
+		return n != nil && n.HasError()
 	}
 	if body.IsMissing() {
 		return true

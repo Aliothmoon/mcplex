@@ -725,7 +725,7 @@ func verifyReplaceableSymbol(lines []string, syms []SymbolInfo, sym SymbolInfo, 
 		return nil
 	}
 
-	if ext != ".go" && !sym.hasBraces {
+	if ext != ".go" && !sym.hasBraces && !sym.fromAST {
 		return sandbox.NewHostError(sandbox.KindBadArgs, nil,
 			"%s: symbol %s (L%d-%d) has no brace-delimited body; use a standard target hunk",
 			relPath, sym.Name, sym.StartLine, sym.EndLine)
@@ -738,10 +738,11 @@ func verifyReplaceableSymbol(lines []string, syms []SymbolInfo, sym SymbolInfo, 
 				relPath, sym.Name, sym.StartLine, sym.EndLine, delta)
 		}
 	}
-	if sym.EndLine > sym.StartLine {
+	isParenGoType := ext == ".go" && sym.Kind == "type" && strings.HasPrefix(strings.TrimSpace(lines[sym.EndLine-1]), ")")
+	if (sym.hasBraces || isParenGoType) && sym.EndLine > sym.StartLine {
 		endRaw := lines[sym.EndLine-1]
 		endTrim := strings.TrimSpace(endRaw)
-		validClose := strings.HasPrefix(endTrim, "}") || (ext == ".go" && sym.Kind == "type" && strings.HasPrefix(endTrim, ")"))
+		validClose := strings.HasPrefix(endTrim, "}") || isParenGoType
 		startLead, _ := splitLeadingHSpace(startRaw)
 		endLead, _ := splitLeadingHSpace(endRaw)
 		if !validClose || startLead != endLead {

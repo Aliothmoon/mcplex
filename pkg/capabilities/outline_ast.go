@@ -27,6 +27,7 @@ type SymbolInfo struct {
 	EndLine   int    `json:"endLine"`
 	unclosed  bool
 	hasBraces bool
+	fromAST   bool
 }
 
 // FileOutline groups extracted symbols for a file.
@@ -252,6 +253,7 @@ func extractGoASTSymbols(absPath string, src []byte, lines []string) ([]SymbolIn
 				EndLine:   end,
 				unclosed:  hasSyntaxErr,
 				hasBraces: d.Body != nil,
+				fromAST:   true,
 			})
 		case *ast.GenDecl:
 			for _, spec := range d.Specs {
@@ -281,6 +283,7 @@ func extractGoASTSymbols(absPath string, src []byte, lines []string) ([]SymbolIn
 						EndLine:   end,
 						unclosed:  hasSyntaxErr,
 						hasBraces: hasBraces,
+						fromAST:   true,
 					})
 				}
 			}

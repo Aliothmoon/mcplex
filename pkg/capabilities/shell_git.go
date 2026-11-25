@@ -22,20 +22,28 @@ import (
 )
 
 var allowedGitReadSubcommands = map[string]bool{
-	"status":    true,
-	"diff":      true,
-	"log":       true,
-	"show":      true,
-	"branch":    true,
-	"rev-parse": true,
-	"ls-files":  true,
-	"blame":     true,
-	"shortlog":  true,
-	"describe":  true,
-	"tag":       true,
-	"remote":    true,
-	"worktree":  true,
-	"stash":     true,
+	"status":       true,
+	"diff":         true,
+	"log":          true,
+	"show":         true,
+	"branch":       true,
+	"rev-parse":    true,
+	"ls-files":     true,
+	"blame":        true,
+	"shortlog":     true,
+	"describe":     true,
+	"tag":          true,
+	"remote":       true,
+	"worktree":     true,
+	"stash":        true,
+	"for-each-ref": true,
+	"show-ref":     true,
+	"rev-list":     true,
+	"ls-tree":      true,
+	"merge-base":   true,
+	"name-rev":     true,
+	"diff-tree":    true,
+	"check-ignore": true,
 }
 
 var shellStreamSeq atomic.Int64
@@ -853,6 +861,7 @@ var gitFlagsTakingSeparateValue = map[string]bool{
 	"-n": true, "-U": true, "-L": true,
 	"--max-count": true, "--unified": true, "--grep": true, "--since": true, "--after": true,
 	"--until": true, "--before": true, "--author": true, "--committer": true, "--format": true, "--pretty": true,
+	"--sort": true, "--count": true, "--contains": true, "--no-contains": true, "--merged": true, "--no-merged": true, "--points-at": true,
 }
 
 // validateGitReadPaths enforces b.Policy.ResolveAndCheckRead on file paths passed to git.diff, git.log,
@@ -1014,7 +1023,7 @@ func runReadOnlyGit(ctx context.Context, cwd string, gitArgs []string) (string, 
 	// Disable core.fsmonitor before the subcommand on ALL git invocations to block malicious repo hook RCE,
 	// and disable external diff / textconv helpers on diff/show/log where supported.
 	fullArgs := []string{"--no-pager", "-c", "core.fsmonitor=false", sub}
-	if sub == "diff" || sub == "show" || sub == "log" {
+	if sub == "diff" || sub == "show" || sub == "log" || sub == "diff-tree" {
 		fullArgs = append(fullArgs, "--no-ext-diff", "--no-textconv")
 	}
 	fullArgs = append(fullArgs, gitArgs[1:]...)
@@ -1027,6 +1036,9 @@ func runReadOnlyGit(ctx context.Context, cwd string, gitArgs []string) (string, 
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return "", 0, fmt.Errorf("git %s canceled: %w", sub, ctx.Err())
+		}
 		if cctx.Err() != nil {
 			return "", 0, fmt.Errorf("git %s timed out: %w", sub, cctx.Err())
 		}
