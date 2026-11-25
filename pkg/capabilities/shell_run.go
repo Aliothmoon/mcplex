@@ -82,12 +82,27 @@ func displayArgv(file string, argv []string) string {
 // resolveExecutable finds file on PATH, or relative to cwd when it contains a path separator
 // (never relative to the MCP process directory).
 func resolveExecutable(cwd, file string) (string, error) {
+	return resolveExecutableWithEnv(cwd, file, nil)
+}
+
+func resolveExecutableWithEnv(cwd, file string, extraEnv map[string]any) (string, error) {
 	if strings.ContainsAny(file, `/\`) {
 		p := file
 		if !filepath.IsAbs(p) {
 			p = filepath.Join(cwd, p)
 		}
 		return exec.LookPath(p)
+	}
+	if len(extraEnv) > 0 {
+		for k, v := range extraEnv {
+			if strings.EqualFold(k, "PATH") && v != nil {
+				if customPath := strings.TrimSpace(fmt.Sprint(v)); customPath != "" && !strings.EqualFold(customPath, "[redacted]") {
+					if found, ok := lookPathInCustomPATH(file, customPath); ok {
+						return found, nil
+					}
+				}
+			}
+		}
 	}
 	p, err := exec.LookPath(file)
 	if err != nil {
@@ -99,6 +114,40 @@ func resolveExecutable(cwd, file string) (string, error) {
 	return p, nil
 }
 
+func lookPathInCustomPATH(file, pathEnv string) (string, bool) {
+	var exts []string
+	if runtime.GOOS == "windows" {
+		if filepath.Ext(file) != "" {
+			exts = []string{""}
+		} else {
+			rawExt := os.Getenv("PATHEXT")
+			if rawExt == "" {
+				rawExt = ".COM;.EXE;.BAT;.CMD"
+			}
+			for _, e := range strings.Split(rawExt, ";") {
+				if e != "" {
+					exts = append(exts, e)
+				}
+			}
+		}
+	} else {
+		exts = []string{""}
+	}
+	for _, dir := range filepath.SplitList(pathEnv) {
+		dir = strings.Trim(strings.TrimSpace(dir), `"`)
+		if dir == "" || !filepath.IsAbs(dir) {
+			continue
+		}
+		for _, ext := range exts {
+			cand := filepath.Join(dir, file+ext)
+			if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+				return cand, true
+			}
+		}
+	}
+	return "", false
+}
+
 // cmd.exe re-parses the command line of .bat/.cmd files, so these characters in arguments could run other commands.
 const cmdMetaChars = "&|<>^%!\"\r\n"
 
@@ -108,7 +157,8 @@ func (b *ShellGitBinder) RunArgv(parentCtx context.Context, env *sandbox.Executi
 	if err := b.Policy.CheckCommand(line); err != nil {
 		return nil, err
 	}
-	resolved, err := resolveExecutable(cwd, file)
+	extraEnv, _ := opts["env"].(map[string]any)
+	resolved, err := resolveExecutableWithEnv(cwd, file, extraEnv)
 	if err != nil {
 		return nil, sandbox.NewHostError(sandbox.KindNotFound, nil, "%s: command not found", file)
 	}
@@ -130,8 +180,8 @@ func (b *ShellGitBinder) RunArgv(parentCtx context.Context, env *sandbox.Executi
 	cmd := exec.CommandContext(ctx, resolved, argv...)
 	cmd.Dir = cwd
 	setSysProcAttrHide(cmd)
-	if extra, ok := opts["env"].(map[string]any); ok && len(extra) > 0 {
-		cmd.Env = mergeEnv(extra)
+	if len(extraEnv) > 0 {
+		cmd.Env = mergeEnv(extraEnv)
 	}
 	if in, ok := opts["stdin"].(string); ok {
 		cmd.Stdin = strings.NewReader(in)
@@ -285,28 +335,45 @@ func cleanStream(s string) string {
 // On Windows names are case-insensitive, so an override replaces e.g. "Path" when "PATH" is given.
 func mergeEnv(extra map[string]any) []string {
 	base := os.Environ()
-	out := make([]string, 0, len(base)+len(extra))
 	norm := func(k string) string {
 		if runtime.GOOS == "windows" {
 			return strings.ToUpper(k)
 		}
 		return k
 	}
-	override := map[string]bool{}
-	for k := range extra {
-		override[norm(k)] = true
+	baseByNorm := make(map[string]string, len(base))
+	for _, kv := range base {
+		if k, v, ok := strings.Cut(kv, "="); ok && k != "" {
+			baseByNorm[norm(k)] = v
+		}
 	}
+	// Ignore placeholder "[redacted]" values coming from `{ env: { ...process.env, FOO: "1" } }`
+	// when the host environment already holds the real secret value (e.g. `ADB_VENDOR_KEYS`, `GITHUB_TOKEN`).
+	effective := make(map[string]string, len(extra))
+	override := make(map[string]bool, len(extra))
+	for k, v := range extra {
+		if v == nil {
+			continue
+		}
+		sv := fmt.Sprint(v)
+		nk := norm(k)
+		if strings.EqualFold(sv, "[redacted]") {
+			if _, existsInHost := baseByNorm[nk]; existsInHost {
+				continue
+			}
+		}
+		effective[k] = sv
+		override[nk] = true
+	}
+	out := make([]string, 0, len(base)+len(effective))
 	for _, kv := range base {
 		if k, _, ok := strings.Cut(kv, "="); ok && k != "" && override[norm(k)] {
 			continue
 		}
 		out = append(out, kv)
 	}
-	for k, v := range extra {
-		if v == nil {
-			continue
-		}
-		out = append(out, k+"="+fmt.Sprint(v))
+	for k, sv := range effective {
+		out = append(out, k+"="+sv)
 	}
 	return out
 }
