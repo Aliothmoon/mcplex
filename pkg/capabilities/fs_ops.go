@@ -405,6 +405,13 @@ func readTailLines(absPath, display string, n int, withNumbers bool) (string, er
 	if err != nil {
 		return "", err
 	}
+	if info.Size() >= 2 {
+		var hdr [4]byte
+		hn, _ := f.ReadAt(hdr[:], 0)
+		if isUTF16, bigEndian := detectUTF16BOM(hdr[:hn]); isUTF16 {
+			return readTailLinesUTF16(f, info.Size(), display, n, withNumbers, bigEndian)
+		}
+	}
 	const block = 64 * 1024
 	pos := info.Size()
 	var buf []byte

@@ -139,10 +139,11 @@ func (b *FSSearchBinder) readText(cwd, targetPath string, opts map[string]any) (
 	if err != nil {
 		return "", err
 	}
-	if bytes.IndexByte(raw, 0) >= 0 || !utf8.Valid(raw) {
+	decoded, ok := decodeTextBytes(raw)
+	if !ok {
 		return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", targetPath)
 	}
-	text := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	text := strings.ReplaceAll(decoded, "\r\n", "\n")
 	if withNumbers && !hasRange {
 		lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
 		for i, l := range lines {
@@ -221,10 +222,11 @@ func readGzippedText(absPath, targetPath string, startLine, endLine, limit, tail
 			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil,
 				"%s decompresses to >2MB; pass { maxBytes } (up to 16MB), { startLine, endLine }, { tail: N }, or use zlib.gunzipSync", targetPath)
 		}
-		if bytes.IndexByte(raw, 0) >= 0 || !utf8.Valid(raw) {
+		decoded, ok := decodeTextBytes(raw)
+		if !ok {
 			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", targetPath)
 		}
-		text := strings.ReplaceAll(string(raw), "\r\n", "\n")
+		text := strings.ReplaceAll(decoded, "\r\n", "\n")
 		if withNumbers {
 			lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
 			for i, l := range lines {
@@ -1901,7 +1903,13 @@ func readBoundedLineRange(absPath, targetPath string, startLine, endLine, limit 
 		return "", fmt.Errorf("invalid range: startLine (%d) > endLine (%d)", s, e)
 	}
 
-	scanner := bufio.NewScanner(f)
+	var reader io.Reader = f
+	if utf16R, isUTF16, uErr := openUTF16StreamReader(f); uErr != nil {
+		return "", uErr
+	} else if isUTF16 {
+		reader = utf16R
+	}
+	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), MaxSandboxReadBytes)
 	var selected []string
 	totalBytes := 0
@@ -1928,6 +1936,9 @@ func readBoundedLineRange(absPath, targetPath string, startLine, endLine, limit 
 		}
 	}
 	if scanErr := scanner.Err(); scanErr != nil {
+		if errors.Is(scanErr, errUTF16Binary) {
+			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", targetPath)
+		}
 		if errors.Is(scanErr, bufio.ErrTooLong) {
 			return "", fmt.Errorf("line %d in '%s' exceeds 2MB sandbox line cap; use search.rg()", lineNum+1, targetPath)
 		}

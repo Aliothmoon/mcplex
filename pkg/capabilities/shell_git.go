@@ -1280,6 +1280,9 @@ var (
 	gitValueFlags = map[string]string{
 		"grep": "--grep=", "since": "--since=", "until": "--until=", "author": "--author=", "format": "--format=",
 	}
+	gitPrettyPresets = map[string]bool{
+		"oneline": true, "short": true, "medium": true, "full": true, "fuller": true, "reference": true, "email": true, "raw": true,
+	}
 	gitPassKeys = map[string]bool{"cwd": true, "repo": true, "repoPath": true}
 )
 
@@ -1315,6 +1318,17 @@ func optionalGitTailArgs(args []any) ([]string, error) {
 			}
 		case gitValueFlags[k] != "":
 			if s := fmt.Sprint(v); s != "" && v != nil {
+				if k == "format" {
+					trimmed := strings.TrimSpace(s)
+					if trimmed == "--oneline" {
+						flags = append(flags, "--oneline")
+						continue
+					}
+					if strings.HasPrefix(trimmed, "--") && gitPrettyPresets[trimmed[2:]] {
+						flags = append(flags, "--format="+trimmed[2:])
+						continue
+					}
+				}
 				flags = append(flags, gitValueFlags[k]+s)
 			}
 		case k == "n" || k == "limit" || k == "maxCount":
@@ -1326,7 +1340,18 @@ func optionalGitTailArgs(args []any) ([]string, error) {
 				flags = append(flags, fmt.Sprintf("-U%d", n))
 			}
 		case k == "ref" || k == "refs" || k == "range" || k == "rev":
-			refs = append(refs, stringList(v)...)
+			for _, item := range stringList(v) {
+				if left, right, ok := strings.Cut(item, " -- "); ok {
+					if l := strings.TrimSpace(left); l != "" {
+						refs = append(refs, l)
+					}
+					if r := strings.TrimSpace(right); r != "" {
+						paths = append(paths, splitCommandArgs(r)...)
+					}
+					continue
+				}
+				refs = append(refs, item)
+			}
 		case k == "path" || k == "paths" || k == "file" || k == "files":
 			paths = append(paths, stringList(v)...)
 		case k == "args":
