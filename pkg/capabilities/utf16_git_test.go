@@ -181,3 +181,99 @@ return { logOneline, logShort, showA };
 		}
 	}
 }
+
+func TestGitQueryGrepAndInlineRefFlags(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Tester", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=Tester", "GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit("init")
+	if err := os.MkdirAll(filepath.Join(dir, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "src", "app.kt"), []byte("val url = \"https://example.com\"\nval nodeName = ctx.node.name\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "add app.kt")
+	firstSha := runGit("rev-parse", "--short", "HEAD")
+
+	// Remove nodeName in second commit so git grep on firstSha proves historical commit search works!
+	if err := os.WriteFile(filepath.Join(dir, "src", "app.kt"), []byte("val url = \"https://example.com\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "remove nodeName")
+
+	pol := policy.NewEngineWithOptions(dir, policy.Options{StrictWorkspace: true})
+	binder := &ShellGitBinder{Policy: pol}
+
+	code := `
+const hit = await git.query("grep -n -E \"(ctx\\.node|https://example)\\.name|https://example\\.com\" " + P.sha + " -- src");
+const miss = await git.query("grep -n \"non_existent_symbol_xyz\" " + P.sha + " -- src");
+const showStat = await git.show({ ref: P.sha + " --stat" });
+let pagerBlocked = false;
+let fileFlagBlocked = false;
+try { await git.query("grep -nOvi \"url\" HEAD"); } catch (e) { pagerBlocked = e.name === "BadArgs"; }
+try { await git.query("grep -f ../patterns.txt HEAD"); } catch (e) { fileFlagBlocked = e.name === "BadArgs"; }
+return { hit, miss, showStat, pagerBlocked, fileFlagBlocked };
+`
+	res, err := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd:      dir,
+		Code:     code,
+		Payloads: map[string]string{"sha": firstSha},
+	}, binder)
+	if err != nil {
+		t.Fatalf("git grep & inline ref flags test failed: %v", err)
+	}
+	m := res.Value.(map[string]any)
+	hit := m["hit"].(string)
+	if !strings.Contains(hit, "ctx.node.name") || !strings.Contains(hit, "https://example.com") {
+		t.Fatalf("expected historical git grep hits (including regex with ':'), got:\n%s", hit)
+	}
+	if m["miss"].(string) != "" {
+		t.Fatalf("expected 0-match git grep to return empty string, got: %q", m["miss"])
+	}
+	showStat := m["showStat"].(string)
+	if !strings.Contains(showStat, "src/app.kt") || strings.Contains(showStat, "+val nodeName") {
+		t.Fatalf("expected git.show({ ref: '<sha> --stat' }) to show stat summary without diff patch, got:\n%s", showStat)
+	}
+	if m["pagerBlocked"] != true || m["fileFlagBlocked"] != true {
+		t.Fatalf("expected -O and -f flags to be blocked in git grep, got %+v", m)
+	}
+}
+
+func TestSearchRgContextCanceledWording(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pol := policy.NewEngineWithOptions(dir, policy.Options{StrictWorkspace: true})
+	rgBin := (&FSSearchBinder{Policy: pol}).resolveRg()
+	if rgBin == "" {
+		t.Skip("rg not installed")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-canceled context
+	_, _, err := runRgJSON(ctx, pol, rgBin, dir, dir, searchQuery{pattern: "hello", maxResults: 10})
+	if err == nil {
+		t.Fatal("expected canceled error")
+	}
+	if !strings.Contains(err.Error(), "search.rg canceled:") || strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected 'search.rg canceled:' wording instead of 'timed out', got: %v", err)
+	}
+}

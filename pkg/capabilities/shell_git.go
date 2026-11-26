@@ -29,6 +29,7 @@ var allowedGitReadSubcommands = map[string]bool{
 	"branch":       true,
 	"rev-parse":    true,
 	"ls-files":     true,
+	"grep":         true,
 	"blame":        true,
 	"shortlog":     true,
 	"describe":     true,
@@ -833,6 +834,27 @@ func validateReadOnlyGitArgs(gitArgs []string) error {
 		}
 	}
 	switch sub {
+	case "grep":
+		for _, a := range rest {
+			if a == "--" {
+				break
+			}
+			if a == "-f" || strings.HasPrefix(a, "-f") || a == "--file" || strings.HasPrefix(a, "--file=") {
+				return fmt.Errorf("disallowed git grep flag '%s' in read-only git query", a)
+			}
+			if strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") {
+				for i := 1; i < len(a); i++ {
+					c := a[i]
+					if c == 'e' || c == 'm' || c == 'A' || c == 'B' || c == 'C' {
+						break // rest of token is attached pattern/count
+					}
+					if c == 'O' || c == 'f' {
+						return fmt.Errorf("disallowed git grep flag '%s' in read-only git query", a)
+					}
+				}
+			}
+		}
+		return nil
 	case "branch":
 		return validateListOnlyArgs("branch", rest, gitBranchListOpts, gitBranchListShort, "-l", "--list")
 	case "tag":
@@ -908,8 +930,8 @@ func validateReadOnlyGitArgs(gitArgs []string) error {
 }
 
 var gitFlagsTakingSeparateValue = map[string]bool{
-	"-n": true, "-U": true, "-L": true,
-	"--max-count": true, "--unified": true, "--grep": true, "--since": true, "--after": true,
+	"-n": true, "-U": true, "-L": true, "-e": true, "-m": true, "-A": true, "-B": true, "-C": true,
+	"--max-count": true, "--max-depth": true, "--threads": true, "--unified": true, "--grep": true, "--since": true, "--after": true,
 	"--until": true, "--before": true, "--author": true, "--committer": true, "--format": true, "--pretty": true,
 	"--sort": true, "--count": true, "--contains": true, "--no-contains": true, "--merged": true, "--no-merged": true, "--points-at": true,
 }
@@ -974,6 +996,19 @@ func (b *ShellGitBinder) validateGitReadPaths(repoDir string, gitArgs []string) 
 		positionals = append(positionals, a)
 	}
 
+	if sub == "grep" && len(positionals) > 0 {
+		hasExplicitPattern := false
+		for _, a := range preDash {
+			if a == "-e" || (strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a[1:], 'e')) {
+				hasExplicitPattern = true
+				break
+			}
+		}
+		if !hasExplicitPattern {
+			// First positional of 'git grep <pattern> [<tree>...]' is a regex/literal pattern, not a path or <rev>:<path>.
+			positionals = positionals[1:]
+		}
+	}
 	if sub == "blame" && dashIdx < 0 && len(positionals) > 0 {
 		target := positionals[len(positionals)-1]
 		if _, err := b.Policy.ResolveAndCheckRead(repoDir, target); err != nil {
@@ -1091,6 +1126,10 @@ func runReadOnlyGit(ctx context.Context, cwd string, gitArgs []string) (string, 
 		}
 		if cctx.Err() != nil {
 			return "", 0, fmt.Errorf("git %s timed out: %w", sub, cctx.Err())
+		}
+		var exitErr *exec.ExitError
+		if sub == "grep" && errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && strings.TrimSpace(stderr.String()) == "" {
+			return "", 0, nil
 		}
 		return "", 0, fmt.Errorf("git %s failed: %s", sub, strings.TrimSpace(stderr.String()))
 	}
@@ -1283,6 +1322,13 @@ var (
 	gitPrettyPresets = map[string]bool{
 		"oneline": true, "short": true, "medium": true, "full": true, "fuller": true, "reference": true, "email": true, "raw": true,
 	}
+	gitInlineRefFlags = map[string]bool{
+		"--stat": true, "--shortstat": true, "--numstat": true, "--summary": true,
+		"--name-only": true, "--name-status": true, "--oneline": true, "--raw": true,
+		"--patch": true, "-p": true, "--no-patch": true, "-s": true,
+		"--abbrev-commit": true, "--no-abbrev-commit": true,
+		"-w": true, "--ignore-all-space": true, "-b": true, "--ignore-space-change": true,
+	}
 	gitPassKeys = map[string]bool{"cwd": true, "repo": true, "repoPath": true}
 )
 
@@ -1341,16 +1387,18 @@ func optionalGitTailArgs(args []any) ([]string, error) {
 			}
 		case k == "ref" || k == "refs" || k == "range" || k == "rev":
 			for _, item := range stringList(v) {
-				if left, right, ok := strings.Cut(item, " -- "); ok {
-					if l := strings.TrimSpace(left); l != "" {
-						refs = append(refs, l)
-					}
+				left := item
+				if l, right, ok := strings.Cut(item, " -- "); ok {
+					left = strings.TrimSpace(l)
 					if r := strings.TrimSpace(right); r != "" {
 						paths = append(paths, splitCommandArgs(r)...)
 					}
-					continue
 				}
-				refs = append(refs, item)
+				if left != "" {
+					rTokens, fTokens := extractInlineRefFlags(left)
+					flags = append(flags, fTokens...)
+					refs = append(refs, rTokens...)
+				}
 			}
 		case k == "path" || k == "paths" || k == "file" || k == "files":
 			paths = append(paths, stringList(v)...)
@@ -1432,4 +1480,27 @@ func withLogDefaults(args []string) []string {
 		pre = append(pre, "--oneline")
 	}
 	return append(pre, args...)
+}
+
+func extractInlineRefFlags(raw string) (revs []string, inlineFlags []string) {
+	if !strings.Contains(raw, " -") || strings.Contains(raw, "@{") {
+		return []string{raw}, nil
+	}
+	parts := splitCommandArgs(raw)
+	if len(parts) <= 1 {
+		return []string{raw}, nil
+	}
+	matchedFlag := false
+	for _, tok := range parts {
+		if gitInlineRefFlags[tok] || (strings.HasPrefix(tok, "-U") && len(tok) > 2 && strings.Trim(tok[2:], "0123456789") == "") {
+			inlineFlags = append(inlineFlags, tok)
+			matchedFlag = true
+		} else {
+			revs = append(revs, tok)
+		}
+	}
+	if !matchedFlag {
+		return []string{raw}, nil
+	}
+	return revs, inlineFlags
 }

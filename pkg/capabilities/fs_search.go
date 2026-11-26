@@ -832,6 +832,9 @@ func execRgSearch(ctx context.Context, rgBin string, baseFlags []string, q searc
 		if errors.As(err, &exitErr) && rgCtx.Err() == nil {
 			return stdout, strings.TrimSpace(stderr.String()), exitErr.ExitCode(), err
 		}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil, "", -1, fmt.Errorf("search.rg canceled: %w", ctx.Err())
+		}
 		if rgCtx.Err() != nil {
 			return nil, "", -1, fmt.Errorf("search.rg timed out: %w", rgCtx.Err())
 		}
