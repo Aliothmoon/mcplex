@@ -128,6 +128,9 @@ func (b *FSSearchBinder) readText(cwd, targetPath string, opts map[string]any) (
 			if readCap <= MaxSandboxReadBytes {
 				return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is %d bytes (>2MB); pass { maxBytes } (up to 16MB), { startLine, endLine }, { tail: N }, or use search.rg", targetPath, info.Size())
 			}
+			if readCap < MaxExplicitSandboxReadBytes && info.Size() <= int64(MaxExplicitSandboxReadBytes) {
+				return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is %d bytes (>%dB maxBytes cap); raise { maxBytes } (up to 16MB), pass { startLine, endLine }, { tail: N }, or use search.rg", targetPath, info.Size(), readCap)
+			}
 			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is %d bytes (>%dB maxBytes cap); pass { startLine, endLine }, { tail: N }, or use search.rg", targetPath, info.Size(), readCap)
 		}
 		return readBoundedLineRange(absPath, targetPath, startLine, endLine, limit, withNumbers)

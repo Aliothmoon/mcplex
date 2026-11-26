@@ -229,3 +229,119 @@ func TestShellExplicitTimeoutExtendsDefaultDeadline(t *testing.T) {
 		t.Fatalf("expected explicit outer timeout to clip inner timeoutMs with diagnostic note, got: %v", err)
 	}
 }
+
+func TestEndTargetStraddlingCapAndAbsoluteHintLineNumbers(t *testing.T) {
+	dir := t.TempDir()
+	var sb strings.Builder
+	// Place target at L501 (so relative vs absolute line numbers are unmistakable).
+	for i := 1; i <= 499; i++ {
+		sb.WriteString(fmt.Sprintf("// pad %d\n", i))
+	}
+	sb.WriteString("static int outer_fn(void) {\n") // L500
+	sb.WriteString("  char dst[256];\n")            // L501 (target)
+	for i := 0; i < 117; i++ {                      // L502..L618
+		sb.WriteString(fmt.Sprintf("  dst[0] = %d;\n", i%127))
+	}
+	sb.WriteString("  return rc;\n")                // L619 (118 lines after L501)
+	sb.WriteString("}\n")                           // L620
+	sb.WriteString("\n")                            // L621 (subEnd = L501+120 = L621)
+	sb.WriteString("static int next_helper_fn(\n")  // L622 (straddles subEnd!)
+	sb.WriteString("  int x) { return x; }\n")      // L623
+
+	file := filepath.Join(dir, "oat_cache.c")
+	if err := os.WriteFile(file, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pol := policy.NewEngineWithOptions(dir, policy.Options{StrictWorkspace: true})
+	binder := &EditTxBinder{Policy: pol}
+
+	// 1. Multi-line endTarget straddling L619..L622 across the 120-line cap must be detected as a span-limit error (not "not found" with a fake blank line).
+	_, err := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd: dir,
+		Code: `await edit.apply({
+  edits: [{
+    path: "oat_cache.c",
+    hunks: [{
+      target: "  char dst[256];",
+      endTarget: "  return rc;\n}\n\nstatic int next_helper_fn(",
+      replacement: "  char dst[512];",
+    }],
+  }],
+});`,
+	}, binder)
+	if err == nil {
+		t.Fatal("expected straddling mid-function endTarget to fail with span limit error")
+	}
+	if !strings.Contains(err.Error(), "endTarget is at L619") || !strings.Contains(err.Error(), "121 lines away, exceeds 120-line span limit") {
+		t.Fatalf("expected straddling endTarget to report L619 and 121-line span limit, got:\n%v", err)
+	}
+
+	// 2. Genuine typo in endTarget must report REAL file line numbers (~L618-L622), NOT subWindow-relative L118-L122!
+	_, errTypo := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd: dir,
+		Code: `await edit.apply({
+  edits: [{
+    path: "oat_cache.c",
+    hunks: [{
+      target: "  char dst[256];",
+      endTarget: "  return rc;\n}\n\nstatic int next_helper_TYPO(",
+      replacement: "  char dst[512];",
+    }],
+  }],
+});`,
+	}, binder)
+	if errTypo == nil {
+		t.Fatal("expected typo endTarget to fail with NoMatch")
+	}
+	msg := errTypo.Error()
+	if !strings.Contains(msg, "L619") || !strings.Contains(msg, "L622") || !strings.Contains(msg, "static int next_helper_fn(") {
+		t.Fatalf("expected real file line numbers (L619/L622) and full straddling context in closestLineHint, got:\n%s", msg)
+	}
+	if strings.Contains(msg, "from L118") || strings.Contains(msg, "from L119") || strings.Contains(msg, "vs L121") || strings.Contains(msg, "vs L122") {
+		t.Fatalf("closestLineHint leaked subWindow-relative line numbers:\n%s", msg)
+	}
+}
+
+func TestRequireStringArgReturnsBadArgs(t *testing.T) {
+	dir := t.TempDir()
+	pol := policy.NewEngineWithOptions(dir, policy.Options{StrictWorkspace: true})
+	binder := &FSSearchBinder{Policy: pol}
+
+	res, err := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd: dir,
+		Code: `
+try {
+  await fs.stat(undefined);
+  return "no-error";
+} catch (e) {
+  return { name: e.name, message: e.message };
+}
+`,
+	}, binder)
+	if err != nil {
+		t.Fatalf("unexpected execution error: %v", err)
+	}
+	m, _ := res.Value.(map[string]any)
+	if m["name"] != "BadArgs" {
+		t.Fatalf("expected e.name == 'BadArgs' for missing fs.stat path, got %+v", m)
+	}
+}
+
+func TestFsReadCustomMaxBytesBelow16MBHint(t *testing.T) {
+	dir := t.TempDir()
+	// 3.5 MB file (> 2MB default, > 3MB custom maxBytes, <= 16MB hard cap)
+	data := strings.Repeat("a", 3500*1024)
+	if err := os.WriteFile(filepath.Join(dir, "mid.txt"), []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pol := policy.NewEngineWithOptions(dir, policy.Options{StrictWorkspace: true})
+	binder := &FSSearchBinder{Policy: pol}
+
+	_, err := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd:  dir,
+		Code: `await fs.read("mid.txt", { maxBytes: 3 * 1024 * 1024 });`,
+	}, binder)
+	if err == nil || !strings.Contains(err.Error(), "raise { maxBytes } (up to 16MB)") {
+		t.Fatalf("expected hint to raise maxBytes up to 16MB, got: %v", err)
+	}
+}

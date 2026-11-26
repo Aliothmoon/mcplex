@@ -1882,31 +1882,49 @@ func resolveEndTargetHunk(
 	}
 	if len(endSpans) == 0 {
 		if cappedBy120 && subEnd < len(windowText) {
-			farSpans, farLines, _ := findAnchorCandidates(windowText[subEnd:], normEnd, relPath, winStart+subEnd, lineStarts, getPyStates)
+			// Search from afterOff (not subEnd) so multi-line endTargets straddling the 120-line boundary are still detected cleanly.
+			farSpans, farLines, _ := findAnchorCandidates(windowText[afterOff:], normEnd, relPath, winStart+afterOff, lineStarts, getPyStates)
 			if len(farSpans) == 1 {
-				farEndLine := offsetToLineNumber(lineStarts, winStart+subEnd+maxInt(farSpans[0][0], farSpans[0][1]-1))
+				farEndLine := offsetToLineNumber(lineStarts, winStart+afterOff+maxInt(farSpans[0][0], farSpans[0][1]-1))
 				isTopSym := countIdentRunes(endBody) >= 8 && isTopLevelSymbolBoundarySpan(outline(), sLine, sEndLine, farLines[0], farEndLine)
 				if isTopSym && farEndLine-sLine <= topLevelSymMaxEndTargetLines {
-					delta := subEnd - afterOff
-					endSpans = [][2]int{{delta + farSpans[0][0], delta + farSpans[0][1]}}
+					endSpans = farSpans
 					endLines = farLines
 				} else {
 					limit := defaultMaxEndTargetSpanLines
 					if isTopSym {
 						limit = topLevelSymMaxEndTargetLines
 					}
+					spanDist := maxInt(farLines[0]-sLine, farEndLine-sLine)
 					return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindNoMatch, map[string]any{"lines": []int{farLines[0]}},
 						"%s hunk %d: target matched at L%d, but endTarget is at L%d (%d lines away, exceeds %d-line span limit); set symbol or endLine",
-						relPath, hIdx+1, sLine, farLines[0], farLines[0]-sLine, limit)
+						relPath, hIdx+1, sLine, farLines[0], spanDist, limit)
 				}
 			} else if len(farSpans) > 1 {
+				farEndLine := offsetToLineNumber(lineStarts, winStart+afterOff+maxInt(farSpans[0][0], farSpans[0][1]-1))
+				spanDist := maxInt(farLines[0]-sLine, farEndLine-sLine)
 				return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindNoMatch, map[string]any{"lines": []int{farLines[0]}},
 					"%s hunk %d: target matched at L%d, but endTarget is at L%d (%d lines away, exceeds %d-line span limit); set symbol or endLine",
-					relPath, hIdx+1, sLine, farLines[0], farLines[0]-sLine, defaultMaxEndTargetSpanLines)
+					relPath, hIdx+1, sLine, farLines[0], spanDist, defaultMaxEndTargetSpanLines)
 			}
 		}
 		if len(endSpans) == 0 {
-			hint := closestLineHint(subWindow, normEnd)
+			subStartLine := offsetToLineNumber(lineStarts, winStart+afterOff)
+			hintWindow := subWindow
+			if cappedBy120 && subEnd < len(windowText) {
+				// Include enough trailing lines past subEnd so multi-line typos straddling the cap aren't shown as blank lines.
+				padLines := strings.Count(strings.TrimSuffix(normEnd, "\n"), "\n") + 4
+				hintMaxLine := offsetToLineNumber(lineStarts, winStart+subEnd) + padLines
+				if hintMaxLine < len(lineStarts) {
+					hintEnd := lineStarts[hintMaxLine] - winStart
+					if hintEnd > subEnd && hintEnd <= len(windowText) {
+						hintWindow = windowText[afterOff:hintEnd]
+					}
+				} else {
+					hintWindow = windowText[afterOff:]
+				}
+			}
+			hint := closestLineHintAt(hintWindow, normEnd, subStartLine)
 			return 0, 0, "", 0, 0, sandbox.NewHostError(sandbox.KindNoMatch, nil,
 				"%s hunk %d: target matched at L%d, but endTarget not found after L%d%s", relPath, hIdx+1, sLine, sLine, hint)
 		}
@@ -2463,6 +2481,11 @@ func simulateJSEscapeLoss(s string) string {
 }
 
 func closestLineHint(fileText, target string) string {
+	return closestLineHintAt(fileText, target, 1)
+}
+
+func closestLineHintAt(fileText, target string, baseLine int) string {
+	lineOffset := maxInt(0, baseLine-1)
 	trimmedTarget := strings.TrimSuffix(target, "\n")
 	targetLines := strings.Split(trimmedTarget, "\n")
 	anchors := selectDiverseAnchors(targetLines)
@@ -2606,7 +2629,7 @@ func closestLineHint(fileText, target string) string {
 		tWS := describeLeadWhitespace(tDiffLine)
 		fWS := describeLeadWhitespace(fDiffLine)
 		if tWS != fWS {
-			extraNotes = append(extraNotes, fmt.Sprintf("indent differs at L%d: target has %s, file has %s", diffFileIdx+1, tWS, fWS))
+			extraNotes = append(extraNotes, fmt.Sprintf("indent differs at L%d: target has %s, file has %s", diffFileIdx+1+lineOffset, tWS, fWS))
 		}
 	}
 	if strings.Contains(fDiffLine, `\`) && fDiffLine != tDiffLine {
@@ -2631,24 +2654,24 @@ func closestLineHint(fileText, target string) string {
 	}
 	var snip []string
 	for i := from; i <= to; i++ {
-		snip = append(snip, fmt.Sprintf("    %d: %s", i+1, truncateHintLine(fileLines[i])))
+		snip = append(snip, fmt.Sprintf("    %d: %s", i+1+lineOffset, truncateHintLine(fileLines[i])))
 	}
 
 	var b strings.Builder
 	if len(targetLines) > 1 && matchedPrefix > 0 && !pureWhitespaceDiff {
 		fmt.Fprintf(&b, "; matched first %d/%d line(s) from L%d, mismatch at target line %d vs L%d:\n",
-			matchedPrefix, len(targetLines), bestTop+1, diffTargetIdx+1, diffFileIdx+1)
+			matchedPrefix, len(targetLines), bestTop+1+lineOffset, diffTargetIdx+1, diffFileIdx+1+lineOffset)
 		fmt.Fprintf(&b, "  - target (%d): %s\n  + file  L%-4d: %s\n",
-			diffTargetIdx+1, truncateHintLine(tDiffLine), diffFileIdx+1, truncateHintLine(fDiffLine))
-		fmt.Fprintf(&b, "  closest L%d-%d:\n%s", from+1, to+1, strings.Join(snip, "\n"))
+			diffTargetIdx+1, truncateHintLine(tDiffLine), diffFileIdx+1+lineOffset, truncateHintLine(fDiffLine))
+		fmt.Fprintf(&b, "  closest L%d-%d:\n%s", from+1+lineOffset, to+1+lineOffset, strings.Join(snip, "\n"))
 	} else {
-		fmt.Fprintf(&b, "; closest L%d-%d", from+1, to+1)
+		fmt.Fprintf(&b, "; closest L%d-%d", from+1+lineOffset, to+1+lineOffset)
 		if len(extraNotes) > 0 && pureWhitespaceDiff {
 			fmt.Fprintf(&b, " (%s)", extraNotes[0])
 			extraNotes = extraNotes[1:]
 		}
 		fmt.Fprintf(&b, ":\n  - target (%d): %s\n  + file  L%-4d: %s\n%s",
-			diffTargetIdx+1, truncateHintLine(tDiffLine), diffFileIdx+1, truncateHintLine(fDiffLine), strings.Join(snip, "\n"))
+			diffTargetIdx+1, truncateHintLine(tDiffLine), diffFileIdx+1+lineOffset, truncateHintLine(fDiffLine), strings.Join(snip, "\n"))
 	}
 	for _, note := range extraNotes {
 		b.WriteString("\n  " + note)

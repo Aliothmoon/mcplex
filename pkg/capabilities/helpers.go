@@ -11,11 +11,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aliothmoon/mcplex/pkg/sandbox"
 )
 
 func requireStringArg(args []any, idx int, name string) (string, error) {
 	if len(args) <= idx || args[idx] == nil {
-		return "", fmt.Errorf("missing required string argument '%s'", name)
+		return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "missing required string argument '%s'", name)
 	}
 	if s, ok := args[idx].(string); ok && strings.TrimSpace(s) != "" {
 		return s, nil
@@ -25,12 +27,12 @@ func requireStringArg(args []any, idx int, name string) (string, error) {
 			return s, nil
 		}
 	}
-	return "", fmt.Errorf("argument '%s' must be a non-empty string", name)
+	return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "argument '%s' must be a non-empty string", name)
 }
 
 func parsePathAndOpts(args []any) (string, map[string]any, error) {
 	if len(args) == 0 || args[0] == nil {
-		return "", nil, fmt.Errorf("missing path argument")
+		return "", nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "missing path argument")
 	}
 	if s, ok := args[0].(string); ok {
 		var opts map[string]any
@@ -43,12 +45,12 @@ func parsePathAndOpts(args []any) (string, map[string]any, error) {
 		p := firstString(m, "path", "file", "file_path", "dir", "directory")
 		return p, m, nil
 	}
-	return "", nil, fmt.Errorf("invalid path argument")
+	return "", nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "invalid path argument")
 }
 
 func parsePatternAndOpts(args []any) (string, map[string]any, error) {
 	if len(args) == 0 || args[0] == nil {
-		return "", nil, fmt.Errorf("missing pattern argument")
+		return "", nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "missing pattern argument")
 	}
 	if s, ok := args[0].(string); ok {
 		var opts map[string]any
@@ -60,11 +62,11 @@ func parsePatternAndOpts(args []any) (string, map[string]any, error) {
 	if m, ok := args[0].(map[string]any); ok {
 		pat := firstString(m, "pattern", "glob", "query", "name")
 		if pat == "" {
-			return "", nil, fmt.Errorf("pattern cannot be empty")
+			return "", nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "pattern cannot be empty")
 		}
 		return pat, m, nil
 	}
-	return "", nil, fmt.Errorf("invalid pattern argument")
+	return "", nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "invalid pattern argument")
 }
 
 func firstString(m map[string]any, keys ...string) string {
