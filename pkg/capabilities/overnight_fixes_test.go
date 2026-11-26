@@ -242,11 +242,11 @@ func TestEndTargetStraddlingCapAndAbsoluteHintLineNumbers(t *testing.T) {
 	for i := 0; i < 117; i++ {                      // L502..L618
 		sb.WriteString(fmt.Sprintf("  dst[0] = %d;\n", i%127))
 	}
-	sb.WriteString("  return rc;\n")                // L619 (118 lines after L501)
-	sb.WriteString("}\n")                           // L620
-	sb.WriteString("\n")                            // L621 (subEnd = L501+120 = L621)
-	sb.WriteString("static int next_helper_fn(\n")  // L622 (straddles subEnd!)
-	sb.WriteString("  int x) { return x; }\n")      // L623
+	sb.WriteString("  return rc;\n")               // L619 (118 lines after L501)
+	sb.WriteString("}\n")                          // L620
+	sb.WriteString("\n")                           // L621 (subEnd = L501+120 = L621)
+	sb.WriteString("static int next_helper_fn(\n") // L622 (straddles subEnd!)
+	sb.WriteString("  int x) { return x; }\n")     // L623
 
 	file := filepath.Join(dir, "oat_cache.c")
 	if err := os.WriteFile(file, []byte(sb.String()), 0o644); err != nil {
