@@ -431,7 +431,7 @@ func readTailLines(absPath, display string, n int, withNumbers bool) (string, er
 		}
 	}
 	if bytes.IndexByte(buf, 0) >= 0 {
-		return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", display)
+		return "", binaryFileHostError(display)
 	}
 	text := strings.TrimRight(strings.ReplaceAll(string(buf), "\r\n", "\n"), "\n")
 	lines := strings.Split(text, "\n")

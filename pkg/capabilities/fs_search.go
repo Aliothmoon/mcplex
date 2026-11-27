@@ -141,7 +141,7 @@ func (b *FSSearchBinder) readText(cwd, targetPath string, opts map[string]any) (
 	}
 	decoded, ok := decodeTextBytes(raw)
 	if !ok {
-		return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", targetPath)
+		return "", binaryFileHostError(targetPath)
 	}
 	text := strings.ReplaceAll(decoded, "\r\n", "\n")
 	if withNumbers && !hasRange {
@@ -224,7 +224,7 @@ func readGzippedText(absPath, targetPath string, startLine, endLine, limit, tail
 		}
 		decoded, ok := decodeTextBytes(raw)
 		if !ok {
-			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", targetPath)
+			return "", binaryFileHostError(targetPath)
 		}
 		text := strings.ReplaceAll(decoded, "\r\n", "\n")
 		if withNumbers {
@@ -249,7 +249,7 @@ func readGzippedText(absPath, targetPath string, startLine, endLine, limit, tail
 		for sc.Scan() {
 			rawLine := sc.Bytes()
 			if bytes.IndexByte(rawLine, 0) >= 0 || !utf8.Valid(rawLine) {
-				return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", targetPath)
+				return "", binaryFileHostError(targetPath)
 			}
 			ring[total%tail] = string(rawLine)
 			total++
@@ -295,7 +295,7 @@ func readGzippedText(absPath, targetPath string, startLine, endLine, limit, tail
 		rawLine := sc.Bytes()
 		lineNum++
 		if bytes.IndexByte(rawLine, 0) >= 0 || !utf8.Valid(rawLine) {
-			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", targetPath)
+			return "", binaryFileHostError(targetPath)
 		}
 		if lineNum >= s && lineNum <= e {
 			clean := string(rawLine)
@@ -1940,7 +1940,7 @@ func readBoundedLineRange(absPath, targetPath string, startLine, endLine, limit 
 	}
 	if scanErr := scanner.Err(); scanErr != nil {
 		if errors.Is(scanErr, errUTF16Binary) {
-			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", targetPath)
+			return "", binaryFileHostError(targetPath)
 		}
 		if errors.Is(scanErr, bufio.ErrTooLong) {
 			return "", fmt.Errorf("line %d in '%s' exceeds 2MB sandbox line cap; use search.rg()", lineNum+1, targetPath)
@@ -2000,4 +2000,13 @@ func ofTotal(total int) string {
 		return ""
 	}
 	return fmt.Sprintf(" of %d", total)
+}
+
+func binaryFileHostError(display string) error {
+	return sandbox.NewHostError(
+		sandbox.KindBadArgs,
+		nil,
+		"%s is binary; use fs.bytes(path) for raw bytes or fs.cat(paths) to skip binary files as null",
+		display,
+	)
 }

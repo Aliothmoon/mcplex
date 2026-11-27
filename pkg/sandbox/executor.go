@@ -1046,8 +1046,13 @@ func (env *ExecutionEnv) newJSHostError(kind, capability, msg string, line int, 
 
 func opBudgetMessage(capability string, maxOps int) string {
 	base := fmt.Sprintf("op budget exceeded (%d host calls); batch work (e.g. ast.outlines, sh.checks) or split the program", maxOps)
-	if capability == "fs.rm" {
+	switch capability {
+	case "fs.rm":
 		return base + "; for recursive directory deletion, use built-in run_command instead of looping fs.rm"
+	case "fs.stat":
+		return base + "; for bulk file sizes/mtimes, use search.glob(\"**/*\", { path: dir, detail: true }) or fs.list(dir, { detail: true }) in 1 call instead of looping fs.stat"
+	case "fs.read":
+		return base + "; for reading many files at once, use fs.cat(paths) or search.rg(...) instead of looping fs.read"
 	}
 	return base
 }

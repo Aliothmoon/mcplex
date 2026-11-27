@@ -187,6 +187,9 @@ func (m *MCPBridge) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
+			if reqDur, ok := extractMCPCallTimeout(callArgs); ok {
+				env.ExtendDefaultDeadline("mcp.call", clampShellTimeout(reqDur+3*time.Second))
+			}
 			return m.CallExternalTool(ctx, env.Cwd, ref, callArgs)
 		},
 	}
@@ -325,7 +328,13 @@ func (m *MCPBridge) CallExternalTool(ctx context.Context, cwd, rawRef string, ca
 		}
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, resolveMCPServerTimeout(cfg.TimeoutSec))
+	callTimeout := resolveMCPServerTimeout(cfg.TimeoutSec)
+	if reqDur, ok := extractMCPCallTimeout(callArgs); ok {
+		if need := clampShellTimeout(reqDur + 3*time.Second); need > callTimeout {
+			callTimeout = need
+		}
+	}
+	callCtx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
 
 	endpoint := strings.TrimSpace(cfg.ServerURL)
@@ -339,6 +348,31 @@ func (m *MCPBridge) CallExternalTool(ctx context.Context, cwd, rawRef string, ca
 		return nil, fmt.Errorf("MCP server '%s' has neither 'command' nor 'serverUrl'", serverName)
 	}
 	return m.callStdioServer(callCtx, serverName, cfg, exactTool, callArgs)
+}
+
+func extractMCPCallTimeout(callArgs map[string]any) (time.Duration, bool) {
+	if len(callArgs) == 0 {
+		return 0, false
+	}
+	if ms := optInt(callArgs, "timeoutMs", 0); ms > 0 {
+		return clampShellTimeout(time.Duration(ms) * time.Millisecond), true
+	}
+	if ms := optInt(callArgs, "timeout_ms", 0); ms > 0 {
+		return clampShellTimeout(time.Duration(ms) * time.Millisecond), true
+	}
+	if sec := optInt(callArgs, "timeoutSec", 0); sec > 0 {
+		return clampShellTimeout(time.Duration(sec) * time.Second), true
+	}
+	if sec := optInt(callArgs, "timeout_sec", 0); sec > 0 {
+		return clampShellTimeout(time.Duration(sec) * time.Second), true
+	}
+	if raw := optInt(callArgs, "timeout", 0); raw > 0 {
+		if raw >= 500 {
+			return clampShellTimeout(time.Duration(raw) * time.Millisecond), true
+		}
+		return clampShellTimeout(time.Duration(raw) * time.Second), true
+	}
+	return 0, false
 }
 
 func (m *MCPBridge) schemaCacheDirs() []string {

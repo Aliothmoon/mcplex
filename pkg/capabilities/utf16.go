@@ -10,8 +10,6 @@ import (
 	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
-
-	"github.com/aliothmoon/mcplex/pkg/sandbox"
 )
 
 var errUTF16Binary = errors.New("utf16 stream contains binary/nul data")
@@ -180,7 +178,7 @@ func (r *utf16ToUTF8Reader) Read(p []byte) (int, error) {
 
 func readTailLinesUTF16(f *os.File, fileSize int64, display string, n int, withNumbers bool, bigEndian bool) (string, error) {
 	if fileSize%2 != 0 {
-		return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", display)
+		return "", binaryFileHostError(display)
 	}
 	const block = 64 * 1024 // even byte size
 	maxBuf := 2 * MaxSandboxReadBytes
@@ -214,7 +212,7 @@ func readTailLinesUTF16(f *os.File, fileSize int64, display string, n int, withN
 	}
 	decoded, ok := decodeUTF16Units(buf, bigEndian)
 	if !ok {
-		return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is binary", display)
+		return "", binaryFileHostError(display)
 	}
 	text := strings.TrimRight(strings.ReplaceAll(decoded, "\r\n", "\n"), "\n")
 	lines := strings.Split(text, "\n")

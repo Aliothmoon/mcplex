@@ -334,7 +334,14 @@ func isEditCapability(capName string) bool {
 }
 
 func isSecondaryCancelTrace(t sandbox.OpTrace) bool {
-	return (t.Kind == "" || t.Kind == "Error") && strings.Contains(strings.ToLower(t.Error), "context canceled")
+	if t.Kind != "" && t.Kind != "Error" {
+		return false
+	}
+	low := strings.ToLower(strings.TrimSpace(t.Error))
+	return strings.Contains(low, "context canceled") ||
+		strings.Contains(low, "outer execution already ended") ||
+		strings.HasPrefix(low, "canceled after ") ||
+		strings.HasSuffix(low, ": canceled")
 }
 
 // PayloadKeyLengths extracts only key names and byte sizes so sensitive file contents aren't duplicated in telemetry.

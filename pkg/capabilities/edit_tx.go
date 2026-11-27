@@ -1744,6 +1744,57 @@ func isTopLevelSymbolBoundarySpan(syms []SymbolInfo, startLine, startEndLine, en
 	return startsAtSym && endsAtSym
 }
 
+// isHighEntropyTopLevelSpan returns true when `target..endTarget` begins at column 0, ends at a column-0
+// top-level boundary with >= 2 non-empty lines and >= 12 identifier runes (or >= 24 non-space runes) in `endTarget`,
+// and does not leak out of or into the middle of any AST symbol in `syms`.
+// This safely handles C/C++/Rust macro-annotated functions (e.g. `JNIEXPORT JNICALL`) up to 600 lines
+// while still rejecting mid-function `endTarget` leaks at the 120-line cap.
+func isHighEntropyTopLevelSpan(syms []SymbolInfo, normStart, normEnd string, startLine, startEndLine, endStartLine, endEndLine int) bool {
+	for _, s := range syms {
+		if s.unclosed {
+			continue
+		}
+		if startLine > s.StartLine && startLine <= s.EndLine && s.EndLine < endEndLine {
+			return false
+		}
+		if s.StartLine > startEndLine && endEndLine >= s.StartLine && endEndLine < s.EndLine && !(endStartLine == endEndLine && s.StartLine == endStartLine) {
+			return false
+		}
+	}
+
+	firstStartLine := ""
+	for _, line := range strings.Split(normStart, "\n") {
+		if strings.TrimSpace(line) != "" {
+			firstStartLine = line
+			break
+		}
+	}
+	if firstStartLine == "" || firstStartLine[0] == ' ' || firstStartLine[0] == '\t' {
+		return false
+	}
+
+	nonEmpty := 0
+	nonSpace := 0
+	lastEndLine := ""
+	for _, line := range strings.Split(normEnd, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		nonEmpty++
+		lastEndLine = line
+		for _, r := range trimmed {
+			if r != ' ' && r != '\t' {
+				nonSpace++
+			}
+		}
+	}
+	if nonEmpty < 2 || lastEndLine == "" || lastEndLine[0] == ' ' || lastEndLine[0] == '\t' {
+		return false
+	}
+	return countIdentRunes(normEnd) >= 12 || nonSpace >= 24
+}
+
 func resolveEndTargetHunk(
 	normText, windowText, normStart, normEnd, normRepl, relPath, scope string,
 	h EditHunk, hIdx, winStart int, lineStarts []int,
@@ -1887,12 +1938,13 @@ func resolveEndTargetHunk(
 			if len(farSpans) == 1 {
 				farEndLine := offsetToLineNumber(lineStarts, winStart+afterOff+maxInt(farSpans[0][0], farSpans[0][1]-1))
 				isTopSym := countIdentRunes(endBody) >= 8 && isTopLevelSymbolBoundarySpan(outline(), sLine, sEndLine, farLines[0], farEndLine)
-				if isTopSym && farEndLine-sLine <= topLevelSymMaxEndTargetLines {
+				isUniqueMultiLine := isHighEntropyTopLevelSpan(outline(), normStart, normEnd, sLine, sEndLine, farLines[0], farEndLine)
+				if (isTopSym || isUniqueMultiLine) && farEndLine-sLine <= topLevelSymMaxEndTargetLines {
 					endSpans = farSpans
 					endLines = farLines
 				} else {
 					limit := defaultMaxEndTargetSpanLines
-					if isTopSym {
+					if isTopSym || isUniqueMultiLine {
 						limit = topLevelSymMaxEndTargetLines
 					}
 					spanDist := maxInt(farLines[0]-sLine, farEndLine-sLine)

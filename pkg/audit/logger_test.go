@@ -182,3 +182,15 @@ func TestClassifyErrorSkipsSecondaryContextCanceledTraceInPromiseAll(t *testing.
 		t.Fatalf("expected primary NotFound to win over sibling context canceled trace, got %q", got)
 	}
 }
+
+func TestClassifyErrorSkipsSecondaryShellCancelTrace(t *testing.T) {
+	traces := []sandbox.OpTrace{
+		{Seq: 1, Wave: 1, Capability: "search.rg", Target: "scripts/device/test_container.py", DurationMs: 3, Status: "error", Kind: "NotFound", Error: "scripts/device/test_container.py not found"},
+		{Seq: 2, Wave: 1, Capability: "search.rg", Target: "return 20", DurationMs: 20, Status: "error", Kind: "Error", Error: "context canceled"},
+		{Seq: 3, Wave: 1, Capability: "sh.exec", Target: "adb shell logcat -d -t 150", DurationMs: 722, Status: "error", Kind: "Error", Error: "CANCELED after 722ms (outer execution already ended)"},
+	}
+	got := ClassifyError("runtime", "NotFound: search.rg: scripts/device/test_container.py not found", traces)
+	if got != "not_found" {
+		t.Fatalf("expected primary 'not_found' category instead of secondary shell cancel, got %q", got)
+	}
+}

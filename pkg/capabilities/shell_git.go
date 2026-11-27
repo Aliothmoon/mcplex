@@ -295,34 +295,71 @@ func extendDeadlineForChecks(env *sandbox.ExecutionEnv, op string, args []any) {
 	if env == nil || len(args) == 0 {
 		return
 	}
-	var maxExplicit time.Duration
-	consider := func(m map[string]any) {
-		if m == nil {
-			return
-		}
-		if d, ok := parseCommandTimeout(m, DefaultShellTimeout); ok && d > maxExplicit {
-			maxExplicit = d
-		}
-	}
+	hasExplicit := false
+	concurrency := 4
+	defaultDur := DefaultShellTimeout
+
 	var rawList []any
+	var opts map[string]any
 	if arr, ok := args[0].([]any); ok {
 		rawList = arr
 		if len(args) > 1 {
-			if m, ok := args[1].(map[string]any); ok {
-				consider(m)
-			}
+			opts, _ = args[1].(map[string]any)
 		}
 	} else if m, ok := args[0].(map[string]any); ok {
-		consider(m)
+		opts = m
 		rawList, _ = m["commands"].([]any)
 	}
-	for _, item := range rawList {
-		if m, ok := item.(map[string]any); ok {
-			consider(m)
+	if opts != nil {
+		concurrency = optInt(opts, "concurrency", 4)
+		if d, ok := parseCommandTimeout(opts, DefaultShellTimeout); ok {
+			defaultDur = d
+			hasExplicit = true
 		}
 	}
-	if maxExplicit > 0 {
-		env.ExtendDefaultDeadline(op, maxExplicit)
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > 8 {
+		concurrency = 8
+	}
+
+	itemDurs := make([]time.Duration, 0, min(len(rawList), maxChecksPerCall))
+	for i, item := range rawList {
+		if i >= maxChecksPerCall {
+			break
+		}
+		if m, ok := item.(map[string]any); ok && m != nil {
+			if d, explicit := parseCommandTimeout(m, defaultDur); explicit {
+				hasExplicit = true
+				itemDurs = append(itemDurs, d)
+				continue
+			}
+		}
+		itemDurs = append(itemDurs, defaultDur)
+	}
+	if !hasExplicit || len(itemDurs) == 0 {
+		return
+	}
+
+	// Sum wave budgets according to concurrency so sequential `{ concurrency: 1 }` batches
+	// (e.g. lint + typecheck + 30s test + diff-check) don't expire right as the long item finishes.
+	var totalBudget time.Duration
+	for start := 0; start < len(itemDurs); start += concurrency {
+		end := min(len(itemDurs), start+concurrency)
+		var waveMax time.Duration
+		for _, d := range itemDurs[start:end] {
+			if d > waveMax {
+				waveMax = d
+			}
+		}
+		totalBudget += waveMax
+	}
+	if totalBudget > MaxShellTimeout {
+		totalBudget = MaxShellTimeout
+	}
+	if totalBudget > 0 {
+		env.ExtendDefaultDeadline(op, totalBudget)
 	}
 }
 
@@ -1439,6 +1476,21 @@ func splitCommandArgs(s string) []string {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
+		case c == '\\' && !inSingle && i+1 < len(s):
+			next := s[i+1]
+			if inDouble {
+				if next == '"' || next == '\\' {
+					cur.WriteByte(next)
+					i++
+					continue
+				}
+			} else if next == ' ' || next == '\t' || next == '"' || next == '\'' {
+				// Unescape POSIX shell `\ `, `\t`, `\"`, `\'` outside quotes while keeping Windows path separators (`src\foo.go`) intact.
+				cur.WriteByte(next)
+				i++
+				continue
+			}
+			cur.WriteByte(c)
 		case c == '\'' && !inDouble:
 			inSingle = !inSingle
 		case c == '"' && !inSingle:
