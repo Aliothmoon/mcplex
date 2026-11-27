@@ -532,6 +532,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.waitNextEvent()
 
+	case batchEventsMsg:
+		m.ingestEvents(msg.Events)
+		if m.hasActiveWork() && !m.tickActive {
+			m.tickActive = true
+			return m, tea.Batch(m.waitNextEvent(), spinnerTickCmd())
+		}
+		return m, m.waitNextEvent()
+
 	case spinnerTickMsg:
 		if m.hasActiveWork() {
 			m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
@@ -1524,11 +1532,49 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) ingestEvents(evs []events.Event) {
+	if len(evs) == 0 {
+		return
+	}
+	hadNodes := len(m.nodeOrder) > 0
+	nonChunk := false
+	for _, ev := range evs {
+		if ev.Kind != events.KindStreamChunk {
+			nonChunk = true
+		}
+		m.ingestEventCore(ev)
+	}
+	m.finalizeIngest(hadNodes, nonChunk)
+}
+
 func (m *Model) ingestEvent(ev events.Event) {
+	hadNodes := len(m.nodeOrder) > 0
+	m.ingestEventCore(ev)
+	m.finalizeIngest(hadNodes, ev.Kind != events.KindStreamChunk)
+}
+
+func (m *Model) finalizeIngest(hadNodes bool, nonChunk bool) {
+	m.syncFeedLayout()
+	if m.feedQuery != "" {
+		m.rebuildFeedMatches()
+	}
+	if nonChunk && len(m.nodeOrder) > 0 {
+		if !hadNodes && m.follow {
+			m.focus = focusFeed
+		}
+		if m.follow || m.selectedID == "" {
+			m.selectedID = m.nodeOrder[len(m.nodeOrder)-1]
+		}
+	}
+	if m.follow {
+		m.scroll = max(0, m.totalVisRows-m.bodyHeight)
+	}
+}
+
+func (m *Model) ingestEventCore(ev events.Event) {
 	if ev.SessionID != "" {
 		m.recordSessionEvent(ev)
 	}
-	hadNodes := len(m.nodeOrder) > 0
 	m.feedDirty = true
 	m.feedRev++
 
@@ -1653,13 +1699,6 @@ func (m *Model) ingestEvent(ev events.Event) {
 			sr.group.bodyCache.valid = false
 		}
 		m.refreshOpenDetailForStream(*target)
-		m.syncFeedLayout()
-		if m.feedQuery != "" {
-			m.rebuildFeedMatches()
-		}
-		if m.follow {
-			m.scroll = max(0, m.totalVisRows-m.bodyHeight)
-		}
 		return
 
 	default:
@@ -1742,22 +1781,6 @@ func (m *Model) ingestEvent(ev events.Event) {
 			}
 			m.trimGroups()
 		}
-	}
-
-	m.syncFeedLayout()
-	if m.feedQuery != "" {
-		m.rebuildFeedMatches()
-	}
-	if len(m.nodeOrder) > 0 {
-		if !hadNodes && m.follow {
-			m.focus = focusFeed
-		}
-		if m.follow || m.selectedID == "" {
-			m.selectedID = m.nodeOrder[len(m.nodeOrder)-1]
-		}
-	}
-	if m.follow {
-		m.scroll = max(0, m.totalVisRows-m.bodyHeight)
 	}
 }
 

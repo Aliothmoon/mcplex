@@ -131,3 +131,90 @@ drainLoop:
 		t.Fatalf("expected All tab ('1') to show all runs, got:\n%s", allView)
 	}
 }
+
+func TestAuditLogSourceBatchesInitialReplayAndHonorsZeroTail(t *testing.T) {
+	tmp := t.TempDir()
+	logger := audit.NewLogger(tmp)
+
+	for i := 0; i < 30; i++ {
+		runID := "ptc_bulk_" + string(rune('a'+(i/10))) + string(rune('0'+(i%10)))
+		ts := time.Now().Add(time.Duration(i-30) * time.Second).Format(time.RFC3339)
+		logger.RecordEvent(events.Event{
+			Kind:      events.KindExecStart,
+			Timestamp: ts,
+			RunID:     runID,
+			Tool:      "exec",
+			Cwd:       "F:/Project/Golang/AgyPTC",
+			Title:     "Bulk historical run",
+			Status:    "running",
+		})
+		logger.RecordEvent(events.Event{
+			Kind:       events.KindExecEnd,
+			Timestamp:  ts,
+			RunID:      runID,
+			Tool:       "exec",
+			Cwd:        "F:/Project/Golang/AgyPTC",
+			Title:      "Bulk historical run",
+			Status:     "ok",
+			DurationMs: 5,
+			HostOps:    1,
+		})
+		logger.Record(audit.Entry{
+			ID:         runID,
+			Timestamp:  ts,
+			Cwd:        "F:/Project/Golang/AgyPTC",
+			Title:      "Bulk historical run",
+			Status:     "ok",
+			DurationMs: 5,
+			HostOps:    1,
+		})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Default (-1 -> 15) must arrive as ONE single batchEventsMsg containing <= 15 runs (no per-event repaint storm).
+	src := NewAuditLogSource(ctx, tmp, -1)
+	defer src.Close()
+
+	firstMsg := <-src.Messages()
+	batch, ok := firstMsg.(batchEventsMsg)
+	if !ok {
+		t.Fatalf("expected initial replay to arrive as single batchEventsMsg, got %T", firstMsg)
+	}
+	m := NewModel(Config{BrandName: "AgyPTC", ModeLabel: "logs"}, src)
+	m.Update(batch)
+	if m.totalRuns != defaultInitialAuditTail {
+		t.Fatalf("expected %d runs from default tail, got %d", defaultInitialAuditTail, m.totalRuns)
+	}
+
+	// Explicit initialTail == 0 must skip historical replay completely and only stream new runs.
+	srcZero := NewAuditLogSource(ctx, tmp, 0)
+	defer srcZero.Close()
+
+	select {
+	case unexpected := <-srcZero.Messages():
+		t.Fatalf("expected zero initial messages for tail=0, got %T", unexpected)
+	case <-time.After(180 * time.Millisecond):
+	}
+
+	logger.RecordEvent(events.Event{
+		Kind:      events.KindExecStart,
+		Timestamp: time.Now().Format(time.RFC3339),
+		RunID:     "ptc_live_after_zero",
+		Tool:      "exec",
+		Cwd:       "F:/Project/Golang/AgyPTC",
+		Title:     "Live run after tail=0",
+		Status:    "running",
+	})
+	select {
+	case liveMsg := <-srcZero.Messages():
+		mZero := NewModel(Config{BrandName: "AgyPTC", ModeLabel: "logs"}, srcZero)
+		mZero.Update(liveMsg)
+		if mZero.totalRuns != 1 {
+			t.Fatalf("expected 1 live run after tail=0, got %d", mZero.totalRuns)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for live event on tail=0 source")
+	}
+}

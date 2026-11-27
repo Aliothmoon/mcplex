@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	defaultInitialAuditTail = 150
+	defaultInitialAuditTail = 15
 	maxInitialEventsBytes   = 4 * 1024 * 1024
 	auditPollInterval       = 120 * time.Millisecond
 	staleActiveRunThreshold = 2 * time.Minute
@@ -59,9 +59,10 @@ func (s *auditLogSource) Close() {
 }
 
 // NewAuditLogSource replays recent PTC runs from `<dataDir>/logs/events.jsonl` and `executions.jsonl`
-// (deduplicated by RunID) and live-tails newly appended events & runs across concurrent processes.
+// (deduplicated by RunID) in a single initial batch and live-tails newly appended events & runs across concurrent processes.
+// Pass `initialTail < 0` for the default (`15`), `initialTail > 0` for an explicit run count, or `0` to skip historical replay.
 func NewAuditLogSource(parentCtx context.Context, explicitDataDir string, initialTail int) EventSource {
-	if initialTail <= 0 {
+	if initialTail < 0 {
 		initialTail = defaultInitialAuditTail
 	}
 	ctx, cancel := context.WithCancel(parentCtx)
@@ -91,22 +92,31 @@ func runAuditTailLoop(ctx context.Context, explicitDataDir string, initialTail i
 	execOffsets := map[string]int64{}
 	seenRichRuns := map[string]bool{}
 
-	emit := func(ev events.Event) bool {
-		normalizeAuditEvent(&ev, &seq)
+	emitBatch := func(evs []events.Event) bool {
+		if len(evs) == 0 {
+			return true
+		}
+		for i := range evs {
+			normalizeAuditEvent(&evs[i], &seq)
+		}
+		var msg tea.Msg
+		if len(evs) == 1 {
+			msg = eventMsg{Event: evs[0]}
+		} else {
+			msg = batchEventsMsg{Events: evs}
+		}
 		select {
-		case out <- eventMsg{Event: ev}:
+		case out <- msg:
 			return true
 		case <-ctx.Done():
 			return false
 		}
 	}
 
-	// 1. Initial snapshot replay (merges rich `events.jsonl` + historical `executions.jsonl` backfill).
+	// 1. Initial snapshot replay delivered as ONE single batch message (zero per-event terminal repaint storm).
 	initial := loadInitialAuditReplay(explicitDataDir, initialTail, evOffsets, execOffsets, seenRichRuns)
-	for _, ev := range initial {
-		if !emit(ev) {
-			return
-		}
+	if !emitBatch(initial) {
+		return
 	}
 
 	// 2. Live O(delta) polling across all discovered log directories.
@@ -119,6 +129,8 @@ func runAuditTailLoop(ctx context.Context, explicitDataDir string, initialTail i
 			return
 		case <-ticker.C:
 			dirs := audit.DiscoverLogDirs(explicitDataDir)
+			var live []events.Event
+
 			// Read `events.jsonl` first so `seenRichRuns` is populated before checking `executions.jsonl`.
 			for _, dir := range dirs {
 				evPath := filepath.Join(dir, "events.jsonl")
@@ -139,9 +151,7 @@ func runAuditTailLoop(ctx context.Context, explicitDataDir string, initialTail i
 					if ev.RunID != "" {
 						rememberBoundedRun(seenRichRuns, ev.RunID)
 					}
-					if !emit(ev) {
-						return
-					}
+					live = append(live, ev)
 				}
 			}
 
@@ -168,12 +178,12 @@ func runAuditTailLoop(ctx context.Context, explicitDataDir string, initialTail i
 					if e.ID != "" {
 						rememberBoundedRun(seenRichRuns, e.ID)
 					}
-					for _, ev := range SynthesizeEventsFromAuditEntry(e) {
-						if !emit(ev) {
-							return
-						}
-					}
+					live = append(live, SynthesizeEventsFromAuditEntry(e)...)
 				}
+			}
+
+			if !emitBatch(live) {
+				return
 			}
 		}
 	}
@@ -205,8 +215,17 @@ func loadInitialAuditReplay(
 			execOffsets[exPath] = fi.Size()
 		}
 	}
+	if initialTail == 0 {
+		for _, dir := range dirs {
+			evPath := filepath.Join(dir, "events.jsonl")
+			if fi, err := os.Stat(evPath); err == nil {
+				evOffsets[evPath] = fi.Size()
+			}
+		}
+		return nil
+	}
 
-	entries, _, _ := audit.LoadEntries(explicitDataDir, false)
+	entries, _, _ := audit.LoadRecentEntries(explicitDataDir, false, max(initialTail*2, 40))
 	entryByID := make(map[string]audit.Entry, len(entries))
 	for _, e := range entries {
 		if e.ID != "" {
@@ -217,7 +236,9 @@ func loadInitialAuditReplay(
 		entries = entries[len(entries)-initialTail:]
 	}
 
-	// Read recent events from `events.jsonl` across discovered dirs, grouping by RunID to preserve intra-run order.
+	// Read recent events from `events.jsonl` across discovered dirs, scaling tail window with `initialTail`.
+	eventsTailBytes := min(int64(maxInitialEventsBytes), max(int64(256*1024), int64(initialTail)*32*1024))
+
 	type richGroup struct {
 		runID    string
 		firstTs  string
@@ -233,7 +254,7 @@ func loadInitialAuditReplay(
 
 	for _, dir := range dirs {
 		evPath := filepath.Join(dir, "events.jsonl")
-		evs, endOff := readInitialEventsTail(evPath, maxInitialEventsBytes)
+		evs, endOff := readInitialEventsTail(evPath, eventsTailBytes)
 		if endOff >= 0 {
 			evOffsets[evPath] = endOff
 		}

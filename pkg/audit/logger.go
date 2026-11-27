@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -416,6 +417,86 @@ func LoadEntries(explicitDataDir string, errorsOnly bool) ([]Entry, []string, er
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].Timestamp < all[j].Timestamp })
 	return all, usedFiles, nil
+}
+
+// LoadRecentEntries loads up to `maxTail` recent entries across discovered log directories by seeking near EOF
+// instead of parsing multi-megabyte JSONL files from byte 0. When `maxTail <= 0`, all entries are loaded.
+func LoadRecentEntries(explicitDataDir string, errorsOnly bool, maxTail int) ([]Entry, []string, error) {
+	if maxTail <= 0 {
+		return LoadEntries(explicitDataDir, errorsOnly)
+	}
+	dirs := DiscoverLogDirs(explicitDataDir)
+	if len(dirs) == 0 {
+		return nil, nil, nil
+	}
+	fileName := "executions.jsonl"
+	if errorsOnly {
+		fileName = "errors.jsonl"
+	}
+	var all []Entry
+	var usedFiles []string
+	for _, d := range dirs {
+		p := filepath.Join(d, fileName)
+		entries, err := readJSONLTailEntries(p, maxTail)
+		if err == nil && len(entries) > 0 {
+			all = append(all, entries...)
+			usedFiles = append(usedFiles, p)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].Timestamp < all[j].Timestamp })
+	if len(all) > maxTail {
+		all = all[len(all)-maxTail:]
+	}
+	return all, usedFiles, nil
+}
+
+func readJSONLTailEntries(path string, maxEntries int) ([]Entry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := fi.Size()
+	if size == 0 {
+		return nil, nil
+	}
+	window := max(int64(256*1024), int64(maxEntries)*24*1024)
+	for {
+		var startOff int64
+		if size > window {
+			startOff = size - window
+		}
+		if _, err := f.Seek(startOff, io.SeekStart); err != nil {
+			return nil, err
+		}
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		if startOff > 0 && !scanner.Scan() {
+			return nil, scanner.Err()
+		}
+		var out []Entry
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			var e Entry
+			if json.Unmarshal([]byte(line), &e) == nil {
+				out = append(out, e)
+			}
+		}
+		if len(out) >= maxEntries || startOff == 0 {
+			if len(out) > maxEntries {
+				out = out[len(out)-maxEntries:]
+			}
+			return out, nil
+		}
+		window *= 2
+	}
 }
 
 func readJSONLFile(path string) ([]Entry, error) {

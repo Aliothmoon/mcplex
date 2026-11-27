@@ -41,6 +41,10 @@ type eventMsg struct {
 	Event events.Event
 }
 
+type batchEventsMsg struct {
+	Events []events.Event
+}
+
 type connStatusMsg struct {
 	Connected bool
 	Note      string
@@ -71,9 +75,11 @@ func NewLocalHubSource(hub *events.Hub, sessionFilter string) EventSource {
 	go func() {
 		defer close(done)
 		defer close(out)
-		for _, ev := range history {
+		if len(history) > 0 {
+			batch := make([]events.Event, len(history))
+			copy(batch, history)
 			select {
-			case out <- eventMsg{Event: ev}:
+			case out <- batchEventsMsg{Events: batch}:
 			case <-stopCh:
 				return
 			}
