@@ -309,3 +309,176 @@ func TestOpBudgetStatReadHintsAndBinaryReadHint(t *testing.T) {
 		t.Fatalf("expected binary file error to mention 'is binary' and 'fs.cat', got %v", binErr)
 	}
 }
+
+func TestFsReadMaxBytesHeadPreviewAndLargeCap(t *testing.T) {
+	dir := t.TempDir()
+	// 40KB UTF-8 HTML file with multi-byte Chinese characters crossing byte 1500 boundary
+	body := "<!doctype html>\n" + strings.Repeat("<div>月虹一键隐藏模块配置项说明</div>\n", 1000)
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	binder := newTestAllBinder(t, dir, nil)
+	res, err := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd:  dir,
+		Code: `return await fs.read("index.html", { maxBytes: 1500 });`,
+	}, binder)
+	if err != nil {
+		t.Fatalf("expected fs.read with sub-2MB maxBytes to return head preview instead of failing, got: %v", err)
+	}
+	head, _ := res.Value.(string)
+	if len(head) == 0 || len(head) > 1500 || !strings.HasPrefix(head, "<!doctype html>\n") {
+		t.Fatalf("unexpected head preview len=%d: %q", len(head), head[:min(80, len(head))])
+	}
+	hasTruncWarn := false
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "truncated to first 1500") {
+			hasTruncWarn = true
+		}
+	}
+	if !hasTruncWarn {
+		t.Fatalf("expected truncation warning for maxBytes head slice, got warnings: %v", res.Warnings)
+	}
+}
+
+func TestGitLogIgnoreCaseAndUnquotedFormatQuery(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+		}
+	}
+	runGit("init")
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "feat: close #42 lowercase")
+
+	binder := newTestAllBinder(t, dir, nil)
+	res, err := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd: dir,
+		Code: `
+const [logHit, queryHit] = await Promise.all([
+  git.log({ n: 5, grep: "CLOSE #42", ignoreCase: true, format: "%h %s" }),
+  git.query("log -1 --format=%H %ci %s"),
+]);
+return { logHit, queryHit };
+`,
+	}, binder)
+	if err != nil {
+		t.Fatalf("expected git.log({ ignoreCase: true }) and unquoted git.query --format=%%H %%ci %%s to succeed, got: %v", err)
+	}
+	m := res.Value.(map[string]any)
+	if !strings.Contains(m["logHit"].(string), "close #42 lowercase") {
+		t.Fatalf("expected case-insensitive git.log grep match, got: %q", m["logHit"])
+	}
+	if !strings.Contains(m["queryHit"].(string), "feat: close #42 lowercase") {
+		t.Fatalf("expected unquoted --format=%%H %%ci %%s to return commit subject, got: %q", m["queryHit"])
+	}
+}
+
+func TestAstReadCombinesMethodOverloadsWhileEditStaysStrict(t *testing.T) {
+	dir := t.TempDir()
+	javaSrc := `package io.vm02.probe;
+
+public class GuestImage {
+    public void prepare(String dir) {
+        prepare(dir, false, 0);
+    }
+
+    public void prepare(String dir, boolean force) {
+        prepare(dir, force, 0);
+    }
+
+    public void prepare(String dir, boolean force, int flags) {
+        System.out.println(dir + ":" + force + ":" + flags);
+    }
+}
+
+class OtherHelper {
+    public void prepare() {}
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "GuestImage.java"), []byte(javaSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pol := policy.NewEngine(dir)
+	astBinder := &ASTBinder{Policy: pol}
+	editBinder := &EditTxBinder{Policy: pol}
+	combined := binderList{astBinder, editBinder}
+
+	// 1. Qualified `GuestImage::prepare` in ast.read combines all 3 overloads cleanly!
+	res, err := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd:  dir,
+		Code: `return await ast.read("GuestImage.java", "GuestImage::prepare");`,
+	}, combined)
+	if err != nil {
+		t.Fatalf("expected ast.read on overloaded Java method to combine overloads, got: %v", err)
+	}
+	m := res.Value.(map[string]any)
+	txt, _ := m["text"].(string)
+	if !strings.Contains(txt, "prepare(String dir)") || !strings.Contains(txt, "prepare(String dir, boolean force, int flags)") {
+		t.Fatalf("expected all 3 overloads in ast.read text, got:\n%s", txt)
+	}
+	if ov, ok := m["overloads"]; !ok || fmt.Sprint(ov) != "3" {
+		t.Fatalf("expected overloads=3 metadata, got %+v", m)
+	}
+
+	// 2. Unqualified `prepare` matching BOTH GuestImage.prepare AND OtherHelper.prepare MUST still throw Ambiguous!
+	_, ambErr := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd:  dir,
+		Code: `return await ast.read("GuestImage.java", "prepare");`,
+	}, combined)
+	if ambErr == nil || !strings.Contains(ambErr.Error(), "Ambiguous") {
+		t.Fatalf("expected unqualified 'prepare' across 2 classes to stay Ambiguous, got: %v", ambErr)
+	}
+
+	// 3. edit.replaceSymbol on overloaded `GuestImage::prepare` MUST stay strict (Ambiguous) to prevent accidental multi-overload deletion!
+	_, editAmbErr := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd:  dir,
+		Code: `await edit.replaceSymbol("GuestImage.java", "GuestImage::prepare", "public void prepare() {}");`,
+	}, combined)
+	if editAmbErr == nil || !strings.Contains(editAmbErr.Error(), "Ambiguous") {
+		t.Fatalf("expected edit.replaceSymbol on overloaded method to stay Ambiguous, got: %v", editAmbErr)
+	}
+}
+
+func TestSearchRgExpandsBraceSubpaths(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"remote", "manager", "utils"} {
+		subDir := filepath.Join(dir, "src", sub)
+		if err := os.MkdirAll(subDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(subDir, sub+".kt"), []byte("val CoreDataDir = \""+sub+"\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	binder := newTestAllBinder(t, dir, nil)
+	res, err := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd: dir,
+		Code: `
+const hits = await search.rg("CoreDataDir", { path: "src/{remote,missing_dir,manager,utils}" });
+const files = await search.rg("CoreDataDir", { path: "src/{remote,manager}", filesOnly: true });
+return { count: hits.length, files };
+`,
+	}, binder)
+	if err != nil {
+		t.Fatalf("expected search.rg with {a,b,c} brace path to succeed, got: %v", err)
+	}
+	m := res.Value.(map[string]any)
+	if fmt.Sprint(m["count"]) != "3" {
+		t.Fatalf("expected 3 hits across expanded brace subdirs, got %+v", m)
+	}
+}

@@ -233,7 +233,7 @@ func (b *ShellGitBinder) Bind(env *sandbox.ExecutionEnv) error {
 					}
 				}
 			}
-			tokens := splitCommandArgs(rawCmd)
+			tokens := coalesceGitFormatTokens(splitCommandArgs(rawCmd))
 			if len(tokens) > 0 && tokens[0] == "git" {
 				tokens = tokens[1:]
 			}
@@ -1351,7 +1351,10 @@ var (
 	gitBoolFlags = map[string]string{
 		"oneline": "--oneline", "stat": "--stat", "shortstat": "--shortstat", "numstat": "--numstat",
 		"nameOnly": "--name-only", "nameStatus": "--name-status", "staged": "--cached", "cached": "--cached",
-		"all": "--all", "noMerges": "--no-merges", "patch": "-p", "graph": "--graph", "reverse": "--reverse",
+		"all": "--all", "noMerges": "--no-merges", "merges": "--merges", "firstParent": "--first-parent",
+		"patch": "-p", "graph": "--graph", "reverse": "--reverse",
+		"ignoreCase": "-i", "regexpIgnoreCase": "--regexp-ignore-case",
+		"extendedRegexp": "-E", "fixedStrings": "-F",
 	}
 	gitValueFlags = map[string]string{
 		"grep": "--grep=", "since": "--since=", "until": "--until=", "author": "--author=", "format": "--format=",
@@ -1376,7 +1379,7 @@ func optionalGitTailArgs(args []any) ([]string, error) {
 		return nil, nil
 	}
 	if s, ok := args[0].(string); ok && strings.TrimSpace(s) != "" {
-		return splitCommandArgs(s), nil
+		return coalesceGitFormatTokens(splitCommandArgs(s)), nil
 	}
 	if arr, ok := args[0].([]any); ok {
 		return extractStringSlice(arr), nil
@@ -1446,7 +1449,7 @@ func optionalGitTailArgs(args []any) ([]string, error) {
 				extra = append(extra, stringList(v)...)
 			}
 		default:
-			return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "unknown git option %q (use n, oneline, stat, nameOnly, nameStatus, staged, grep, since, until, author, format, unified, ref, path, args)", k)
+			return nil, sandbox.NewHostError(sandbox.KindBadArgs, nil, "unknown git option %q (use n, oneline, stat, nameOnly, nameStatus, staged, grep, ignoreCase, extendedRegexp, fixedStrings, since, until, author, format, unified, ref, path, args)", k)
 		}
 	}
 	out := append(append(flags, refs...), extra...)
@@ -1508,6 +1511,41 @@ func splitCommandArgs(s string) []string {
 		args = append(args, cur.String())
 	}
 	return args
+}
+
+// coalesceGitFormatTokens rejoins unquoted `%...` format placeholders that immediately follow
+// `--format=...` / `--pretty=...` (e.g. `git.query("log -1 --format=%H %ci %s")` -> `"--format=%H %ci %s"`),
+// preventing git from rejecting `%ci` / `%s` as ambiguous revision arguments.
+func coalesceGitFormatTokens(tokens []string) []string {
+	if len(tokens) < 2 {
+		return tokens
+	}
+	out := make([]string, 0, len(tokens))
+	for i := 0; i < len(tokens); i++ {
+		tok := tokens[i]
+		if (strings.HasPrefix(tok, "--format=") || strings.HasPrefix(tok, "--pretty=")) && strings.Contains(tok, "%") {
+			merged := tok
+			for i+1 < len(tokens) && strings.HasPrefix(tokens[i+1], "%") {
+				i++
+				merged += " " + tokens[i]
+			}
+			out = append(out, merged)
+			continue
+		}
+		if (tok == "--format" || tok == "--pretty") && i+1 < len(tokens) && strings.Contains(tokens[i+1], "%") {
+			out = append(out, tok)
+			i++
+			merged := tokens[i]
+			for i+1 < len(tokens) && strings.HasPrefix(tokens[i+1], "%") {
+				i++
+				merged += " " + tokens[i]
+			}
+			out = append(out, merged)
+			continue
+		}
+		out = append(out, tok)
+	}
+	return out
 }
 
 func withLogDefaults(args []string) []string {

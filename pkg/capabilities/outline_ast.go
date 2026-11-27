@@ -132,36 +132,65 @@ func (b *ASTBinder) Bind(env *sandbox.ExecutionEnv) error {
 			}
 			syms, lines := outlineFromSource(absPath, raw)
 			rel := relDisplayPath(env.Cwd, absPath)
-			s, err := resolveSymbol(syms, query, rel)
+			matched, err := resolveSymbolsForRead(syms, query, rel)
 			if err != nil {
 				return nil, err
 			}
+			s := matched[0]
+			qName := qualifiedName(syms, s, symbolSep(rel))
 			if len(lines) == 0 {
-				return map[string]any{
+				res := map[string]any{
 					"kind":      s.Kind,
-					"name":      qualifiedName(syms, s, symbolSep(rel)),
+					"name":      qName,
 					"startLine": 1,
 					"endLine":   1,
 					"text":      "",
-				}, nil
-			}
-			start := maxInt(1, minInt(s.StartLine, len(lines)))
-			end := maxInt(start, minInt(s.EndLine, len(lines)))
-			body := lines[start-1 : end]
-			if optBool(opts, "lineNumbers", false) {
-				numbered := make([]string, len(body))
-				for i, l := range body {
-					numbered[i] = fmt.Sprintf("%d: %s", start+i, l)
 				}
-				body = numbered
+				if len(matched) > 1 {
+					res["overloads"] = len(matched)
+				}
+				return res, nil
 			}
-			return map[string]any{
+			withNums := optBool(opts, "lineNumbers", false)
+			// Merge contiguous/nearby overload spans (gap <= 5 lines) while keeping distant overloads separate.
+			type lineSpan struct{ start, end int }
+			var spans []lineSpan
+			for _, m := range matched {
+				st := maxInt(1, minInt(m.StartLine, len(lines)))
+				en := maxInt(st, minInt(m.EndLine, len(lines)))
+				if len(spans) > 0 && st <= spans[len(spans)-1].end+6 {
+					if en > spans[len(spans)-1].end {
+						spans[len(spans)-1].end = en
+					}
+					continue
+				}
+				spans = append(spans, lineSpan{start: st, end: en})
+			}
+			var blocks []string
+			for _, sp := range spans {
+				chunk := lines[sp.start-1 : sp.end]
+				if withNums {
+					numbered := make([]string, len(chunk))
+					for i, l := range chunk {
+						numbered[i] = fmt.Sprintf("%d: %s", sp.start+i, l)
+					}
+					chunk = numbered
+				}
+				blocks = append(blocks, strings.Join(chunk, "\n"))
+			}
+			overallStart := spans[0].start
+			overallEnd := spans[len(spans)-1].end
+			res := map[string]any{
 				"kind":      s.Kind,
-				"name":      qualifiedName(syms, s, symbolSep(rel)),
-				"startLine": start,
-				"endLine":   end,
-				"text":      strings.Join(body, "\n"),
-			}, nil
+				"name":      qName,
+				"startLine": overallStart,
+				"endLine":   overallEnd,
+				"text":      strings.Join(blocks, "\n\n"),
+			}
+			if len(matched) > 1 {
+				res["overloads"] = len(matched)
+			}
+			return res, nil
 		},
 		"enclosingSymbol": func(_ context.Context, args []any) (any, error) {
 			targetPath, err := requireStringArg(args, 0, "path")

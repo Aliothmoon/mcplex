@@ -188,6 +188,7 @@ func TestClassifyErrorSkipsSecondaryShellCancelTrace(t *testing.T) {
 		{Seq: 1, Wave: 1, Capability: "search.rg", Target: "scripts/device/test_container.py", DurationMs: 3, Status: "error", Kind: "NotFound", Error: "scripts/device/test_container.py not found"},
 		{Seq: 2, Wave: 1, Capability: "search.rg", Target: "return 20", DurationMs: 20, Status: "error", Kind: "Error", Error: "context canceled"},
 		{Seq: 3, Wave: 1, Capability: "sh.exec", Target: "adb shell logcat -d -t 150", DurationMs: 722, Status: "error", Kind: "Error", Error: "CANCELED after 722ms (outer execution already ended)"},
+		{Seq: 4, Wave: 1, Capability: "sh.run", Target: "adb.exe", DurationMs: 603, Status: "error", Kind: "Error", Error: "adb.exe -s edcf25eb shell \"ls\" canceled after 601ms (outer program ended)"},
 	}
 	got := ClassifyError("runtime", "NotFound: search.rg: scripts/device/test_container.py not found", traces)
 	if got != "not_found" {

@@ -83,11 +83,16 @@ func (b *FSSearchBinder) resolveRg() string {
 	return b.rgBin
 }
 
-// readText implements fs.read for one path (shared by fs.read and fs.cat).
+// readText implements fs.read for one path (shared by fs.cat and internal callers).
 func (b *FSSearchBinder) readText(cwd, targetPath string, opts map[string]any) (string, error) {
+	text, _, err := b.readTextCore(cwd, targetPath, opts)
+	return text, err
+}
+
+func (b *FSSearchBinder) readTextCore(cwd, targetPath string, opts map[string]any) (string, string, error) {
 	absPath, err := b.Policy.ResolveAndCheckRead(cwd, targetPath)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	info, err := os.Stat(absPath)
 	if err != nil && errors.Is(err, os.ErrNotExist) {
@@ -102,10 +107,10 @@ func (b *FSSearchBinder) readText(cwd, targetPath string, opts map[string]any) (
 		}
 	}
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if info.IsDir() {
-		return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is a directory; use fs.list/fs.tree", targetPath)
+		return "", "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is a directory; use fs.list/fs.tree", targetPath)
 	}
 	startLine := optInt(opts, "startLine", optInt(opts, "offset", 0))
 	endLine := optInt(opts, "endLine", 0)
@@ -113,35 +118,49 @@ func (b *FSSearchBinder) readText(cwd, targetPath string, opts map[string]any) (
 	hasRange := startLine > 0 || endLine > 0 || limit > 0
 	withNumbers := optBool(opts, "lineNumbers", false)
 	tail := optInt(opts, "tail", 0)
+	explicitMB := optInt(opts, "maxBytes", 0)
 	readCap := MaxSandboxReadBytes
-	if mb := optInt(opts, "maxBytes", 0); mb > 0 {
-		readCap = minInt(mb, MaxExplicitSandboxReadBytes)
+	if explicitMB > 0 {
+		readCap = minInt(explicitMB, MaxExplicitSandboxReadBytes)
 	}
 	if isGzipFile(absPath) {
-		return readGzippedText(absPath, targetPath, startLine, endLine, limit, tail, withNumbers, readCap)
+		txt, gErr := readGzippedText(absPath, targetPath, startLine, endLine, limit, tail, withNumbers, readCap)
+		return txt, "", gErr
 	}
 	if tail > 0 {
-		return readTailLines(absPath, targetPath, tail, withNumbers)
+		txt, tErr := readTailLines(absPath, targetPath, tail, withNumbers)
+		return txt, "", tErr
 	}
 	if info.Size() > int64(readCap) {
 		if !hasRange {
-			if readCap <= MaxSandboxReadBytes {
-				return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is %d bytes (>2MB); pass { maxBytes } (up to 16MB), { startLine, endLine }, { tail: N }, or use search.rg", targetPath, info.Size())
+			// When caller explicitly requests a sub-2MB byte budget (e.g. `{ maxBytes: 16000 }` on a 43KB or 800KB file),
+			// stream-slice the requested head preview cleanly on a UTF-8/UTF-16 rune boundary instead of rejecting.
+			if explicitMB > 0 && explicitMB < MaxSandboxReadBytes {
+				txt, hErr := readBoundedHeadBytes(absPath, targetPath, readCap, withNumbers)
+				if hErr != nil {
+					return "", "", hErr
+				}
+				warn := fmt.Sprintf("fs.read: %s truncated to first %d of %d bytes (maxBytes)", targetPath, readCap, info.Size())
+				return txt, warn, nil
+			}
+			if explicitMB <= 0 {
+				return "", "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is %d bytes (>2MB); pass { maxBytes } (up to 16MB), { startLine, endLine }, { tail: N }, or use search.rg", targetPath, info.Size())
 			}
 			if readCap < MaxExplicitSandboxReadBytes && info.Size() <= int64(MaxExplicitSandboxReadBytes) {
-				return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is %d bytes (>%dB maxBytes cap); raise { maxBytes } (up to 16MB), pass { startLine, endLine }, { tail: N }, or use search.rg", targetPath, info.Size(), readCap)
+				return "", "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is %d bytes (>%dB maxBytes cap); raise { maxBytes } (up to 16MB), pass { startLine, endLine }, { tail: N }, or use search.rg", targetPath, info.Size(), readCap)
 			}
-			return "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is %d bytes (>%dB maxBytes cap); pass { startLine, endLine }, { tail: N }, or use search.rg", targetPath, info.Size(), readCap)
+			return "", "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s is %d bytes (>%dB maxBytes cap); pass { startLine, endLine }, { tail: N }, or use search.rg", targetPath, info.Size(), readCap)
 		}
-		return readBoundedLineRange(absPath, targetPath, startLine, endLine, limit, withNumbers)
+		txt, rErr := readBoundedLineRange(absPath, targetPath, startLine, endLine, limit, withNumbers)
+		return txt, "", rErr
 	}
 	raw, err := os.ReadFile(absPath)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	decoded, ok := decodeTextBytes(raw)
 	if !ok {
-		return "", binaryFileHostError(targetPath)
+		return "", "", binaryFileHostError(targetPath)
 	}
 	text := strings.ReplaceAll(decoded, "\r\n", "\n")
 	if withNumbers && !hasRange {
@@ -149,7 +168,7 @@ func (b *FSSearchBinder) readText(cwd, targetPath string, opts map[string]any) (
 		for i, l := range lines {
 			lines[i] = fmt.Sprintf("%d: %s", i+1, l)
 		}
-		return strings.Join(lines, "\n"), nil
+		return strings.Join(lines, "\n"), "", nil
 	}
 	if hasRange {
 		lines := strings.Split(text, "\n")
@@ -161,10 +180,10 @@ func (b *FSSearchBinder) readText(cwd, targetPath string, opts map[string]any) (
 			e = s + limit - 1
 		}
 		if s > len(lines) {
-			return "", nil
+			return "", "", nil
 		}
 		if e < s {
-			return "", fmt.Errorf("invalid range: startLine (%d) > endLine (%d)", s, e)
+			return "", "", fmt.Errorf("invalid range: startLine (%d) > endLine (%d)", s, e)
 		}
 		selected := lines[s-1 : e]
 		if withNumbers {
@@ -172,11 +191,11 @@ func (b *FSSearchBinder) readText(cwd, targetPath string, opts map[string]any) (
 			for i, l := range selected {
 				numbered[i] = fmt.Sprintf("%d: %s", s+i, l)
 			}
-			return strings.Join(numbered, "\n"), nil
+			return strings.Join(numbered, "\n"), "", nil
 		}
-		return strings.Join(selected, "\n"), nil
+		return strings.Join(selected, "\n"), "", nil
 	}
-	return text, nil
+	return text, "", nil
 }
 
 const maxGzipScanBytes = 64 * 1024 * 1024 // 64 MB streaming gunzip cap for range/tail reads
@@ -325,7 +344,10 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
-			text, err := b.readText(env.Cwd, targetPath, opts)
+			text, warn, err := b.readTextCore(env.Cwd, targetPath, opts)
+			if err == nil && warn != "" {
+				env.AddWarning(warn)
+			}
 			if err == nil && b.Events.Active() {
 				absRead := targetPath
 				if !filepath.IsAbs(absRead) {
@@ -568,27 +590,51 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 			if err != nil {
 				return nil, err
 			}
-			searchRoot, err := b.Policy.ResolveAndCheckRead(env.Cwd, q.path)
+			roots, err := b.resolveSearchRoots(env.Cwd, q.path)
 			if err != nil {
 				return nil, err
 			}
-			if _, stErr := os.Stat(searchRoot); stErr != nil {
-				return nil, stErr
-			}
 			if q.mode != "" {
-				return b.runListSearch(ctx, env, searchRoot, q)
+				if len(roots) == 1 {
+					return b.runListSearch(ctx, env, roots[0], q)
+				}
+				return b.runListSearchMulti(ctx, env, roots, q)
 			}
-			hits, total, err := b.runTextOrRegexSearch(ctx, env.Cwd, searchRoot, q)
-			if err == nil && len(hits) >= q.maxResults && (total < 0 || total > len(hits)) {
+			var hits []SearchHit
+			total := 0
+			hasUnknownCap := false
+			for _, searchRoot := range roots {
+				rem := q.maxResults - len(hits)
+				if rem <= 0 {
+					hasUnknownCap = true
+					break
+				}
+				subQ := q
+				subQ.maxResults = rem
+				subHits, subTotal, sErr := b.runTextOrRegexSearch(ctx, env.Cwd, searchRoot, subQ)
+				if sErr != nil {
+					return nil, sErr
+				}
+				hits = append(hits, subHits...)
+				if subTotal < 0 {
+					hasUnknownCap = true
+				} else {
+					total += subTotal
+				}
+			}
+			if hasUnknownCap {
+				total = -1
+			}
+			if len(hits) >= q.maxResults && (total < 0 || total > len(hits)) {
 				env.AddWarning(fmt.Sprintf("search.rg: capped at %d%s hits; narrow path/glob, pass { maxResults }, or use { count: true } for totals", q.maxResults, ofTotal(total)))
 			}
 			if cut := countCutLines(hits); cut > 0 {
 				env.AddWarning(fmt.Sprintf("search.rg: %d long line(s) cut at %dB; fs.read the line range for full text", cut, MaxSearchLineBytes))
 			}
-			if err == nil && b.Events.Active() {
-				emitSearchHits(b.Events, b.SessionID, b.RunID, "search.rg", searchRoot, q.pattern, hits, total)
+			if b.Events.Active() {
+				emitSearchHits(b.Events, b.SessionID, b.RunID, "search.rg", roots[0], q.pattern, hits, total)
 			}
-			return hits, err
+			return hits, nil
 		},
 		"glob": func(ctx context.Context, args []any) (any, error) {
 			pat, opts, err := parsePatternAndOpts(args)
@@ -2009,4 +2055,234 @@ func binaryFileHostError(display string) error {
 		"%s is binary; use fs.bytes(path) for raw bytes or fs.cat(paths) to skip binary files as null",
 		display,
 	)
+}
+
+func readBoundedHeadBytes(absPath, targetPath string, maxBytes int, withNumbers bool) (string, error) {
+	f, err := os.Open(absPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)))
+	if err != nil {
+		return "", err
+	}
+	raw = trimPartialTrailingRuneBytes(raw)
+	decoded, ok := decodeTextBytes(raw)
+	if !ok {
+		return "", binaryFileHostError(targetPath)
+	}
+	text := strings.ReplaceAll(decoded, "\r\n", "\n")
+	if withNumbers {
+		lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
+		for i, l := range lines {
+			lines[i] = fmt.Sprintf("%d: %s", i+1, l)
+		}
+		return strings.Join(lines, "\n"), nil
+	}
+	return text, nil
+}
+
+// trimPartialTrailingRuneBytes strips an incomplete trailing UTF-8 rune (or odd byte / split surrogate on UTF-16 BOM)
+// when a file is sliced at an arbitrary byte count via `{ maxBytes: N }`.
+func trimPartialTrailingRuneBytes(raw []byte) []byte {
+	if len(raw) == 0 {
+		return raw
+	}
+	if isUTF16, bigEndian := detectUTF16BOM(raw); isUTF16 {
+		if len(raw)%2 != 0 {
+			raw = raw[:len(raw)-1]
+		}
+		if len(raw) >= 4 {
+			var last uint16
+			if bigEndian {
+				last = uint16(raw[len(raw)-2])<<8 | uint16(raw[len(raw)-1])
+			} else {
+				last = uint16(raw[len(raw)-1])<<8 | uint16(raw[len(raw)-2])
+			}
+			if last >= 0xD800 && last <= 0xDBFF {
+				raw = raw[:len(raw)-2]
+			}
+		}
+		return raw
+	}
+	for back := 1; back <= 3 && back <= len(raw); back++ {
+		idx := len(raw) - back
+		b := raw[idx]
+		if b < 0x80 {
+			return raw
+		}
+		if utf8.RuneStart(b) {
+			r, width := utf8.DecodeRune(raw[idx:])
+			if r == utf8.RuneError && width == 1 {
+				return raw[:idx]
+			}
+			return raw
+		}
+	}
+	return raw
+}
+
+// expandSearchSubpaths expands single- or multi-group `{a,b,c}` brace expressions in a search.rg `path`
+// (up to 32 targets) when the literal path does not exist on disk.
+func expandSearchSubpaths(rawPath string) []string {
+	if !strings.Contains(rawPath, "{") || !strings.Contains(rawPath, "}") {
+		return []string{rawPath}
+	}
+	results := []string{rawPath}
+	for {
+		changed := false
+		var next []string
+		for _, item := range results {
+			openIdx := strings.IndexByte(item, '{')
+			if openIdx < 0 {
+				next = append(next, item)
+				continue
+			}
+			closeRel := strings.IndexByte(item[openIdx:], '}')
+			if closeRel < 0 {
+				next = append(next, item)
+				continue
+			}
+			closeIdx := openIdx + closeRel
+			inner := item[openIdx+1 : closeIdx]
+			if !strings.Contains(inner, ",") || strings.Contains(inner, "{") {
+				next = append(next, item)
+				continue
+			}
+			parts := strings.Split(inner, ",")
+			prefix := item[:openIdx]
+			suffix := item[closeIdx+1:]
+			for _, p := range parts {
+				p = strings.TrimSpace(p)
+				if p == "" {
+					continue
+				}
+				next = append(next, prefix+p+suffix)
+				if len(next) > 32 {
+					return []string{rawPath}
+				}
+			}
+			changed = true
+		}
+		results = next
+		if !changed {
+			break
+		}
+	}
+	if len(results) == 0 {
+		return []string{rawPath}
+	}
+	return results
+}
+
+func (b *FSSearchBinder) resolveSearchRoots(cwd, rawPath string) ([]string, error) {
+	candidates := expandSearchSubpaths(rawPath)
+	if len(candidates) == 1 {
+		root, err := b.Policy.ResolveAndCheckRead(cwd, rawPath)
+		if err != nil {
+			return nil, err
+		}
+		if _, stErr := os.Stat(root); stErr != nil {
+			return nil, stErr
+		}
+		return []string{root}, nil
+	}
+	// If literal path with braces happens to exist on disk, prefer it directly.
+	if litRoot, litErr := b.Policy.ResolveAndCheckRead(cwd, rawPath); litErr == nil {
+		if _, stErr := os.Stat(litRoot); stErr == nil {
+			return []string{litRoot}, nil
+		}
+	}
+	var valid []string
+	seen := map[string]bool{}
+	for _, c := range candidates {
+		abs, err := b.Policy.ResolveAndCheckRead(cwd, c)
+		if err != nil {
+			return nil, err
+		}
+		clean := filepath.Clean(abs)
+		if seen[clean] {
+			continue
+		}
+		if _, stErr := os.Stat(clean); stErr == nil {
+			seen[clean] = true
+			valid = append(valid, clean)
+		}
+	}
+	if len(valid) == 0 {
+		return nil, sandbox.NewHostError(sandbox.KindNotFound, nil, "%s not found", rawPath)
+	}
+	return valid, nil
+}
+
+func (b *FSSearchBinder) runListSearchMulti(ctx context.Context, env *sandbox.ExecutionEnv, roots []string, q searchQuery) (any, error) {
+	mergedIdx := map[string]int{}
+	var counts []fileCount
+	for _, root := range roots {
+		subQ := q
+		subQ.maxResults = 200000
+		var subCounts []fileCount
+		var err error
+		if rgBin := b.resolveRg(); rgBin != "" {
+			var overflow bool
+			subCounts, overflow, err = runRgCounts(ctx, b.Policy, rgBin, env.Cwd, root, subQ)
+			if overflow {
+				env.AddWarning("search.rg: count output exceeded 8MB, some files are missing; narrow path/glob")
+			}
+			var he *sandbox.HostError
+			if err != nil && errors.As(err, &he) {
+				return nil, err
+			}
+		}
+		if subCounts == nil && (err == nil || ctx.Err() == nil) {
+			fq := subQ
+			fq.contextLines = 0
+			hits, _, ferr := runGoFallbackSearch(ctx, b.Policy, env.Cwd, root, fq)
+			if ferr != nil {
+				return nil, ferr
+			}
+			for _, h := range hits {
+				subCounts = append(subCounts, fileCount{h.File, 1})
+			}
+		} else if err != nil {
+			return nil, err
+		}
+		for _, c := range subCounts {
+			if i, ok := mergedIdx[c.file]; ok {
+				counts[i].count += c.count
+			} else {
+				mergedIdx[c.file] = len(counts)
+				counts = append(counts, c)
+			}
+		}
+	}
+	if q.mode == "files" {
+		sort.Slice(counts, func(i, j int) bool { return counts[i].file < counts[j].file })
+	} else {
+		sort.SliceStable(counts, func(i, j int) bool {
+			if counts[i].count != counts[j].count {
+				return counts[i].count > counts[j].count
+			}
+			return counts[i].file < counts[j].file
+		})
+	}
+	if len(counts) > q.maxResults {
+		env.AddWarning(fmt.Sprintf("search.rg: capped at %d of %d files; narrow path/glob or pass { maxResults }", q.maxResults, len(counts)))
+		counts = counts[:q.maxResults]
+	}
+	if q.mode == "files" {
+		files := make([]any, len(counts))
+		for i, c := range counts {
+			files[i] = c.file
+		}
+		return files, nil
+	}
+	out := &sandbox.OrderedMap{}
+	for _, c := range counts {
+		out.Keys = append(out.Keys, c.file)
+		out.Vals = append(out.Vals, c.count)
+	}
+	return out, nil
 }

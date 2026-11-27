@@ -138,3 +138,45 @@ func TestPolicyCommandPrivEscQuoteAwareness(t *testing.T) {
 		}
 	}
 }
+
+func TestPowerRebootGuardAllowsGrepPatternsAndBlocksRealReboots(t *testing.T) {
+	eng := NewEngine(t.TempDir())
+
+	mustAllow := []string{
+		`adb -s 1ab1a4d2 shell "logcat -d -t 200 | grep -iE 'VM02|WorkerService|Reboot|init:'"`,
+		`adb -s 1ab1a4d2 shell "ps -A | grep -i vm02; echo ---; logcat -d -t 400 | grep -iE 'vm02|container|restore|shutdown|stop|kill' | tail -n 120"`,
+		`rg -n "reboot|shutdown|poweroff|halt" pkg/`,
+		`git log -n 10 --grep="fix clean shutdown and reboot handling"`,
+		`echo "checking reboot counter"`,
+	}
+	for _, cmd := range mustAllow {
+		if err := eng.CheckCommand(cmd); err != nil {
+			t.Fatalf("expected read-only log/grep command to be allowed, got %v for: %s", err, cmd)
+		}
+	}
+
+	mustBlock := []string{
+		`reboot`,
+		`/sbin/shutdown -h now`,
+		`/system/bin/reboot`,
+		`sudo poweroff`,
+		`init 0`,
+		`init 6`,
+		`systemctl reboot`,
+		`systemctl --force poweroff`,
+		`adb reboot`,
+		`adb -s 1ab1a4d2 reboot bootloader`,
+		`adb -s 1ab1a4d2 shell reboot`,
+		`adb -s 1ab1a4d2 shell "reboot"`,
+		`adb -s 1ab1a4d2 shell "echo ok; reboot"`,
+		`adb -s 1ab1a4d2 shell "su -c 'reboot'"`,
+		`adb -s 1ab1a4d2 shell "su -c /system/bin/svc power shutdown"`,
+		`ssh -p 2222 root@10.0.0.2 "sudo shutdown -r now"`,
+		`pwsh -NoProfile -Command "Restart-Computer -Force"`,
+	}
+	for _, cmd := range mustBlock {
+		if err := eng.CheckCommand(cmd); !IsApprovalRequired(err) {
+			t.Fatalf("expected APPROVAL_REQUIRED for real reboot/shutdown command %q, got: %v", cmd, err)
+		}
+	}
+}

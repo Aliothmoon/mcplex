@@ -61,8 +61,7 @@ var rawCommandRules = []commandRule{
 		`(?i)\b(?:remove-item|ri|rmdir|rd|del|erase)\b`+seg+`*\s-(?:f|fo[a-z]*)\b`+seg+`*\s-(?:r|re|rec[a-z]*)\b`),
 	rule("recursive delete", `(?i)\b(?:rd|rmdir|del|erase)\b`+seg+`*\s/s\b`),
 	rule("recursive delete", `(?i)\bfind\b`+seg+`*\s-delete\b`),
-	rule("power off/reboot", `(?i)\b(?:shutdown|reboot|poweroff|halt|stop-computer|restart-computer)\b`),
-	rule("power off/reboot", `(?i)\binit\s+[06]\b`),
+	// power off/reboot is checked structurally in containsPowerOrRebootCommand so grep/rg/log patterns like 'vm02|Reboot|shutdown' never false-positive.
 	rule("kills all processes", `(?i)\bkill\s+(?:-[a-z0-9]+\s+)*-1\s*(?:$|[;&|\n])`),
 
 	// --- POSIX native: disks, devices, system files, remote code ---
@@ -124,6 +123,9 @@ func matchBuiltinCommandGuard(cmdLine string) string {
 	surface := extractHostCommandSurface(cmdLine, 0)
 	if hostPrivEscPattern.MatchString(surface) {
 		return "privilege escalation"
+	}
+	if containsPowerOrRebootCommand(cmdLine, 0) {
+		return "power off/reboot"
 	}
 	if name := matchRawCommandRules(cmdLine); name != "" {
 		return name
@@ -461,4 +463,335 @@ func isProtectedConfigPath(p string) bool {
 		}
 	}
 	return false
+}
+
+var powerRebootVerbs = map[string]bool{
+	"shutdown":         true,
+	"reboot":           true,
+	"poweroff":         true,
+	"halt":             true,
+	"stop-computer":    true,
+	"restart-computer": true,
+}
+
+var powerPrefixWrappers = map[string]bool{
+	"env":     true,
+	"command": true,
+	"builtin": true,
+	"exec":    true,
+	"nohup":   true,
+	"nice":    true,
+	"time":    true,
+	"sudo":    true,
+	"doas":    true,
+	"busybox": true,
+	"toybox":  true,
+}
+
+// containsPowerOrRebootCommand inspects shell command segments and nested shell/remote wrappers
+// (`sh -c`, `su -c`, `adb shell`, `ssh`, `$(...)`, backticks) so real shutdown/reboot invocations
+// (`reboot`, `adb reboot`, `adb shell "su -c 'reboot'"`, `systemctl poweroff`, `svc power shutdown`)
+// are always caught, while regex/search arguments (`logcat | grep -iE 'VM02|Reboot|shutdown'`) never false-positive.
+func containsPowerOrRebootCommand(cmdLine string, depth int) bool {
+	if depth > 6 || strings.TrimSpace(cmdLine) == "" {
+		return false
+	}
+	segments, substs := splitUnquotedSegmentsAndSubsts(cmdLine)
+	for _, sub := range substs {
+		if containsPowerOrRebootCommand(sub, depth+1) {
+			return true
+		}
+	}
+	for _, seg := range segments {
+		tokens := tokenizeShellWordsKeepQuotes(seg)
+		if len(tokens) == 0 {
+			continue
+		}
+		idx := 0
+		inWrap := false
+		for idx < len(tokens) {
+			unq := stripOuterQuotes(tokens[idx])
+			if isEnvPrefixToken(unq) {
+				idx++
+				continue
+			}
+			if inWrap && strings.HasPrefix(unq, "-") {
+				// Skip single-value flags on sudo/nice/env wrappers (e.g. `sudo -u root reboot`).
+				lowFlag := strings.ToLower(unq)
+				if (lowFlag == "-u" || lowFlag == "-g" || lowFlag == "-n" || lowFlag == "-c") && idx+1 < len(tokens) {
+					// Note: `su` is NOT in powerPrefixWrappers; `-u` on sudo takes username.
+					if lowFlag != "-c" {
+						idx += 2
+						continue
+					}
+				}
+				idx++
+				continue
+			}
+			v := normalizeCmdVerb(tokens[idx])
+			if powerPrefixWrappers[v] {
+				inWrap = true
+				idx++
+				continue
+			}
+			break
+		}
+		if idx >= len(tokens) {
+			continue
+		}
+		verb := normalizeCmdVerb(tokens[idx])
+		rest := tokens[idx+1:]
+
+		if powerRebootVerbs[verb] {
+			return true
+		}
+		if verb == "init" && len(rest) > 0 {
+			arg0 := stripOuterQuotes(rest[0])
+			if arg0 == "0" || arg0 == "6" {
+				return true
+			}
+		}
+		if verb == "svc" && len(rest) >= 2 && strings.EqualFold(stripOuterQuotes(rest[0]), "power") {
+			act := strings.ToLower(stripOuterQuotes(rest[1]))
+			if act == "shutdown" || act == "reboot" {
+				return true
+			}
+		}
+		if verb == "systemctl" || verb == "loginctl" {
+			for _, tk := range rest {
+				u := strings.ToLower(stripOuterQuotes(tk))
+				if strings.HasPrefix(u, "-") {
+					continue
+				}
+				if u == "reboot" || u == "poweroff" || u == "halt" || u == "kexec" {
+					return true
+				}
+				break
+			}
+		}
+		if verb == "adb" || verb == "fastboot" {
+			for ri := 0; ri < len(rest); ri++ {
+				u := stripOuterQuotes(rest[ri])
+				low := strings.ToLower(u)
+				if low == "-s" || low == "-t" || low == "-h" || low == "-p" || low == "-l" {
+					ri++
+					continue
+				}
+				if strings.HasPrefix(low, "-") {
+					continue
+				}
+				if low == "reboot" || strings.HasPrefix(low, "reboot-") {
+					return true
+				}
+				if low == "shell" && ri+1 < len(rest) {
+					tail := rest[ri+1:]
+					if len(tail) == 1 {
+						if containsPowerOrRebootCommand(stripOuterQuotes(tail[0]), depth+1) {
+							return true
+						}
+					} else if containsPowerOrRebootCommand(strings.Join(tail, " "), depth+1) {
+						return true
+					}
+				}
+				break
+			}
+			continue
+		}
+		if verb == "su" {
+			for ri := 0; ri < len(rest); ri++ {
+				u := stripOuterQuotes(rest[ri])
+				low := strings.ToLower(u)
+				if (low == "-c" || low == "--command") && ri+1 < len(rest) {
+					tail := rest[ri+1:]
+					if len(tail) == 1 {
+						if containsPowerOrRebootCommand(stripOuterQuotes(tail[0]), depth+1) {
+							return true
+						}
+					} else if containsPowerOrRebootCommand(strings.Join(tail, " "), depth+1) {
+						return true
+					}
+					break
+				}
+				if strings.HasPrefix(low, "--command=") {
+					if containsPowerOrRebootCommand(stripOuterQuotes(u[len("--command="):]), depth+1) {
+						return true
+					}
+					break
+				}
+			}
+			continue
+		}
+		if verb == "ssh" {
+			hostSeen := false
+			for ri := 0; ri < len(rest); ri++ {
+				u := stripOuterQuotes(rest[ri])
+				if !hostSeen {
+					if u == "-p" || u == "-i" || u == "-l" || u == "-o" || u == "-J" || u == "-F" || u == "-L" || u == "-R" || u == "-D" || u == "-b" || u == "-c" || u == "-m" || u == "-S" || u == "-W" {
+						ri++
+						continue
+					}
+					if strings.HasPrefix(u, "-") {
+						continue
+					}
+					hostSeen = true
+					continue
+				}
+				tail := rest[ri:]
+				if len(tail) == 1 {
+					if containsPowerOrRebootCommand(stripOuterQuotes(tail[0]), depth+1) {
+						return true
+					}
+				} else if containsPowerOrRebootCommand(strings.Join(tail, " "), depth+1) {
+					return true
+				}
+				break
+			}
+			continue
+		}
+		if isHostShellWrapper(verb) {
+			for _, tk := range rest {
+				unq := stripOuterQuotes(tk)
+				if unq != tk {
+					if containsPowerOrRebootCommand(unq, depth+1) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func splitUnquotedSegmentsAndSubsts(cmdLine string) ([]string, []string) {
+	var segs []string
+	var substs []string
+	var cur strings.Builder
+	n := len(cmdLine)
+	flush := func() {
+		if s := strings.TrimSpace(cur.String()); s != "" {
+			segs = append(segs, s)
+		}
+		cur.Reset()
+	}
+	for i := 0; i < n; i++ {
+		ch := cmdLine[i]
+		switch ch {
+		case '\'':
+			start := i
+			i++
+			for i < n && cmdLine[i] != '\'' {
+				i++
+			}
+			if i < n {
+				cur.WriteString(cmdLine[start : i+1])
+			} else {
+				cur.WriteString(cmdLine[start:])
+			}
+		case '"':
+			cur.WriteByte('"')
+			i++
+			for i < n && cmdLine[i] != '"' {
+				if cmdLine[i] == '\\' && i+1 < n {
+					cur.WriteByte(cmdLine[i])
+					cur.WriteByte(cmdLine[i+1])
+					i += 2
+					continue
+				}
+				if cmdLine[i] == '$' && i+1 < n && cmdLine[i+1] == '(' {
+					sub, nextIdx := scanCommandSubst(cmdLine, i+2)
+					substs = append(substs, sub)
+					cur.WriteString(`""`)
+					i = nextIdx + 1
+					continue
+				}
+				if cmdLine[i] == '`' {
+					if sub, nextIdx, closed := scanBacktickSubst(cmdLine, i+1); closed {
+						substs = append(substs, sub)
+						cur.WriteString(`""`)
+						i = nextIdx + 1
+						continue
+					}
+				}
+				cur.WriteByte(cmdLine[i])
+				i++
+			}
+			if i < n && cmdLine[i] == '"' {
+				cur.WriteByte('"')
+			}
+		case '$':
+			if i+1 < n && cmdLine[i+1] == '(' {
+				sub, nextIdx := scanCommandSubst(cmdLine, i+2)
+				substs = append(substs, sub)
+				i = nextIdx
+				continue
+			}
+			cur.WriteByte(ch)
+		case '`':
+			if sub, nextIdx, closed := scanBacktickSubst(cmdLine, i+1); closed {
+				substs = append(substs, sub)
+				i = nextIdx
+				continue
+			}
+			cur.WriteByte(ch)
+		case ';', '\n', '(', ')':
+			flush()
+		case '&', '|':
+			flush()
+			if i+1 < n && cmdLine[i+1] == ch {
+				i++
+			}
+		default:
+			cur.WriteByte(ch)
+		}
+	}
+	flush()
+	return segs, substs
+}
+
+func tokenizeShellWordsKeepQuotes(seg string) []string {
+	var words []string
+	var cur strings.Builder
+	n := len(seg)
+	for i := 0; i < n; i++ {
+		ch := seg[i]
+		switch ch {
+		case ' ', '\t':
+			if cur.Len() > 0 {
+				words = append(words, cur.String())
+				cur.Reset()
+			}
+		case '\'':
+			start := i
+			i++
+			for i < n && seg[i] != '\'' {
+				i++
+			}
+			if i < n {
+				cur.WriteString(seg[start : i+1])
+			} else {
+				cur.WriteString(seg[start:])
+			}
+		case '"':
+			cur.WriteByte('"')
+			i++
+			for i < n && seg[i] != '"' {
+				if seg[i] == '\\' && i+1 < n && (seg[i+1] == '"' || seg[i+1] == '\\') {
+					cur.WriteByte(seg[i+1])
+					i += 2
+					continue
+				}
+				cur.WriteByte(seg[i])
+				i++
+			}
+			if i < n && seg[i] == '"' {
+				cur.WriteByte('"')
+			}
+		default:
+			cur.WriteByte(ch)
+		}
+	}
+	if cur.Len() > 0 {
+		words = append(words, cur.String())
+	}
+	return words
 }

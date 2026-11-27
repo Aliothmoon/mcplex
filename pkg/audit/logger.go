@@ -340,7 +340,9 @@ func isSecondaryCancelTrace(t sandbox.OpTrace) bool {
 	low := strings.ToLower(strings.TrimSpace(t.Error))
 	return strings.Contains(low, "context canceled") ||
 		strings.Contains(low, "outer execution already ended") ||
+		strings.Contains(low, "outer program ended") ||
 		strings.HasPrefix(low, "canceled after ") ||
+		strings.Contains(low, " canceled after ") ||
 		strings.HasSuffix(low, ": canceled")
 }
 

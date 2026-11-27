@@ -1,6 +1,7 @@
 package capabilities
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -187,6 +188,73 @@ func resolveSymbol(syms []SymbolInfo, query, rel string) (SymbolInfo, error) {
 		names = append(names, fmt.Sprintf("%s L%d", qualifiedName(syms, h, sep), h.StartLine))
 	}
 	return SymbolInfo{}, sandbox.NewHostError(sandbox.KindAmbiguous, nil, "%s: symbol %s matches %d (%s); qualify it", rel, query, len(hits), joinLimited(names, 6))
+}
+
+// resolveSymbolsForRead behaves like resolveSymbol for read-only `ast.read`, except when multiple symbols
+// share the exact same canonical qualified name (e.g. Java/Kotlin/C++/C#/TS overloaded methods like
+// `GuestImage.prepare`), it returns all overloads ordered by StartLine instead of throwing an unresolvable
+// "qualify it" Ambiguous error. Symbols from distinct owners (e.g. `Foo.run` vs `Bar.run`) still throw Ambiguous.
+func resolveSymbolsForRead(syms []SymbolInfo, query, rel string) ([]SymbolInfo, error) {
+	single, err := resolveSymbol(syms, query, rel)
+	if err == nil {
+		return []SymbolInfo{single}, nil
+	}
+	var he *sandbox.HostError
+	if !errors.As(err, &he) || he.Kind != sandbox.KindAmbiguous {
+		return nil, err
+	}
+
+	parts := splitSymbolQuery(query)
+	if len(parts) == 0 {
+		return nil, err
+	}
+	leaf, quals := parts[len(parts)-1], parts[:len(parts)-1]
+	sep := symbolSep(rel)
+	var hits []SymbolInfo
+	for _, s := range syms {
+		recv, sl := symbolParts(s.Name)
+		if sl != leaf {
+			continue
+		}
+		ok := true
+		for _, q := range quals {
+			if recv == q {
+				continue
+			}
+			found := false
+			for _, c := range syms {
+				_, cl := symbolParts(c.Name)
+				if containerKinds[c.Kind] && cl == q && c.StartLine <= s.StartLine && s.EndLine <= c.EndLine &&
+					!(c.StartLine == s.StartLine && c.EndLine == s.EndLine) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			hits = append(hits, s)
+		}
+	}
+	if len(hits) < 2 {
+		return nil, err
+	}
+	canonical := qualifiedName(syms, hits[0], sep)
+	for _, h := range hits[1:] {
+		if qualifiedName(syms, h, sep) != canonical {
+			return nil, err
+		}
+	}
+	sort.SliceStable(hits, func(i, j int) bool {
+		if hits[i].StartLine != hits[j].StartLine {
+			return hits[i].StartLine < hits[j].StartLine
+		}
+		return hits[i].EndLine < hits[j].EndLine
+	})
+	return hits, nil
 }
 
 func suggestSimilarSymbols(syms []SymbolInfo, leaf string, quals []string, sep string) []string {
