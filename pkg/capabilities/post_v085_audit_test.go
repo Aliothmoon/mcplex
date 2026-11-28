@@ -482,3 +482,83 @@ return { count: hits.length, files };
 		t.Fatalf("expected 3 hits across expanded brace subdirs, got %+v", m)
 	}
 }
+
+func TestSearchRgZeroMatchesReturnsEmptyArrayNotNull(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sub1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub1", "a.go"), []byte("package sub1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	binder := newTestAllBinder(t, dir, nil)
+	res, err := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd: dir,
+		Code: `
+const [singleZero, braceZero] = await Promise.all([
+  search.rg("NEVER_MATCHES_ANYTHING_XYZ_999"),
+  search.rg("NEVER_MATCHES_ANYTHING_XYZ_999", { path: "{sub1,missing}" }),
+]);
+let iterated = 0;
+for (const h of singleZero) iterated++;
+for (const h of braceZero) iterated++;
+return {
+  singleIsArray: Array.isArray(singleZero),
+  braceIsArray: Array.isArray(braceZero),
+  singleLen: singleZero.length,
+  braceLen: braceZero.length,
+  mappedLen: singleZero.map((x) => x.file).length,
+  iterated,
+};
+`,
+	}, binder)
+	if err != nil {
+		t.Fatalf("expected 0-match search.rg to return iterable JS Array [], got: %v", err)
+	}
+	m := res.Value.(map[string]any)
+	if m["singleIsArray"] != true || m["braceIsArray"] != true || fmt.Sprint(m["singleLen"]) != "0" || fmt.Sprint(m["braceLen"]) != "0" {
+		t.Fatalf("expected empty JS arrays for 0-match search.rg, got: %+v", m)
+	}
+}
+
+func TestShRunSpillsOversizedInlineScriptOnWindows(t *testing.T) {
+	dir := t.TempDir()
+	binder := newTestAllBinder(t, dir, nil)
+
+	// Build a ~45 KB inline Node `-e` script (> Windows 32,767-char CreateProcess limit!)
+	pad := strings.Repeat("a", 45000)
+	bigScript := fmt.Sprintf("const pad = %q;\nconsole.log('LEN=' + pad.length + ' ARG=' + (process.argv[2] || ''));\n", pad)
+
+	res, err := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd:      dir,
+		Payloads: map[string]string{"js": bigScript},
+		Code: `
+const r = await sh.run("node", ["-e", P.js, "--", "tailArg"]);
+if (!r.ok) {
+  throw new Error("node failed: " + r.stderr);
+}
+return r.stdout.trim();
+`,
+	}, binder)
+	if err != nil {
+		t.Fatalf("expected >32KB inline script in sh.run to succeed via temp-file spill on Windows, got: %v", err)
+	}
+	out, _ := res.Value.(string)
+	if !strings.Contains(out, "LEN=45000") {
+		t.Fatalf("unexpected stdout from spilled >32KB script: %q", out)
+	}
+}
+
+func TestOpBudgetExistsListHint(t *testing.T) {
+	dir := t.TempDir()
+	binder := newTestAllBinder(t, dir, nil)
+	_, err := sandbox.Execute(context.Background(), sandbox.ExecRequest{
+		Cwd:    dir,
+		MaxOps: 3,
+		Code:   `for (let i = 0; i < 10; i++) { fs.exists("missing.txt"); }`,
+	}, binder)
+	if err == nil || !strings.Contains(err.Error(), "fs.tree") {
+		t.Fatalf("expected fs.exists op budget error to suggest fs.tree, got: %v", err)
+	}
+}

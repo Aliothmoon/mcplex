@@ -180,7 +180,14 @@ func (b *ShellGitBinder) RunArgv(parentCtx context.Context, env *sandbox.Executi
 	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, resolved, argv...)
+	execArgv := argv
+	if runtime.GOOS == "windows" {
+		if spilledArgv, cleanupSpill := maybeSpillWindowsInlineScript(resolved, argv); cleanupSpill != nil {
+			defer cleanupSpill()
+			execArgv = spilledArgv
+		}
+	}
+	cmd := exec.CommandContext(ctx, resolved, execArgv...)
 	cmd.Dir = cwd
 	setSysProcAttrHide(cmd)
 	if len(extraEnv) > 0 {
@@ -292,6 +299,9 @@ func (b *ShellGitBinder) RunArgv(parentCtx context.Context, env *sandbox.Executi
 		})
 	}
 	if spawnErr != "" {
+		if strings.Contains(strings.ToLower(spawnErr), "filename or extension is too long") {
+			return nil, fmt.Errorf("%s: %s (Windows 32KB CreateProcess command-line limit exceeded; pass large input via { stdin } or a temp file)", file, spawnErr)
+		}
 		return nil, fmt.Errorf("%s: %s", file, spawnErr)
 	}
 	if parentCtx.Err() != nil {
@@ -401,4 +411,108 @@ func resolveShellFull(name string) (string, []string, string, error) {
 		return "", nil, "", sandbox.NewHostError(sandbox.KindBadArgs, nil, "%s", err.Error())
 	}
 	return exe, args, dialect, nil
+}
+
+const windowsInlineSpillThreshold = 26000 // safely below Windows 32,767 UTF-16 CreateProcess command-line limit
+
+// maybeSpillWindowsInlineScript transparently materializes an oversized inline script argument
+// (`python -c <huge>`, `node -e <huge>`, `pwsh -Command <huge>`) to a temporary file when the Windows
+// command line would exceed CreateProcessW's 32,767-char limit. Policy.CheckCommand has already run on the full raw argv.
+func maybeSpillWindowsInlineScript(resolvedExe string, argv []string) ([]string, func()) {
+	approxLen := len(resolvedExe) + 4
+	for _, a := range argv {
+		approxLen += len(a) + 3
+	}
+	if approxLen < windowsInlineSpillThreshold {
+		return argv, nil
+	}
+
+	base := strings.ToLower(strings.TrimSuffix(filepath.Base(resolvedExe), filepath.Ext(resolvedExe)))
+	switch {
+	case base == "python" || base == "python3" || strings.HasPrefix(base, "python3."):
+		for i := 0; i+1 < len(argv); i++ {
+			if argv[i] == "-c" && len(argv[i+1]) > 16000 {
+				tmp, cleanup, err := writeTempScript("ptc-py-*.py", []byte(argv[i+1]))
+				if err != nil {
+					return argv, nil
+				}
+				next := make([]string, 0, len(argv))
+				next = append(next, argv[:i]...)
+				next = append(next, tmp)
+				next = append(next, argv[i+2:]...)
+				return next, cleanup
+			}
+		}
+
+	case base == "node" || base == "bun":
+		isESM := false
+		for _, a := range argv {
+			if a == "--input-type=module" {
+				isESM = true
+			}
+		}
+		for i := 0; i+1 < len(argv); i++ {
+			if (argv[i] == "-e" || argv[i] == "--eval") && len(argv[i+1]) > 16000 {
+				pat := "ptc-js-*.js"
+				if isESM {
+					pat = "ptc-js-*.mjs"
+				}
+				tmp, cleanup, err := writeTempScript(pat, []byte(argv[i+1]))
+				if err != nil {
+					return argv, nil
+				}
+				next := make([]string, 0, len(argv))
+				for _, before := range argv[:i] {
+					if before != "--input-type=module" {
+						next = append(next, before)
+					}
+				}
+				next = append(next, tmp)
+				// In `node -e code -- arg1`, strip leading `--` separator when switching to `node file.js arg1` so process.argv aligns.
+				tail := argv[i+2:]
+				if len(tail) > 0 && tail[0] == "--" {
+					tail = tail[1:]
+				}
+				next = append(next, tail...)
+				return next, cleanup
+			}
+		}
+
+	case base == "pwsh" || base == "powershell":
+		for i := 0; i+1 < len(argv); i++ {
+			low := strings.ToLower(argv[i])
+			if (low == "-c" || low == "-command") && len(argv[i+1]) > 16000 {
+				// Prepend UTF-8 BOM so Windows PowerShell 5.1 and pwsh 7 both decode non-ASCII scripts identically.
+				raw := append([]byte{0xEF, 0xBB, 0xBF}, []byte(argv[i+1])...)
+				tmp, cleanup, err := writeTempScript("ptc-ps-*.ps1", raw)
+				if err != nil {
+					return argv, nil
+				}
+				next := make([]string, 0, len(argv)+1)
+				next = append(next, argv[:i]...)
+				next = append(next, "-File", tmp)
+				next = append(next, argv[i+2:]...)
+				return next, cleanup
+			}
+		}
+	}
+	return argv, nil
+}
+
+func writeTempScript(pattern string, content []byte) (string, func(), error) {
+	f, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", nil, err
+	}
+	name := f.Name()
+	if _, wErr := f.Write(content); wErr != nil {
+		_ = f.Close()
+		_ = os.Remove(name)
+		return "", nil, wErr
+	}
+	if cErr := f.Close(); cErr != nil {
+		_ = os.Remove(name)
+		return "", nil, cErr
+	}
+	return name, func() { _ = os.Remove(name) }, nil
 }

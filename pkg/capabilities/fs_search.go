@@ -600,7 +600,7 @@ func (b *FSSearchBinder) Bind(env *sandbox.ExecutionEnv) error {
 				}
 				return b.runListSearchMulti(ctx, env, roots, q)
 			}
-			var hits []SearchHit
+			hits := []SearchHit{}
 			total := 0
 			hasUnknownCap := false
 			for _, searchRoot := range roots {

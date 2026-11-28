@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -494,6 +495,9 @@ func (env *ExecutionEnv) toJSValue(v any) goja.Value {
 		}
 		return obj
 	default:
+		if rv := reflect.ValueOf(v); rv.Kind() == reflect.Slice && rv.IsNil() {
+			return env.VM.NewArray()
+		}
 		raw, err := json.Marshal(v)
 		if err != nil {
 			return env.VM.ToValue(v)
@@ -1053,6 +1057,8 @@ func opBudgetMessage(capability string, maxOps int) string {
 		return base + "; for bulk file sizes/mtimes, use search.glob(\"**/*\", { path: dir, detail: true }) or fs.list(dir, { detail: true }) in 1 call instead of looping fs.stat"
 	case "fs.read":
 		return base + "; for reading many files at once, use fs.cat(paths) or search.rg(...) instead of looping fs.read"
+	case "fs.exists", "fs.existsSync", "fs.list":
+		return base + "; for recursive directory traversal, use fs.tree(dir, depth) or search.glob(\"**/*\", { path: dir, detail: true }) in 1 call instead of recursive fs.list/fs.exists loops"
 	}
 	return base
 }
